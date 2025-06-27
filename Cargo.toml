@@ -1,0 +1,8 @@
+[workspace]
+resolver = "3"
+members = ["veil-client", "veil-server", "veil-protocol"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1

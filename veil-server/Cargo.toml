@@ -1,0 +1,11 @@
+[package]
+name = "veil-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+curve25519-dalek = "4"
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+rkyv = "0.8"
