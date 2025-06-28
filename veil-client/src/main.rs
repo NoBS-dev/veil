@@ -1,2 +1,1 @@
-#[tokio::main]
 fn main() {}
