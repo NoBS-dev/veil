@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+veil-protocol = { path = "../veil-protocol" }
+
 anyhow = "1"
-curve25519-dalek = "4"
 axum = { version = "0.8", features = ["ws"] }
+futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 rkyv = "0.8"

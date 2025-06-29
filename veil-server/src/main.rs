@@ -1,11 +1,17 @@
 use anyhow::Result;
 use axum::{
 	Router,
-	extract::{WebSocketUpgrade, ws::WebSocket},
+	extract::{
+		WebSocketUpgrade,
+		ws::{Message, WebSocket},
+	},
 	response::Response,
 	routing,
 };
-use tokio::net::TcpListener;
+use futures::{SinkExt, StreamExt, stream::SplitSink};
+use std::{collections::HashMap, sync::LazyLock};
+use tokio::{net::TcpListener, sync::RwLock};
+use veil_protocol::ArchivedEncryptedMessage;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -18,12 +24,47 @@ async fn main() -> Result<()> {
 	Ok(())
 }
 
+static CLIENTS: LazyLock<RwLock<HashMap<[u8; 32], SplitSink<WebSocket, Message>>>> =
+	LazyLock::new(|| RwLock::new(HashMap::new()));
+
 async fn socket(socket: WebSocketUpgrade) -> Response {
-	async fn handle(mut socket: WebSocket) {
-		while let Some(Ok(message)) = socket.recv().await {
-			println!("{message:?}");
+	async fn handle(socket: WebSocket) {
+		let (sender, mut reciever) = socket.split();
+
+		let public_key = if let Some(Ok(Message::Binary(bytes))) = reciever.next().await {
+			if bytes.len() != 32 {
+				return;
+			}
+			bytes.first_chunk::<32>().unwrap().to_owned()
+		} else {
+			return;
+		};
+
+		CLIENTS.write().await.insert(public_key, sender);
+
+		while let Some(Ok(Message::Binary(bytes))) = reciever.next().await {
+			let message = if let Ok(message) =
+				rkyv::access::<ArchivedEncryptedMessage, rkyv::rancor::Error>(&bytes)
+			{
+				message
+			} else {
+				println!("Invalid message recieved");
+				continue;
+			};
+
+			if let Some(sender) = CLIENTS.write().await.get_mut(&message.recipient) {
+				let _ = sender.send(Message::Binary(bytes)).await;
+			} else {
+				println!(
+					"Recipient {:?} is not connected, dropping message",
+					message.recipient
+				);
+				continue;
+			}
 		}
-		println!("Client disconnected");
+
+		CLIENTS.write().await.remove(&public_key);
+		println!("Client {public_key:?} disconnected");
 	}
 
 	socket.on_upgrade(handle)
