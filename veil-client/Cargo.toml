@@ -2,3 +2,16 @@
 name = "veil-client"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+rand = "0.9"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.27"
+url = "2.5"
+vodozemac = "0.9"
+veil-protocol = { path = "../veil-protocol" }
+tungstenite = "0.27"
+reqwest = "0.12.22"
+once_cell = "1.21.3"

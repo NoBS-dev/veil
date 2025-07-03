@@ -5,21 +5,21 @@ use axum::{
 		WebSocketUpgrade,
 		ws::{Message, WebSocket},
 	},
-	response::Response,
+	response::{IntoResponse, Response},
 	routing,
 };
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use std::{collections::HashMap, sync::LazyLock};
 use tokio::{net::TcpListener, sync::RwLock};
-use veil_protocol::ArchivedEncryptedMessage;
+use veil_protocol::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	axum::serve(
-		TcpListener::bind("localhost:3000").await?,
-		Router::new().route("/", routing::any(socket)),
-	)
-	.await?;
+	let router = Router::new()
+		.route("/", routing::any(socket))
+		.route("/clients", routing::get(list_clients));
+
+	axum::serve(TcpListener::bind("[::]:3000").await?, router).await?;
 
 	Ok(())
 }
@@ -35,17 +35,20 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 			if bytes.len() != 32 {
 				return;
 			}
+
 			bytes.first_chunk::<32>().unwrap().to_owned()
 		} else {
 			return;
 		};
 
+		println!("{} connected", display_key(&public_key));
 		CLIENTS.write().await.insert(public_key, sender);
 
 		while let Some(Ok(Message::Binary(bytes))) = reciever.next().await {
 			let message = if let Ok(message) =
 				rkyv::access::<ArchivedEncryptedMessage, rkyv::rancor::Error>(&bytes)
 			{
+				println!("Valid message received!");
 				message
 			} else {
 				println!("Invalid message recieved");
@@ -56,16 +59,26 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 				let _ = sender.send(Message::Binary(bytes)).await;
 			} else {
 				println!(
-					"Recipient {:?} is not connected, dropping message",
-					message.recipient
+					"{} is not connected, dropping message",
+					display_key(&message.recipient)
 				);
 				continue;
 			}
 		}
 
 		CLIENTS.write().await.remove(&public_key);
-		println!("Client {public_key:?} disconnected");
+		println!("{} disconnected", display_key(&public_key));
 	}
 
 	socket.on_upgrade(handle)
+}
+
+async fn list_clients() -> impl IntoResponse {
+	let clients = CLIENTS.read().await;
+	let output = clients
+		.keys()
+		.map(|key| display_key(key))
+		.collect::<Vec<_>>()
+		.join("\n");
+	output
 }
