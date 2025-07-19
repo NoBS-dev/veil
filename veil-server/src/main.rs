@@ -9,7 +9,6 @@ use axum::{
 	routing,
 };
 use futures::{SinkExt, StreamExt, stream::SplitSink};
-use itertools::Itertools;
 use std::{collections::HashMap, sync::LazyLock};
 use tokio::{net::TcpListener, sync::RwLock};
 use veil_protocol::*;
@@ -75,11 +74,7 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 }
 
 async fn list_clients() -> impl IntoResponse {
-	CLIENTS
-		.read()
-		.await
-		.keys()
-		.map(display_key)
-		.intersperse('\n'.to_string())
-		.collect::<String>()
+	let clients = CLIENTS.read().await;
+	let iter = clients.keys().map(display_key);
+	itertools::Itertools::intersperse(iter, String::from("\n")).collect::<String>()
 }

@@ -570,6 +570,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "gcc"
+version = "0.3.55"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f5f3913fa0bfe7ee1fd8248b6b9f42a5af4b9d65ec2dd2c3c26132b950ecfc2"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -607,6 +613,12 @@ name = "gimli"
 version = "0.31.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f"
+
+[[package]]
+name = "glob"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be18de09a56b60ed0edf84bc9df007e30040691af7acd1c41874faac5895bfb"
 
 [[package]]
 name = "h2"
@@ -2205,12 +2217,15 @@ dependencies = [
  "once_cell",
  "rand 0.9.1",
  "reqwest",
+ "rkyv",
  "tokio",
  "tokio-tungstenite 0.27.0",
  "tungstenite 0.27.0",
  "url",
  "veil-protocol",
  "vodozemac",
+ "x25519-dalek",
+ "zstd",
 ]
 
 [[package]]
@@ -2718,4 +2733,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "zstd"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894ea7a4f2ca47fdaf9af95bfca360e2cc53718046e7f5b3e79a72aae16777b5"
+dependencies = [
+ "gcc",
+ "glob",
+ "libc",
 ]
