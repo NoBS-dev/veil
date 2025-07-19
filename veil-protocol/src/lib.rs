@@ -9,7 +9,7 @@ pub struct EncryptedMessage {
 }
 
 pub fn display_key(bytes: &[u8; 32]) -> String {
-	bytes.iter().map(|b| format!("{:02x}", b)).collect()
+	bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn parse_hex_key(hex: &str) -> anyhow::Result<[u8; 32]> {

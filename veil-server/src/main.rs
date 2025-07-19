@@ -9,6 +9,7 @@ use axum::{
 	routing,
 };
 use futures::{SinkExt, StreamExt, stream::SplitSink};
+use itertools::Itertools;
 use std::{collections::HashMap, sync::LazyLock};
 use tokio::{net::TcpListener, sync::RwLock};
 use veil_protocol::*;
@@ -19,7 +20,7 @@ async fn main() -> Result<()> {
 		.route("/", routing::any(socket))
 		.route("/clients", routing::get(list_clients));
 
-	axum::serve(TcpListener::bind("[::]:3000").await?, router).await?;
+	axum::serve(TcpListener::bind("localhost:3000").await?, router).await?;
 
 	Ok(())
 }
@@ -74,11 +75,11 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 }
 
 async fn list_clients() -> impl IntoResponse {
-	let clients = CLIENTS.read().await;
-	let output = clients
+	CLIENTS
+		.read()
+		.await
 		.keys()
-		.map(|key| display_key(key))
-		.collect::<Vec<_>>()
-		.join("\n");
-	output
+		.map(display_key)
+		.intersperse('\n'.to_string())
+		.collect::<String>()
 }

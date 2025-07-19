@@ -1,3 +1,4 @@
+use constcat::concat;
 use futures_util::{SinkExt, StreamExt};
 use std::{
 	io::{self, Write},
@@ -9,14 +10,14 @@ use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::*;
 use vodozemac::Ed25519Keypair;
 
+const IP_AND_PORT: &str = "localhost:3000";
+const SOCKET: &str = concat!("ws://", IP_AND_PORT);
+const URL: &str = concat!("http://", IP_AND_PORT);
+const PROMPT: &str = concat!(SOCKET, " > ");
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	let ip_and_port = "localhost:3000";
-	let socket = format!("ws://{}", ip_and_port);
-	let url = format!("http://{}", ip_and_port);
-	let prompt = format!("{} > ", &socket);
-
-	let (ws_stream, _) = connect_async(&socket).await?;
+	let (ws_stream, _) = connect_async(SOCKET).await?;
 	let (mut write, mut read) = ws_stream.split();
 
 	let identity_key_pair = Ed25519Keypair::new();
@@ -28,26 +29,18 @@ async fn main() -> anyhow::Result<()> {
 
 	println!("My public key: {}", display_key(&pub_key_bytes));
 
-	// Clone the prompt for the spawned task, arc is prob overkill for just a string
-	let prompt_clone = prompt.clone();
-
 	// Spawn a task to listen for incoming notifs
 	tokio::spawn(async move {
 		while let Some(msg) = read.next().await {
 			match msg {
 				Ok(Message::Binary(data)) => {
-					println!("\n[Notification] Received binary message: {:?}", data);
-					print!("{}", prompt_clone);
-					io::stdout().flush().unwrap();
-				}
-				Ok(Message::Text(text)) => {
-					println!("\n[Notification] Received text: {}", text);
-					print!("{}", prompt_clone);
+					println!("\n[Notification] Received binary message: {data:?}");
+					print!("{PROMPT}");
 					io::stdout().flush().unwrap();
 				}
 				Ok(_) => {}
 				Err(e) => {
-					println!("\n[Notification] Error: {}", e);
+					println!("\n[Notification] Error: {e}");
 					break;
 				}
 			}
@@ -56,7 +49,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// Talking to server
 	loop {
-		print!("{}", &prompt);
+		print!("{PROMPT}");
 		io::stdout().flush()?;
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
@@ -64,14 +57,14 @@ async fn main() -> anyhow::Result<()> {
 		// Cmds (pre-conversation)
 		match input.to_lowercase().trim() {
 			"list" => {
-				println!("{:?}", list_clients(&url).await?);
+				println!("{:?}", list_clients(URL).await?);
 			}
 			"quit" => {
 				println!("Quitting...");
 				std::process::exit(0);
 			}
 			"msg" => {
-				println!("{:?}", list_clients(&url).await?);
+				println!("{:?}", list_clients(URL).await?);
 
 				print!(
 					"Enter client to message\n(you are {}): ",
@@ -83,15 +76,7 @@ async fn main() -> anyhow::Result<()> {
 				io::stdin().read_line(&mut recipient)?;
 				let recipient = recipient.trim();
 
-				let clients = list_clients(&url).await?;
-
-				if clients.contains(&recipient.to_string()) {
-					println!("Recipient: {}", recipient);
-
-					// TODO: Check profile to see if they have their key. If not, send key exchange req
-				} else {
-					println!("Invalid recipient: {}", recipient);
-				}
+				// TODO encryption and zstd compression, then send message
 			}
 			_ => (), // Do nothing
 		}
@@ -99,31 +84,29 @@ async fn main() -> anyhow::Result<()> {
 	// Ok(())
 }
 
-async fn list_clients(url: &String) -> anyhow::Result<Vec<String>> {
-	let response = reqwest::get(format!("{}/clients", url))
+async fn list_clients(url: &str) -> anyhow::Result<Vec<String>> {
+	Ok(reqwest::get(format!("{url}/clients"))
 		.await?
 		.text()
-		.await?;
-	let clients: Vec<String> = response
+		.await?
 		.lines()
 		.map(|line| line.trim().to_string())
-		.collect();
-	Ok(clients)
+		.collect())
 }
 
-async fn send_key_exchange_request(recipient: &String) {}
+async fn send_key_exchange_request(recipient: &str) {}
 
-async fn _open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
+async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 	// TODO: Actually account for encryption and serialization
 	if filename.exists() {
 		// File exists, open and read it
 		let contents = tokio::fs::read_to_string(&filename).await?;
-		println!("File contents: {}", contents);
+		println!("File contents: {contents}");
 	} else {
 		// File doesn't exist, create it and write some data
 		let mut file = File::create(&filename).await?;
 		file.write_all(b"New file created").await?;
-		println!("Created new file: {:?}", filename);
+		println!("Created new file: {filename:?}");
 	}
 
 	Ok(())

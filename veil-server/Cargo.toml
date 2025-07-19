@@ -9,5 +9,6 @@ veil-protocol = { path = "../veil-protocol" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
+itertools = "0.14"
 tokio = { version = "1", features = ["full"] }
 rkyv = "0.8"
