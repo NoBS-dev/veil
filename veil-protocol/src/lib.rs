@@ -1,9 +1,16 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Archive, Deserialize, Serialize)]
+pub struct Signed<T> {
+	pub generic: T,
+	pub signature: [u8; 64],
+}
+
+#[derive(Archive, Deserialize, Serialize)]
 pub enum ProtocolMessage {
 	EncryptedMessage(EncryptedMessage),
 	KeyExchangeRequest(KeyExchangeRequest),
+	KeyExchangeResponse(KeyExchangeResponse),
 }
 
 #[derive(Archive, Deserialize, Serialize)]
@@ -14,11 +21,21 @@ pub struct EncryptedMessage {
 	pub message: Box<[u8]>,
 }
 
+// Request will be sent by the client
 #[derive(Archive, Deserialize, Serialize)]
 pub struct KeyExchangeRequest {
-	pub sender: [u8; 32],
-	pub recipient: [u8; 32],
-	pub sender_public_key: [u8; 32],
+	pub origin_identity_key: [u8; 32],
+	pub origin_public_key: [u8; 32],
+	pub target_identity_key: [u8; 32],
+}
+
+// Response will be sent by the server
+#[derive(Archive, Deserialize, Serialize)]
+pub struct KeyExchangeResponse {
+	pub origin_identity_key: [u8; 32],
+	pub target_identity_key: [u8; 32],
+	// Implement double ratchet later, keys other than identity should only be used once
+	pub target_public_key: [u8; 32],
 }
 
 pub fn display_key(bytes: &[u8; 32]) -> String {
