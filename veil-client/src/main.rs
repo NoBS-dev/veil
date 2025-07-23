@@ -1,37 +1,45 @@
 use constcat::concat;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, stream::SplitSink};
+use once_cell::sync::Lazy;
+use rkyv::{rancor::Error, to_bytes, validation::archive};
 use std::{
+	collections::HashMap,
 	io::{self, Write},
 	path::PathBuf,
+	sync::Arc,
 };
-use tokio::{fs::File, io::AsyncWriteExt};
-use tokio_tungstenite::connect_async;
+use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
+use tokio_tungstenite::{WebSocketStream, connect_async};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::*;
 use vodozemac::Ed25519Keypair;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
+// TODO: Let user specify ip/port
 const IP_AND_PORT: &str = "localhost:3000";
 const SOCKET: &str = concat!("ws://", IP_AND_PORT);
 const URL: &str = concat!("http://", IP_AND_PORT);
 const PROMPT: &str = concat!(SOCKET, " > ");
 
-struct MessageableUsers {
-	other_public_key: PublicKey,
-	shared_secret: SharedSecret,
-}
+static IDENTITY_KEYPAIR: Lazy<Ed25519Keypair> = Lazy::new(|| Ed25519Keypair::new());
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	let mut messageable_users: Vec<MessageableUsers> = Vec::new();
+	// The first hashmap entry will contain the other users' identity key.
+	// The second will be the shared secret from the key exchange.
+	let mut messageable_users: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
 
 	let (ws_stream, _) = connect_async(SOCKET).await?;
-	let (mut write, mut read) = ws_stream.split();
+	let (write, read) = ws_stream.split();
 
-	let identity_key_pair = Ed25519Keypair::new();
-	let pub_key_bytes = *identity_key_pair.public_key().as_bytes();
+	let write = Arc::new(Mutex::new(write));
+	let read = Arc::new(Mutex::new(read));
+
+	let pub_key_bytes = *IDENTITY_KEYPAIR.public_key().as_bytes();
 
 	write
+		.lock()
+		.await
 		.send(Message::Binary(Bytes::copy_from_slice(&pub_key_bytes)))
 		.await?;
 
@@ -39,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// Spawn a task to listen for incoming notifs
 	tokio::spawn(async move {
-		while let Some(msg) = read.next().await {
+		while let Some(msg) = read.lock().await.next().await {
 			match msg {
 				Ok(Message::Binary(data)) => {
 					println!("\n[Notification] Received binary message: {:?}", data);
@@ -87,13 +95,10 @@ async fn main() -> anyhow::Result<()> {
 				};
 
 				if list_clients().await?.contains(&display_key(&target_client)) {
-					if let Some(_) = messageable_users
-						.iter()
-						.find(|user| user.other_public_key.as_bytes() == &target_client)
-					{
+					if messageable_users.contains_key(&target_client) {
 						// TODO: Start messaging
 					} else {
-						println!("Key exchange has not been performed\nDo it now? (Y/n) ");
+						print!("Key exchange has not been performed\nDo it now? (Y/n) ");
 
 						let input: String = {
 							let mut input = String::new();
@@ -103,31 +108,23 @@ async fn main() -> anyhow::Result<()> {
 
 						match input.trim().to_lowercase().as_str() {
 							"y" | "" => {
-								send_key_exchange_request(target_client).await?;
+								send_key_exchange_request(target_client, write.clone()).await?;
 							}
 							_ => println!("Can't communicate without exchanging keys. Leaving..."),
 						}
 					}
 				} else {
-					println!("Invalid client.");
+					println!("Client not connected.");
 				}
 
 				// TODO: Make work
-				if let Ok(shared_secret) = send_key_exchange_request(target_client).await {
-					messageable_users.push(MessageableUsers {
-						other_public_key: PublicKey::from(target_client),
-						shared_secret: shared_secret,
-					});
+				if let Ok(shared_secret) =
+					send_key_exchange_request(target_client, write.clone()).await
+				{
+					messageable_users.insert(target_client, *shared_secret.as_bytes());
 				}
 
-				print!("Enter message: ");
-				io::stdout().flush()?;
-
-				let message = {
-					let mut message = String::new();
-					io::stdin().read_line(&mut message)?;
-					let message = message.trim();
-				};
+				send_message(target_client).await?;
 
 				// TODO: Ensure that we have a shared secret key with the recipient.
 				// If not, we need to prompt them to initiate a key exchange.
@@ -149,9 +146,44 @@ async fn list_clients() -> anyhow::Result<Vec<String>> {
 		.collect())
 }
 
-async fn send_key_exchange_request(target_client: [u8; 32]) -> anyhow::Result<SharedSecret> {
+async fn send_key_exchange_request(
+	target_client: [u8; 32],
+	write: Arc<
+		tokio::sync::Mutex<
+			SplitSink<
+				WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+				tungstenite::Message,
+			>,
+		>,
+	>,
+) -> anyhow::Result<SharedSecret> {
 	let private_key = EphemeralSecret::random();
 	let public_key = PublicKey::from(&private_key); // TODO: Send this to the server
+
+	let request = KeyExchangeRequest {
+		origin_identity_key: *IDENTITY_KEYPAIR.public_key().as_bytes(),
+		origin_public_key: *public_key.as_bytes(),
+		target_identity_key: target_client,
+	};
+
+	let signature = IDENTITY_KEYPAIR
+		.sign(&to_bytes::<Error>(&request)?)
+		.to_bytes();
+
+	let signed_request = Signed {
+		generic: request,
+		signature,
+	};
+
+	let archived_signed_request = to_bytes::<Error>(&signed_request)?;
+
+	write
+		.lock()
+		.await
+		.send(Message::Binary(Bytes::copy_from_slice(
+			&archived_signed_request,
+		)))
+		.await?;
 
 	// TODO: Actually get the pub key from the server
 	let other_private_key = EphemeralSecret::random();
@@ -160,6 +192,18 @@ async fn send_key_exchange_request(target_client: [u8; 32]) -> anyhow::Result<Sh
 	Ok(private_key.diffie_hellman(&other_public_key))
 }
 
+async fn send_message(target_client: [u8; 32]) -> anyhow::Result<()> {
+	print!("Enter message: ");
+	io::stdout().flush()?;
+
+	let message = {
+		let mut message = String::new();
+		io::stdin().read_line(&mut message)?;
+		message
+	};
+
+	Ok(())
+}
 async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 	// TODO: Actually account for encryption and serialization
 	if filename.exists() {

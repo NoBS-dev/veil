@@ -74,6 +74,8 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 }
 
 async fn list_clients() -> impl IntoResponse {
+	println!("List called");
+
 	let clients = CLIENTS.read().await;
 	let iter = clients.keys().map(display_key);
 	itertools::Itertools::intersperse(iter, String::from("\n")).collect::<String>()
