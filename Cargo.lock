@@ -2235,6 +2235,7 @@ dependencies = [
  "anyhow",
  "hex",
  "rkyv",
+ "vodozemac",
 ]
 
 [[package]]

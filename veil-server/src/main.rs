@@ -45,24 +45,48 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 		CLIENTS.write().await.insert(public_key, sender);
 
 		while let Some(Ok(Message::Binary(bytes))) = reciever.next().await {
-			let message = if let Ok(message) =
-				rkyv::access::<ArchivedEncryptedMessage, rkyv::rancor::Error>(&bytes)
-			{
-				println!("Valid message received!");
-				message
-			} else {
-				println!("Invalid message recieved");
-				continue;
-			};
+			// let message = if let Ok(message) =
+			// 	rkyv::access::<ArchivedEncryptedMessage, rkyv::rancor::Error>(&bytes)
+			// {
+			// 	println!("Valid message received!");
+			// 	message
+			// } else {
+			// 	println!("Invalid message recieved");
+			// 	continue;
+			// };
 
-			if let Some(sender) = CLIENTS.write().await.get_mut(&message.recipient) {
-				let _ = sender.send(Message::Binary(bytes)).await;
-			} else {
-				println!(
-					"{} is not connected, dropping message",
-					display_key(&message.recipient)
-				);
-				continue;
+			// if let Some(sender) = CLIENTS.write().await.get_mut(&message.recipient) {
+			// 	// let _ = sender.send(Message::Binary(bytes)).await;
+			// } else {
+			// 	println!(
+			// 		"{} is not connected, dropping message",
+			// 		display_key(&message.recipient)
+			// 	);
+			// 	continue;
+			// }
+
+			// let message = if let Ok(message) =
+			// 	rkyv::access::<ArchivedSigned<KeyExchangeRequest>, rkyv::rancor::Error>(&bytes)
+			// {
+			// 	println!("Valid key exchange request received.");
+			// 	message
+			// } else {
+			// 	println!("Invalid key exchange request received.");
+			// 	continue;
+			// };
+			match rkyv::access::<ArchivedProtocolMessage, rkyv::rancor::Error>(&bytes) {
+				Ok(ArchivedProtocolMessage::EncryptedMessage(msg)) => {
+					println!("EncryptedMessage received");
+				}
+				Ok(ArchivedProtocolMessage::KeyExchangeRequest(req)) => {
+					println!("KeyExchangeRequest received");
+				}
+				Ok(ArchivedProtocolMessage::KeyExchangeResponse(resp)) => {
+					println!("KeyExchangeResponse received");
+				}
+				Err(err) => {
+					println!("Invalid or unrecognized message: {:?}", err);
+				}
 			}
 		}
 
@@ -74,6 +98,7 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 }
 
 async fn list_clients() -> impl IntoResponse {
+	// TODO: Maybe say who in the future
 	println!("List called");
 
 	let clients = CLIENTS.read().await;

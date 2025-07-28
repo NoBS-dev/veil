@@ -2,7 +2,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 #[derive(Archive, Deserialize, Serialize)]
 pub struct Signed<T> {
-	pub generic: T,
+	pub data: T,
 	pub signature: [u8; 64],
 }
 

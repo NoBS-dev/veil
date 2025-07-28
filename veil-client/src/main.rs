@@ -1,15 +1,15 @@
 use constcat::concat;
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use once_cell::sync::Lazy;
-use rkyv::{rancor::Error, to_bytes, validation::archive};
+use rkyv::{rancor::Error, to_bytes};
 use std::{
 	collections::HashMap,
 	io::{self, Write},
 	path::PathBuf,
 	sync::Arc,
 };
-use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
-use tokio_tungstenite::{WebSocketStream, connect_async};
+use tokio::{fs::File, io::AsyncWriteExt, net::TcpStream, sync::Mutex};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::*;
 use vodozemac::Ed25519Keypair;
@@ -23,11 +23,17 @@ const PROMPT: &str = concat!(SOCKET, " > ");
 
 static IDENTITY_KEYPAIR: Lazy<Ed25519Keypair> = Lazy::new(|| Ed25519Keypair::new());
 
+// Messagable users should store target client identity key, as well as secret
+// At first, the secret will be your ephemeral secret,
+// but when you get a call back or receive a key exchange request,
+// it will be replaced by the diffie hellman derived shared secret
+static MESSAGEABLE_USERS: Lazy<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
+	Lazy::new(|| Mutex::new(HashMap::new()));
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
 	// The first hashmap entry will contain the other users' identity key.
 	// The second will be the shared secret from the key exchange.
-	let mut messageable_users: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
 
 	let (ws_stream, _) = connect_async(SOCKET).await?;
 	let (write, read) = ws_stream.split();
@@ -50,16 +56,18 @@ async fn main() -> anyhow::Result<()> {
 		while let Some(msg) = read.lock().await.next().await {
 			match msg {
 				Ok(Message::Binary(data)) => {
-					println!("\n[Notification] Received binary message: {:?}", data);
-					print!("{}", PROMPT);
-					io::stdout().flush().unwrap();
+					println!("\n[Notification] Received message: {:?}", data);
 				}
-				Ok(_) => {}
+				Ok(_) => {
+					println!("\n[Notification] Received something of unknown type.");
+				}
 				Err(e) => {
 					println!("\n[Notification] Error: {}", e);
 					break;
 				}
 			}
+			print!("{}", PROMPT);
+			io::stdout().flush().unwrap();
 		}
 	});
 
@@ -82,10 +90,7 @@ async fn main() -> anyhow::Result<()> {
 			"msg" | "key-exchange" => {
 				println!("{:?}", list_clients().await?);
 
-				print!(
-					"Enter target client\n(you are {}): ",
-					display_key(&pub_key_bytes)
-				);
+				print!("Enter target client: ");
 				io::stdout().flush()?;
 
 				let target_client = {
@@ -94,44 +99,44 @@ async fn main() -> anyhow::Result<()> {
 					parse_hex_key(input.trim())?
 				};
 
-				if list_clients().await?.contains(&display_key(&target_client)) {
-					if messageable_users.contains_key(&target_client) {
-						// TODO: Start messaging
-					} else {
-						print!("Key exchange has not been performed\nDo it now? (Y/n) ");
+				if MESSAGEABLE_USERS.lock().await.contains_key(&target_client) {
+					// TODO: Start messaging
+				} else {
+					print!("Key exchange has not been performed.\nDo it now? (Y/n) ");
+					io::stdout().flush()?;
 
-						let input: String = {
-							let mut input = String::new();
-							io::stdin().read_line(&mut input)?;
-							input
-						};
+					let input: String = {
+						let mut input = String::new();
+						io::stdin().read_line(&mut input)?;
+						input
+					};
 
-						match input.trim().to_lowercase().as_str() {
-							"y" | "" => {
-								send_key_exchange_request(target_client, write.clone()).await?;
-							}
-							_ => println!("Can't communicate without exchanging keys. Leaving..."),
+					match input.trim().to_lowercase().as_str() {
+						"y" | "" => {
+							send_key_exchange_request(target_client, write.clone()).await?;
+						}
+						_ => {
+							println!("Can't communicate without exchanging keys. Leaving...");
 						}
 					}
-				} else {
-					println!("Client not connected.");
 				}
 
-				// TODO: Make work
-				if let Ok(shared_secret) =
-					send_key_exchange_request(target_client, write.clone()).await
-				{
-					messageable_users.insert(target_client, *shared_secret.as_bytes());
-				}
+				// // TODO: Make work
+				// if let Ok(shared_secret) =
+				// 	send_key_exchange_request(target_client, write.clone()).await
+				// {
+				// 	messageable_users.insert(target_client, *shared_secret.as_bytes());
+				// }
 
-				send_message(target_client).await?;
+				// send_message(target_client).await?;
 
 				// TODO: Ensure that we have a shared secret key with the recipient.
 				// If not, we need to prompt them to initiate a key exchange.
 
 				// TODO encryption and zstd compression, then send message
 			}
-			_ => println!("Invalid option. Ignoring."), // Do nothing
+
+			_ => println!("Invalid option. Ignoring..."),
 		}
 	}
 }
@@ -148,17 +153,10 @@ async fn list_clients() -> anyhow::Result<Vec<String>> {
 
 async fn send_key_exchange_request(
 	target_client: [u8; 32],
-	write: Arc<
-		tokio::sync::Mutex<
-			SplitSink<
-				WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-				tungstenite::Message,
-			>,
-		>,
-	>,
-) -> anyhow::Result<SharedSecret> {
+	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+) -> anyhow::Result<()> {
 	let private_key = EphemeralSecret::random();
-	let public_key = PublicKey::from(&private_key); // TODO: Send this to the server
+	let public_key = PublicKey::from(&private_key);
 
 	let request = KeyExchangeRequest {
 		origin_identity_key: *IDENTITY_KEYPAIR.public_key().as_bytes(),
@@ -171,7 +169,7 @@ async fn send_key_exchange_request(
 		.to_bytes();
 
 	let signed_request = Signed {
-		generic: request,
+		data: request,
 		signature,
 	};
 
@@ -185,11 +183,7 @@ async fn send_key_exchange_request(
 		)))
 		.await?;
 
-	// TODO: Actually get the pub key from the server
-	let other_private_key = EphemeralSecret::random();
-	let other_public_key = PublicKey::from(&other_private_key);
-
-	Ok(private_key.diffie_hellman(&other_public_key))
+	Ok(())
 }
 
 async fn send_message(target_client: [u8; 32]) -> anyhow::Result<()> {
