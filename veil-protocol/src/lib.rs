@@ -5,6 +5,9 @@ pub struct Signed<T> {
 	pub data: T,
 	pub signature: [u8; 64],
 }
+impl<T> Signed<T> {
+	pub fn verify_signature(&self) {}
+}
 
 #[derive(Archive, Deserialize, Serialize)]
 pub enum ProtocolMessage {

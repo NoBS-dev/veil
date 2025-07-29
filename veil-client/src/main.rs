@@ -1,6 +1,8 @@
 use constcat::concat;
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use once_cell::sync::Lazy;
+use rand::rngs::OsRng;
 use rkyv::{rancor::Error, to_bytes};
 use std::{
 	collections::HashMap,
@@ -12,7 +14,7 @@ use tokio::{fs::File, io::AsyncWriteExt, net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::*;
-use vodozemac::Ed25519Keypair;
+// use vodozemac::Ed25519Keypair;
 use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
 // TODO: Let user specify ip/port
@@ -21,7 +23,8 @@ const SOCKET: &str = concat!("ws://", IP_AND_PORT);
 const URL: &str = concat!("http://", IP_AND_PORT);
 const PROMPT: &str = concat!(SOCKET, " > ");
 
-static IDENTITY_KEYPAIR: Lazy<Ed25519Keypair> = Lazy::new(|| Ed25519Keypair::new());
+// It's kinda confusing, but the signing key contains both the public and private keys
+static SIGNING_KEY: Lazy<SigningKey> = Lazy::new(|| SigningKey::generate(&mut OsRng));
 
 // Messagable users should store target client identity key, as well as secret
 // At first, the secret will be your ephemeral secret,
@@ -32,16 +35,13 @@ static MESSAGEABLE_USERS: Lazy<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	// The first hashmap entry will contain the other users' identity key.
-	// The second will be the shared secret from the key exchange.
-
 	let (ws_stream, _) = connect_async(SOCKET).await?;
 	let (write, read) = ws_stream.split();
 
 	let write = Arc::new(Mutex::new(write));
 	let read = Arc::new(Mutex::new(read));
 
-	let pub_key_bytes = *IDENTITY_KEYPAIR.public_key().as_bytes();
+	let pub_key_bytes = SIGNING_KEY.verifying_key().to_bytes();
 
 	write
 		.lock()
@@ -83,7 +83,7 @@ async fn main() -> anyhow::Result<()> {
 			"list" => {
 				println!("{:?}", list_clients().await?);
 			}
-			"quit" => {
+			"quit" | "exit" => {
 				println!("Quitting...");
 				std::process::exit(0);
 			}
@@ -159,14 +159,13 @@ async fn send_key_exchange_request(
 	let public_key = PublicKey::from(&private_key);
 
 	let request = KeyExchangeRequest {
-		origin_identity_key: *IDENTITY_KEYPAIR.public_key().as_bytes(),
+		origin_identity_key: SIGNING_KEY.verifying_key().to_bytes(),
+		// origin_identity_key: *IDENTITY_KEYPAIR.public_key().as_bytes(),
 		origin_public_key: *public_key.as_bytes(),
 		target_identity_key: target_client,
 	};
 
-	let signature = IDENTITY_KEYPAIR
-		.sign(&to_bytes::<Error>(&request)?)
-		.to_bytes();
+	let signature = SIGNING_KEY.sign(&to_bytes::<Error>(&request)?).to_bytes();
 
 	let signed_request = Signed {
 		data: request,
