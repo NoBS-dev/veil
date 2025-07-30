@@ -2234,6 +2234,7 @@ name = "veil-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "ed25519-dalek",
  "hex",
  "rkyv",
  "vodozemac",

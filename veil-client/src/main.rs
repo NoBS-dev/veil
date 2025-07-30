@@ -3,13 +3,14 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use once_cell::sync::Lazy;
 use rand::rngs::OsRng;
-use rkyv::{rancor::Error, to_bytes};
+use rkyv::{rancor::Error, to_bytes, util::AlignedVec};
 use std::{
 	collections::HashMap,
 	io::{self, Write},
 	path::PathBuf,
 	sync::Arc,
 };
+
 use tokio::{fs::File, io::AsyncWriteExt, net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tungstenite::{Bytes, protocol::Message};
@@ -160,17 +161,23 @@ async fn send_key_exchange_request(
 
 	let request = KeyExchangeRequest {
 		origin_identity_key: SIGNING_KEY.verifying_key().to_bytes(),
-		// origin_identity_key: *IDENTITY_KEYPAIR.public_key().as_bytes(),
-		origin_public_key: *public_key.as_bytes(),
+		origin_public_key: public_key.to_bytes(),
 		target_identity_key: target_client,
 	};
 
-	let signature = SIGNING_KEY.sign(&to_bytes::<Error>(&request)?).to_bytes();
+	// let signature = SIGNING_KEY.sign(&to_bytes::<Error>(&request)?).to_bytes();
+	let signature = sign_key_exchange(&request, SIGNING_KEY.verifying_key().as_bytes())?;
 
 	let signed_request = Signed {
 		data: request,
-		signature,
+		identity_pub_key: SIGNING_KEY.verifying_key().to_bytes(),
+		identity_signature: signature,
 	};
+
+	// TODO: Remove when done testing
+	if signed_request.verify_sig(&SIGNING_KEY.verifying_key())? {
+		println!("Signature verified successfully, yippee!!");
+	}
 
 	let archived_signed_request = to_bytes::<Error>(&signed_request)?;
 
@@ -211,4 +218,14 @@ async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 	}
 
 	Ok(())
+}
+
+// Uses the signing key to sign the request + the pub key, returns the signature within the result
+fn sign_key_exchange(
+	request: &KeyExchangeRequest,
+	identity_pub_key: &[u8; 32],
+) -> anyhow::Result<[u8; 64]> {
+	let mut data = to_bytes::<Error>(request)?;
+	data.extend_from_slice(identity_pub_key);
+	Ok(SIGNING_KEY.sign(&data).to_bytes())
 }
