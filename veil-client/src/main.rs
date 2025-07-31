@@ -165,7 +165,8 @@ async fn send_key_exchange_request(
 		target_identity_key: target_client,
 	};
 
-	// let signature = SIGNING_KEY.sign(&to_bytes::<Error>(&request)?).to_bytes();
+	let request = ProtocolMessage::KeyExchangeRequest(request);
+
 	let signature = sign_key_exchange(&request, SIGNING_KEY.verifying_key().as_bytes())?;
 
 	let signed_request = Signed {
@@ -175,7 +176,7 @@ async fn send_key_exchange_request(
 	};
 
 	// TODO: Remove when done testing
-	if signed_request.verify_sig(&SIGNING_KEY.verifying_key())? {
+	if signed_request.verify_sig()? {
 		println!("Signature verified successfully, yippee!!");
 	}
 
@@ -222,7 +223,7 @@ async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 
 // Uses the signing key to sign the request + the pub key, returns the signature within the result
 fn sign_key_exchange(
-	request: &KeyExchangeRequest,
+	request: &ProtocolMessage,
 	identity_pub_key: &[u8; 32],
 ) -> anyhow::Result<[u8; 64]> {
 	let mut data = to_bytes::<Error>(request)?;

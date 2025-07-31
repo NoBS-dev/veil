@@ -1,42 +1,37 @@
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rkyv::{
-	Archive, Deserialize, Serialize,
-	rancor::{Error, Strategy},
-	ser::{Serializer, allocator::ArenaHandle, sharing::Share},
-	to_bytes,
-	util::AlignedVec,
-};
+use rkyv::{Archive, Deserialize, Serialize, rancor::Error, to_bytes, util::AlignedVec};
 
-#[derive(Archive, Deserialize, Serialize)]
-pub struct Signed<T> {
-	pub data: T,
+#[derive(Archive, Deserialize, Serialize, Debug)]
+pub struct Signed {
+	pub data: ProtocolMessage,
 	pub identity_pub_key: [u8; 32],
 	pub identity_signature: [u8; 64],
 }
-impl<T> Signed<T>
-where
-	T: Archive + for<'a> Serialize<Strategy<Serializer<AlignedVec, ArenaHandle<'a>, Share>, Error>>,
-{
-	pub fn verify_sig(&self, identity_pub_key: &VerifyingKey) -> anyhow::Result<bool> {
+impl Signed {
+	pub fn verify_sig(&self) -> anyhow::Result<bool> {
 		let signature = Signature::from_bytes(&self.identity_signature);
 
-		let mut data_bytes: AlignedVec = to_bytes(&self.data)?;
+		let mut data_bytes = to_bytes::<Error>(&self.data)?;
 		data_bytes.extend_from_slice(&self.identity_pub_key);
 
-		identity_pub_key.verify(&data_bytes, &signature)?;
+		let pub_key = VerifyingKey::from_bytes(&self.identity_pub_key)?;
+
+		pub_key.verify(&data_bytes, &signature)?;
 
 		Ok(true)
 	}
 }
 
-#[derive(Archive, Deserialize, Serialize)]
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
 pub enum ProtocolMessage {
 	EncryptedMessage(EncryptedMessage),
 	KeyExchangeRequest(KeyExchangeRequest),
 	KeyExchangeResponse(KeyExchangeResponse),
 }
 
-#[derive(Archive, Deserialize, Serialize)]
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
 pub struct EncryptedMessage {
 	pub recipient: [u8; 32],
 
@@ -45,7 +40,8 @@ pub struct EncryptedMessage {
 }
 
 // Request will be sent by the client
-#[derive(Archive, Deserialize, Serialize)]
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
 pub struct KeyExchangeRequest {
 	pub origin_identity_key: [u8; 32],
 	pub origin_public_key: [u8; 32],
@@ -53,7 +49,8 @@ pub struct KeyExchangeRequest {
 }
 
 // Response will be sent by the server
-#[derive(Archive, Deserialize, Serialize)]
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
 pub struct KeyExchangeResponse {
 	pub origin_identity_key: [u8; 32],
 	pub target_identity_key: [u8; 32],
