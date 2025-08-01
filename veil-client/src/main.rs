@@ -171,12 +171,11 @@ async fn send_key_exchange_request(
 
 	let signed_request = Signed {
 		data: request,
-		identity_pub_key: SIGNING_KEY.verifying_key().to_bytes(),
 		identity_signature: signature,
 	};
 
 	// TODO: Remove when done testing
-	if signed_request.verify_sig()? {
+	if signed_request.verify_sig(&SIGNING_KEY.verifying_key().as_bytes())? {
 		println!("Signature verified successfully, yippee!!");
 	}
 
@@ -193,18 +192,65 @@ async fn send_key_exchange_request(
 	Ok(())
 }
 
-async fn send_message(target_client: [u8; 32]) -> anyhow::Result<()> {
-	print!("Enter message: ");
-	io::stdout().flush()?;
+async fn send_key_exchange_response(
+	binary_key_exchange_request: Vec<u8>,
+	target_client: [u8; 32],
+	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+) -> anyhow::Result<()> {
+	let private_key = EphemeralSecret::random();
+	let public_key = PublicKey::from(&private_key);
 
-	let message = {
-		let mut message = String::new();
-		io::stdin().read_line(&mut message)?;
-		message
+	let mut aligned: AlignedVec = AlignedVec::new();
+	aligned.extend_from_slice(&binary_key_exchange_request);
+
+	match rkyv::access::<ArchivedSigned, rkyv::rancor::Error>(&aligned) {
+		Ok(archived_signed) => match archived_signed.data {
+			_ => (),
+		},
+		Err(e) => println!("Error: {:?}", e),
+	}
+
+	let request = KeyExchangeRequest {
+		origin_identity_key: SIGNING_KEY.verifying_key().to_bytes(),
+		origin_public_key: public_key.to_bytes(),
+		target_identity_key: target_client,
 	};
+
+	let request = ProtocolMessage::KeyExchangeRequest(request);
+
+	let signature = sign_key_exchange(&request, SIGNING_KEY.verifying_key().as_bytes())?;
+
+	let signed_request = Signed {
+		data: request,
+		identity_signature: signature,
+	};
+
+	// TODO: Remove when done testing
+	if signed_request.verify_sig(&SIGNING_KEY.verifying_key().as_bytes())? {
+		println!("Signature verified successfully, yippee!!");
+	}
+
+	let archived_signed_request = to_bytes::<Error>(&signed_request)?;
+
+	write
+		.lock()
+		.await
+		.send(Message::Binary(Bytes::copy_from_slice(
+			&archived_signed_request,
+		)))
+		.await?;
 
 	Ok(())
 }
+
+async fn send_message(
+	target_client: [u8; 32],
+	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
+) -> anyhow::Result<()> {
+	// Need to finish key exchange responses first
+	Ok(())
+}
+
 async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 	// TODO: Actually account for encryption and serialization
 	if filename.exists() {

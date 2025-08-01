@@ -8,9 +8,8 @@ use axum::{
 	response::{IntoResponse, Response},
 	routing,
 };
-use core::convert::Infallible;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
-use rkyv::{Deserialize, deserialize, util::AlignedVec};
+use rkyv::{deserialize, util::AlignedVec};
 use std::{collections::HashMap, sync::LazyLock};
 use tokio::{net::TcpListener, sync::RwLock};
 use veil_protocol::*;
@@ -55,19 +54,70 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 				// I'm choosing not to add a _ so it will panic every time you try to use without it
 				Ok(archived_signed) => {
 					match deserialize::<Signed, rkyv::rancor::Error>(archived_signed) {
-						Ok(signed) => match signed.verify_sig() {
+						Ok(signed) => match signed.verify_sig(&public_key) {
 							Ok(true) => {
-								println!("Signature verified");
+								println!("Signature from {} verified", display_key(&public_key));
 
 								match signed.data {
 									ProtocolMessage::EncryptedMessage(msg) => {
-										println!("Received an encrypted msg: {:?}", msg)
+										// Key exchange response needs to be dnoe first
 									}
 									ProtocolMessage::KeyExchangeRequest(req) => {
-										println!("Received a key exchange request: {:?}", req)
+										println!("Received a key exchange request: {:?}", &req);
+										println!(
+											"Routing from {} to {}",
+											display_key(&public_key),
+											display_key(&req.target_identity_key)
+										);
+
+										if let Some(sender) =
+											CLIENTS.write().await.get_mut(&req.target_identity_key)
+										{
+											if let Err(e) =
+												sender.send(Message::Binary(bytes.clone())).await
+											{
+												eprintln!(
+													"Failed to send key exchange request to {}: {:?}",
+													display_key(&req.target_identity_key),
+													e
+												);
+											} else {
+												println!("Key exchange request sent");
+											}
+										} else {
+											println!(
+												"Recipient {} not connected. Dropping key exchange request.",
+												display_key(&req.target_identity_key)
+											);
+										}
 									}
 									ProtocolMessage::KeyExchangeResponse(resp) => {
-										println!("Received a key exchange response: {:?}", resp)
+										println!(
+											"Routing key exchange response from {} to {}",
+											display_key(&public_key),
+											display_key(&resp.target_identity_key)
+										);
+
+										if let Some(sender) =
+											CLIENTS.write().await.get_mut(&resp.target_identity_key)
+										{
+											if let Err(e) =
+												sender.send(Message::Binary(bytes.clone())).await
+											{
+												eprintln!(
+													"Failed to send key exchange response to {}: {:?}",
+													display_key(&resp.target_identity_key),
+													e
+												);
+											} else {
+												println!("Key exchange response sent");
+											}
+										} else {
+											println!(
+												"Recipient {} not connected. Dropping key exchange response.",
+												display_key(&resp.target_identity_key)
+											);
+										}
 									}
 								}
 							}

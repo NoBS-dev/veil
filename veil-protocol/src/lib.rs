@@ -4,17 +4,16 @@ use rkyv::{Archive, Deserialize, Serialize, rancor::Error, to_bytes, util::Align
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Signed {
 	pub data: ProtocolMessage,
-	pub identity_pub_key: [u8; 32],
 	pub identity_signature: [u8; 64],
 }
 impl Signed {
-	pub fn verify_sig(&self) -> anyhow::Result<bool> {
+	pub fn verify_sig(&self, identity_pub_key: &[u8; 32]) -> anyhow::Result<bool> {
 		let signature = Signature::from_bytes(&self.identity_signature);
 
 		let mut data_bytes = to_bytes::<Error>(&self.data)?;
-		data_bytes.extend_from_slice(&self.identity_pub_key);
+		data_bytes.extend_from_slice(identity_pub_key);
 
-		let pub_key = VerifyingKey::from_bytes(&self.identity_pub_key)?;
+		let pub_key = VerifyingKey::from_bytes(&identity_pub_key)?;
 
 		pub_key.verify(&data_bytes, &signature)?;
 
