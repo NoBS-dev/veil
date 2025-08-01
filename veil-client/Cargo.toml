@@ -14,9 +14,8 @@ vodozemac = "0.9"
 veil-protocol = { path = "../veil-protocol" }
 tungstenite = "0.27"
 reqwest = "0.12"
-once_cell = "1"
 rkyv = { version = "0.8", features = ["std", "alloc"] }
-zstd = "0.1"
+zstd = "0.13"
 x25519-dalek = { version = "2", features = ["getrandom"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

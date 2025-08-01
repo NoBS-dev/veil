@@ -1,22 +1,17 @@
 use constcat::concat;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use futures_util::{SinkExt, StreamExt, stream::SplitSink};
-use once_cell::sync::Lazy;
+use ed25519_dalek::{Signer, SigningKey};
+use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
-use rkyv::{rancor::Error, to_bytes, util::AlignedVec};
+use rkyv::{rancor::Error, to_bytes};
 use std::{
 	collections::HashMap,
 	io::{self, Write},
 	path::PathBuf,
-	sync::Arc,
 };
-
-use tokio::{fs::File, io::AsyncWriteExt, net::TcpStream, sync::Mutex};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio::{fs::File, io::AsyncWriteExt};
 use tungstenite::{Bytes, protocol::Message};
-use veil_protocol::*;
-// use vodozemac::Ed25519Keypair;
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use veil_protocol::{KeyExchangeRequest, ProtocolMessage, Signed, display_key, parse_hex_key};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 // TODO: Let user specify ip/port
 const IP_AND_PORT: &str = "localhost:3000";
@@ -24,29 +19,23 @@ const SOCKET: &str = concat!("ws://", IP_AND_PORT);
 const URL: &str = concat!("http://", IP_AND_PORT);
 const PROMPT: &str = concat!(SOCKET, " > ");
 
-// It's kinda confusing, but the signing key contains both the public and private keys
-static SIGNING_KEY: Lazy<SigningKey> = Lazy::new(|| SigningKey::generate(&mut OsRng));
-
-// Messagable users should store target client identity key, as well as secret
-// At first, the secret will be your ephemeral secret,
-// but when you get a call back or receive a key exchange request,
-// it will be replaced by the diffie hellman derived shared secret
-static MESSAGEABLE_USERS: Lazy<Mutex<HashMap<[u8; 32], [u8; 32]>>> =
-	Lazy::new(|| Mutex::new(HashMap::new()));
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	let (ws_stream, _) = connect_async(SOCKET).await?;
-	let (write, read) = ws_stream.split();
+	// It's kinda confusing, but the signing key contains both the public and private keys
+	let signing_key = SigningKey::generate(&mut OsRng);
 
-	let write = Arc::new(Mutex::new(write));
-	let read = Arc::new(Mutex::new(read));
+	// Messagable users should store target client identity key, as well as secret
+	// At first, the secret will be your ephemeral secret,
+	// but when you get a call back or receive a key exchange request,
+	// it will be replaced by the diffie hellman derived shared secret
+	let messageable_users: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
 
-	let pub_key_bytes = SIGNING_KEY.verifying_key().to_bytes();
+	let (ws_stream, _) = tokio_tungstenite::connect_async(SOCKET).await?;
+	let (mut write, mut read) = ws_stream.split();
+
+	let pub_key_bytes = signing_key.verifying_key().to_bytes();
 
 	write
-		.lock()
-		.await
 		.send(Message::Binary(Bytes::copy_from_slice(&pub_key_bytes)))
 		.await?;
 
@@ -54,27 +43,27 @@ async fn main() -> anyhow::Result<()> {
 
 	// Spawn a task to listen for incoming notifs
 	tokio::spawn(async move {
-		while let Some(msg) = read.lock().await.next().await {
+		while let Some(msg) = read.next().await {
 			match msg {
 				Ok(Message::Binary(data)) => {
-					println!("\n[Notification] Received message: {:?}", data);
+					println!("\n[Notification] Received message: {data:?}");
 				}
 				Ok(_) => {
 					println!("\n[Notification] Received something of unknown type.");
 				}
 				Err(e) => {
-					println!("\n[Notification] Error: {}", e);
+					println!("\n[Notification] Error: {e}");
 					break;
 				}
 			}
-			print!("{}", PROMPT);
+			print!("{PROMPT}");
 			io::stdout().flush().unwrap();
 		}
 	});
 
 	// Talking to server
 	loop {
-		print!("{}", PROMPT);
+		print!("{PROMPT}");
 		io::stdout().flush()?;
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
@@ -100,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
 					parse_hex_key(input.trim())?
 				};
 
-				if MESSAGEABLE_USERS.lock().await.contains_key(&target_client) {
+				if messageable_users.contains_key(&target_client) {
 					// TODO: Start messaging
 				} else {
 					print!("Key exchange has not been performed.\nDo it now? (Y/n) ");
@@ -114,7 +103,9 @@ async fn main() -> anyhow::Result<()> {
 
 					match input.trim().to_lowercase().as_str() {
 						"y" | "" => {
-							send_key_exchange_request(target_client, write.clone()).await?;
+							write
+								.send(key_exchange_request(&signing_key, target_client).await?)
+								.await?
 						}
 						_ => {
 							println!("Can't communicate without exchanging keys. Leaving...");
@@ -122,11 +113,9 @@ async fn main() -> anyhow::Result<()> {
 					}
 				}
 
-				// // TODO: Make work
-				// if let Ok(shared_secret) =
-				// 	send_key_exchange_request(target_client, write.clone()).await
-				// {
-				// 	messageable_users.insert(target_client, *shared_secret.as_bytes());
+				// TODO: Make work
+				// if let Ok(shared_secret) = key_exchange_request(&signing_key, target_client).await {
+				// 	messageable_users.insert(target_client, shared_secret);
 				// }
 
 				// send_message(target_client).await?;
@@ -143,7 +132,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn list_clients() -> anyhow::Result<Vec<String>> {
-	Ok(reqwest::get(format!("{}/clients", URL))
+	Ok(reqwest::get(format!("{URL}/clients"))
 		.await?
 		.text()
 		.await?
@@ -152,22 +141,26 @@ async fn list_clients() -> anyhow::Result<Vec<String>> {
 		.collect())
 }
 
-async fn send_key_exchange_request(
+async fn key_exchange_request(
+	signing_key: &SigningKey,
 	target_client: [u8; 32],
-	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Message> {
 	let private_key = EphemeralSecret::random();
 	let public_key = PublicKey::from(&private_key);
 
 	let request = KeyExchangeRequest {
-		origin_identity_key: SIGNING_KEY.verifying_key().to_bytes(),
+		origin_identity_key: signing_key.verifying_key().to_bytes(),
 		origin_public_key: public_key.to_bytes(),
 		target_identity_key: target_client,
 	};
 
 	let request = ProtocolMessage::KeyExchangeRequest(request);
 
-	let signature = sign_key_exchange(&request, SIGNING_KEY.verifying_key().as_bytes())?;
+	let signature = sign_key_exchange(
+		&request,
+		signing_key.verifying_key().as_bytes(),
+		&signing_key,
+	)?;
 
 	let signed_request = Signed {
 		data: request,
@@ -175,79 +168,27 @@ async fn send_key_exchange_request(
 	};
 
 	// TODO: Remove when done testing
-	if signed_request.verify_sig(&SIGNING_KEY.verifying_key().as_bytes())? {
+	if signed_request.verify_sig(signing_key.verifying_key().as_bytes())? {
 		println!("Signature verified successfully, yippee!!");
 	}
 
 	let archived_signed_request = to_bytes::<Error>(&signed_request)?;
 
-	write
-		.lock()
-		.await
-		.send(Message::Binary(Bytes::copy_from_slice(
-			&archived_signed_request,
-		)))
-		.await?;
-
-	Ok(())
+	Ok(Message::Binary(Bytes::copy_from_slice(
+		&archived_signed_request,
+	)))
 }
 
-async fn send_key_exchange_response(
-	binary_key_exchange_request: Vec<u8>,
-	target_client: [u8; 32],
-	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-) -> anyhow::Result<()> {
-	let private_key = EphemeralSecret::random();
-	let public_key = PublicKey::from(&private_key);
+async fn send_message(target_client: [u8; 32]) -> anyhow::Result<()> {
+	print!("Enter message: ");
+	io::stdout().flush()?;
 
-	let mut aligned: AlignedVec = AlignedVec::new();
-	aligned.extend_from_slice(&binary_key_exchange_request);
-
-	match rkyv::access::<ArchivedSigned, rkyv::rancor::Error>(&aligned) {
-		Ok(archived_signed) => match archived_signed.data {
-			_ => (),
-		},
-		Err(e) => println!("Error: {:?}", e),
-	}
-
-	let request = KeyExchangeRequest {
-		origin_identity_key: SIGNING_KEY.verifying_key().to_bytes(),
-		origin_public_key: public_key.to_bytes(),
-		target_identity_key: target_client,
+	let message = {
+		let mut message = String::new();
+		io::stdin().read_line(&mut message)?;
+		message
 	};
 
-	let request = ProtocolMessage::KeyExchangeRequest(request);
-
-	let signature = sign_key_exchange(&request, SIGNING_KEY.verifying_key().as_bytes())?;
-
-	let signed_request = Signed {
-		data: request,
-		identity_signature: signature,
-	};
-
-	// TODO: Remove when done testing
-	if signed_request.verify_sig(&SIGNING_KEY.verifying_key().as_bytes())? {
-		println!("Signature verified successfully, yippee!!");
-	}
-
-	let archived_signed_request = to_bytes::<Error>(&signed_request)?;
-
-	write
-		.lock()
-		.await
-		.send(Message::Binary(Bytes::copy_from_slice(
-			&archived_signed_request,
-		)))
-		.await?;
-
-	Ok(())
-}
-
-async fn send_message(
-	target_client: [u8; 32],
-	write: Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-) -> anyhow::Result<()> {
-	// Need to finish key exchange responses first
 	Ok(())
 }
 
@@ -256,12 +197,12 @@ async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 	if filename.exists() {
 		// File exists, open and read it
 		let contents = tokio::fs::read_to_string(&filename).await?;
-		println!("File contents: {}", contents);
+		println!("File contents: {contents}");
 	} else {
 		// // File doesn't exist, create it and write some data
 		let mut file = File::create(&filename).await?;
 		file.write_all(b"New file created").await?;
-		println!("Created new file: {:?}", filename);
+		println!("Created new file: {filename:?}");
 	}
 
 	Ok(())
@@ -271,8 +212,9 @@ async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
 fn sign_key_exchange(
 	request: &ProtocolMessage,
 	identity_pub_key: &[u8; 32],
+	signing_key: &SigningKey,
 ) -> anyhow::Result<[u8; 64]> {
 	let mut data = to_bytes::<Error>(request)?;
 	data.extend_from_slice(identity_pub_key);
-	Ok(SIGNING_KEY.sign(&data).to_bytes())
+	Ok(signing_key.sign(&data).to_bytes())
 }

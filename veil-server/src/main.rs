@@ -60,7 +60,8 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 
 								match signed.data {
 									ProtocolMessage::EncryptedMessage(msg) => {
-										// Key exchange response needs to be dnoe first
+										// Key exchange response needs to be done first
+										println!("Received an encrypted msg: {msg:?}")
 									}
 									ProtocolMessage::KeyExchangeRequest(req) => {
 										println!("Received a key exchange request: {:?}", &req);
@@ -77,9 +78,8 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 												sender.send(Message::Binary(bytes.clone())).await
 											{
 												eprintln!(
-													"Failed to send key exchange request to {}: {:?}",
+													"Failed to send key exchange request to {}: {e:?}",
 													display_key(&req.target_identity_key),
-													e
 												);
 											} else {
 												println!("Key exchange request sent");
@@ -122,12 +122,12 @@ async fn socket(socket: WebSocketUpgrade) -> Response {
 								}
 							}
 							Ok(false) => println!("Invalid signature"),
-							Err(e) => eprintln!("Signature verification error: {:?}", e),
+							Err(e) => eprintln!("Signature verification error: {e:?}"),
 						},
-						Err(e) => eprintln!("Failed to deserialize Signed: {:?}", e),
+						Err(e) => eprintln!("Failed to deserialize Signed: {e:?}"),
 					}
 				}
-				Err(e) => println!("Failed to deserialize: {:?}", e),
+				Err(e) => println!("Failed to deserialize: {e:?}"),
 			}
 
 			// let message = if let Ok(message) =

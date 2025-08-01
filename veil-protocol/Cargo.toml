@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-anyhow = "1.0.98"
-hex = "0.4.3"
+anyhow = "1"
+hex = "0.4"
 rkyv = { version = "0.8", features = ["alloc"] }
-vodozemac = "0.9"
 ed25519-dalek = { version = "2", features = ["rand_core"] }

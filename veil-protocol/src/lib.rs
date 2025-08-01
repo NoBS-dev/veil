@@ -1,5 +1,5 @@
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use rkyv::{Archive, Deserialize, Serialize, rancor::Error, to_bytes, util::AlignedVec};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use rkyv::{Archive, Deserialize, Serialize, rancor::Error, to_bytes};
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Signed {
