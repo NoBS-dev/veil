@@ -3,6 +3,7 @@ use rkyv::{
 	Archive, Deserialize, Serialize, deserialize, rancor::Error, to_bytes, util::AlignedVec,
 };
 use tungstenite::Bytes;
+use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Signed {
@@ -67,6 +68,7 @@ pub struct KeyExchangeResponse {
 	pub initiator_identity_key: [u8; 32],
 	// Implement double ratchet later, keys other than identity should only be used once
 	pub recipient_public_key: [u8; 32],
+	pub recipient_identity_key: [u8; 32],
 }
 
 pub fn display_key(bytes: &[u8; 32]) -> String {

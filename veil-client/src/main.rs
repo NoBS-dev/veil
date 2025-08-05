@@ -1,9 +1,9 @@
 use constcat::concat;
+use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
 use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
 use std::{
-	collections::HashMap,
 	io::{self, Write},
 	path::PathBuf,
 	sync::Arc,
@@ -31,7 +31,11 @@ async fn main() -> anyhow::Result<()> {
 	// At first, the secret will be your ephemeral secret,
 	// but when you get a call back or receive a key exchange request,
 	// it will be replaced by the diffie hellman derived shared secret
-	let messageable_users: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+	let messageable_users: Arc<DashMap<[u8; 32], [u8; 32]>> = Arc::new(DashMap::new());
+	let messageable_users_clone = messageable_users.clone();
+
+	let pending_key_exchanges: Arc<DashMap<[u8; 32], EphemeralSecret>> = Arc::new(DashMap::new());
+	let pending_key_exchanges_clone = pending_key_exchanges.clone();
 
 	let (ws_stream, _) = tokio_tungstenite::connect_async(SOCKET).await?;
 	let (write, mut read) = ws_stream.split();
@@ -60,19 +64,31 @@ async fn main() -> anyhow::Result<()> {
 							println!("[Notification] Received a key exchange request: {req:?}");
 							println!("Sending a key exchange response...");
 
-							write_clone
-								.lock()
-								.await
-								.send(
-									generate_key_exchange_response(&req, &signing_key)
-										.await
-										.unwrap(),
-								)
-								.await
-								.unwrap();
+							if let Ok(response_msg) = generate_key_exchange_response(
+								&req,
+								&signing_key_clone,
+								&messageable_users_clone,
+							)
+							.await
+							{
+								if let Err(e) = write_clone.lock().await.send(response_msg).await {
+									eprintln!("Failed to send key exchange response: {e:?}");
+								} else {
+									println!("Key exchange response sent.");
+								}
+							} else {
+								eprintln!("Failed to build key exchange response.");
+							}
 						}
 						ProtocolMessage::KeyExchangeResponse(resp) => {
 							println!("[Notification] Receieved a key exchange response: {resp:?}");
+
+							handle_key_exchange_response(
+								&resp,
+								&pending_key_exchanges_clone,
+								&messageable_users_clone,
+							)
+							.await;
 						}
 						_ => println!("[Notification] Received message: {data:?}"),
 					},
@@ -133,36 +149,21 @@ async fn main() -> anyhow::Result<()> {
 
 					match input.trim().to_lowercase().as_str() {
 						"y" | "" => {
-							write
-								.lock()
-								.await
-								.send(
-									generate_key_exchange_request(
-										pub_key_bytes,
-										target_client,
-										&signing_key_clone,
-									)
-									.await?,
-								)
-								.await?
+							// TODO: Figure out how to not store the ephemeral key, but also use it to diffie hellman the other's public key once a response arrives
+							let message = generate_key_exchange_request(
+								pub_key_bytes,
+								target_client,
+								&signing_key,
+								&pending_key_exchanges,
+							)
+							.await?;
+							write.lock().await.send(message).await?;
 						}
 						_ => {
 							println!("Can't communicate without exchanging keys. Leaving...");
 						}
 					}
 				}
-
-				// TODO: Make work
-				// if let Ok(shared_secret) = key_exchange_request(&signing_key, target_client).await {
-				// 	messageable_users.insert(target_client, shared_secret);
-				// }
-
-				// send_message(target_client).await?;
-
-				// TODO: Ensure that we have a shared secret key with the recipient.
-				// If not, we need to prompt them to initiate a key exchange.
-
-				// TODO encryption and zstd compression, then send message
 			}
 
 			_ => println!("Invalid option. Ignoring..."),
@@ -181,22 +182,23 @@ async fn list_clients() -> anyhow::Result<Vec<String>> {
 }
 
 async fn generate_key_exchange_request(
-	initiator_identity_key: [u8; 32],
+	recipient_identity_key: [u8; 32],
 	target_client: [u8; 32],
 	signing_key: &SigningKey,
-) -> anyhow::Result<Message> {
+	pending_key_exchanges: &DashMap<[u8; 32], EphemeralSecret>,
+) -> anyhow::Result<(Message)> {
 	let private_key = EphemeralSecret::random();
 	let public_key = PublicKey::from(&private_key);
 
-	let request = KeyExchangeRequest {
-		initiator_identity_key,
+	let request = ProtocolMessage::KeyExchangeRequest(KeyExchangeRequest {
+		initiator_identity_key: recipient_identity_key,
 		initiator_public_key: public_key.to_bytes(),
 		recipient_identity_key: target_client,
-	};
-
-	let request = ProtocolMessage::KeyExchangeRequest(request);
+	});
 
 	let archived_signed_request = Signed::new_archived(request, signing_key)?;
+
+	pending_key_exchanges.insert(target_client, private_key);
 
 	Ok(Message::Binary(Bytes::copy_from_slice(
 		archived_signed_request.as_slice(),
@@ -206,17 +208,21 @@ async fn generate_key_exchange_request(
 async fn generate_key_exchange_response(
 	request: &KeyExchangeRequest,
 	signing_key: &SigningKey,
+	messageable_users: &DashMap<[u8; 32], [u8; 32]>,
 ) -> anyhow::Result<Message> {
 	let private_key = EphemeralSecret::random();
 	let public_key = PublicKey::from(&private_key);
 	let shared_secret = private_key.diffie_hellman(&PublicKey::from(request.initiator_public_key));
 
-	println!("{}", display_key(&shared_secret.as_bytes()));
+	println!("Shared secret: {}", display_key(&shared_secret.as_bytes()));
 
 	let response = KeyExchangeResponse {
 		initiator_identity_key: request.initiator_identity_key,
 		recipient_public_key: public_key.to_bytes(),
+		recipient_identity_key: signing_key.verifying_key().to_bytes(),
 	};
+
+	messageable_users.insert(response.initiator_identity_key, shared_secret.to_bytes());
 
 	let archived_signed_response =
 		Signed::new_archived(ProtocolMessage::KeyExchangeResponse(response), signing_key)?;
@@ -224,6 +230,27 @@ async fn generate_key_exchange_response(
 	Ok(Message::Binary(Bytes::copy_from_slice(
 		archived_signed_response.as_slice(),
 	)))
+}
+
+async fn handle_key_exchange_response(
+	response: &KeyExchangeResponse,
+	pending_key_exchanges: &DashMap<[u8; 32], EphemeralSecret>,
+	messageable_users: &DashMap<[u8; 32], [u8; 32]>,
+) {
+	println!("Handling key exchange response...");
+
+	if let Some((_, private_key)) = pending_key_exchanges.remove(&response.recipient_identity_key) {
+		let shared_secret =
+			private_key.diffie_hellman(&PublicKey::from(response.recipient_public_key));
+
+		println!("Shared secret: {}", display_key(shared_secret.as_bytes()));
+
+		messageable_users.insert(response.recipient_identity_key, shared_secret.to_bytes());
+	} else {
+		eprintln!(
+			"Something went wrong extracting the ephemeral key from the pending key exchanges map."
+		);
+	}
 }
 
 async fn send_message(target_client: [u8; 32]) -> anyhow::Result<()> {
