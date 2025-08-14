@@ -4,7 +4,7 @@ use rkyv::{
 use tungstenite::Bytes;
 use vodozemac::{
 	Ed25519PublicKey, Ed25519Signature,
-	olm::{Account, OlmMessage, Session},
+	olm::{Account, Session},
 };
 
 pub struct PeerSession {
@@ -46,14 +46,12 @@ impl Signed {
 #[rkyv(attr(derive(Debug)))]
 pub enum ProtocolMessage {
 	UploadKeys(UploadKeys),
-	// KeyRequest([u8; 32]), // recipient identity key
 	EncryptedMessage(EncryptedMessage),
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(attr(derive(Debug)))]
 pub struct UploadKeys {
-	// pub identity_key: [u8; 32],   // ed25519 key
 	pub encryption_key: [u8; 32], // x25519 key
 	pub one_time_keys: Vec<[u8; 32]>,
 }
@@ -93,12 +91,7 @@ pub async fn process_data(
 	let archived_signed = rkyv::access::<ArchivedSigned, rkyv::rancor::Error>(&aligned)?;
 	let signed = deserialize::<Signed, rkyv::rancor::Error>(archived_signed)?;
 
-	if signed.verify_sig()? {
-		// println!(
-		// 	"Signature verified: {}",
-		// 	display_key(&signed.ed25519_public_key)
-		// );
-	} else {
+	if !signed.verify_sig()? {
 		anyhow::bail!(
 			"Signature was received from {} and deserialized properly, though is invalid.",
 			display_key(&sender_public_key)

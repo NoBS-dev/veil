@@ -1,21 +1,39 @@
+// NOTE: If you are adding a new feature, MAKE SURE that you are persisting the state after if you want that stuff to be saved.
+
+use anyhow::{Context, Result};
 use constcat::concat;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use keyring::Entry;
+use serde::{Deserialize, Serialize};
 use std::{
 	io::{self, Write},
-	path::PathBuf,
 	sync::Arc,
 };
-use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
+use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
 	EncryptedMessage, PeerSession, ProtocolMessage, Signed, UploadKeys, display_key, parse_hex_key,
 	process_data,
 };
 use vodozemac::{
-	Curve25519PublicKey, Ed25519PublicKey,
-	olm::{Account, MessageType, OlmMessage, Session, SessionConfig},
+	Curve25519PublicKey,
+	olm::{Account, AccountPickle, OlmMessage, Session, SessionConfig, SessionPickle},
 };
+
+#[derive(Serialize, Deserialize)]
+struct PersistedPeer {
+	identity_key: [u8; 32],
+	x25519: [u8; 32],
+	session: SessionPickle,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedState {
+	account: AccountPickle,
+	peers: Vec<PersistedPeer>,
+	version: u32,
+}
 
 // TODO: Let user specify ip/port
 const IP_AND_PORT: &str = "localhost:3000";
@@ -25,25 +43,54 @@ const PROMPT: &str = concat!(SOCKET, " > ");
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	// Try to load from keyring; fall back to fresh account + empty map.
+	let (acc, msgable_users): (Arc<Mutex<Account>>, Arc<DashMap<[u8; 32], PeerSession>>) =
 	// Messagable users should store target client identity key, as well as secret
 	// At first, the secret will be your ephemeral secret,
 	// but when you get a call back or receive a key exchange request,
 	// it will be replaced by the diffie hellman derived shared secret
-	let messageable_users: Arc<DashMap<[u8; 32], PeerSession>> = Arc::new(DashMap::new());
-	let messageable_users_clone = messageable_users.clone();
+		match load_state_keyring() {
+			Ok(state) => {
+				let account = Account::from_pickle(state.account);
+				let map = Arc::new(DashMap::new());
+				for p in state.peers {
+					let session = Session::from_pickle(p.session);
+					map.insert(
+						p.identity_key,
+						PeerSession {
+							x25519: p.x25519,
+							session,
+						},
+					);
+				}
+
+				eprintln!("Prior state found. Loading...");
+
+				(Arc::new(Mutex::new(account)), map)
+			}
+			Err(e) => {
+				eprintln!(
+					"[state] No prior state in keyring (or failed to load): {e:#}. Generating a new profile..."
+				);
+				(
+					Arc::new(Mutex::new(Account::new())),
+					Arc::new(DashMap::new()),
+				)
+			}
+		};
+
+	let msgable_users_clone = msgable_users.clone();
+	let acc_clone = acc.clone();
 
 	let (ws_stream, _) = tokio_tungstenite::connect_async(SOCKET).await?;
 	let (write, mut read) = ws_stream.split();
 	let write = Arc::new(Mutex::new(write));
-	let write_clone = write.clone();
-
-	let acc = Arc::new(Mutex::new(Account::new()));
-	let acc_clone = acc.clone();
+	// let write_clone = write.clone();
 
 	let mut acc_guard = acc.lock().await;
 	let pub_key_bytes = acc_guard.ed25519_key().as_bytes().clone();
 	let pub_key_bytes_clone = pub_key_bytes.clone();
-	let signing_key_clone = acc_guard.identity_keys().ed25519.clone();
+	// let signing_key_clone = acc_guard.identity_keys().ed25519.clone();
 
 	write
 		.lock()
@@ -64,7 +111,6 @@ async fn main() -> anyhow::Result<()> {
 		.collect();
 
 	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
-		// identity_key: acc_guard.identity_keys().ed25519.as_bytes().clone(),
 		encryption_key: acc_guard.curve25519_key().to_bytes(),
 		one_time_keys: otks,
 	});
@@ -80,6 +126,8 @@ async fn main() -> anyhow::Result<()> {
 	acc_guard.mark_keys_as_published();
 
 	drop(acc_guard);
+
+	save_state(&acc, &msgable_users).await?;
 
 	// Listener
 	tokio::spawn(async move {
@@ -99,13 +147,19 @@ async fn main() -> anyhow::Result<()> {
 									Curve25519PublicKey::from(resp.one_time_keys[0]),
 								);
 
-								messageable_users_clone.insert(
+								msgable_users_clone.insert(
 									sender_pub_key,
 									PeerSession {
 										x25519: resp.encryption_key,
 										session: session,
 									},
 								);
+
+								if let Err(e) = save_state(&acc_clone, &msgable_users_clone).await {
+									eprintln!("Save state failed: {e:?}");
+								} else {
+									eprintln!("Saved!");
+								}
 							}
 							ProtocolMessage::EncryptedMessage(message) => {
 								println!("Received a msg: {message:?}");
@@ -131,15 +185,22 @@ async fn main() -> anyhow::Result<()> {
 												println!("Failed to create inbound session.");
 											}
 										}
-										OlmMessage::Normal(normal_msg) => {
+										OlmMessage::Normal(_) => {
 											println!("Received normal message.");
 										}
+									}
+
+									if let Err(e) =
+										save_state(&acc_clone, &msgable_users_clone).await
+									{
+										eprintln!("Save state failed: {e:?}");
+									} else {
+										eprintln!("Saved!");
 									}
 								} else {
 									println!("Invalid message received.");
 								}
 							}
-							_ => println!("[Notification] Received message: {data:?}"),
 						}
 					}
 				}
@@ -183,7 +244,7 @@ async fn main() -> anyhow::Result<()> {
 				std::process::exit(0);
 			}
 			"msgable" => {
-				for entry in messageable_users.iter() {
+				for entry in msgable_users.iter() {
 					println!("{}", display_key(entry.key()));
 				}
 			}
@@ -199,7 +260,7 @@ async fn main() -> anyhow::Result<()> {
 					parse_hex_key(input.trim())?
 				};
 
-				if messageable_users.contains_key(&target_client) {
+				if msgable_users.contains_key(&target_client) {
 					// TODO: Start messaging
 				} else {
 					if let Ok((encryption_key, otk)) =
@@ -214,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
 							)
 						};
 
-						messageable_users.insert(
+						msgable_users.insert(
 							target_client,
 							PeerSession {
 								x25519: encryption_key,
@@ -225,7 +286,7 @@ async fn main() -> anyhow::Result<()> {
 						let msg = build_message(
 							acc_guard.curve25519_key().to_bytes(),
 							target_client,
-							&messageable_users,
+							&msgable_users,
 						)
 						.await?;
 
@@ -239,6 +300,12 @@ async fn main() -> anyhow::Result<()> {
 
 						println!("Sent a pre-key message to {}", display_key(&target_client));
 					}
+				}
+
+				if let Err(e) = save_state(&acc, &msgable_users).await {
+					eprintln!("Save state failed: {e:?}");
+				} else {
+					eprintln!("Saved!");
 				}
 			}
 
@@ -287,22 +354,6 @@ async fn build_message(
 	}
 }
 
-async fn open_or_save_to_file(filename: PathBuf) -> anyhow::Result<()> {
-	// TODO: Actually account for encryption and serialization
-	if filename.exists() {
-		// File exists, open and read it
-		let contents = tokio::fs::read_to_string(&filename).await?;
-		println!("File contents: {contents}");
-	} else {
-		// // File doesn't exist, create it and write some data
-		let mut file = File::create(&filename).await?;
-		file.write_all(b"New file created").await?;
-		println!("Created new file: {filename:?}");
-	}
-
-	Ok(())
-}
-
 async fn fetch_encryption_key_and_otk(
 	target_identity_key: &[u8; 32],
 ) -> anyhow::Result<([u8; 32], [u8; 32])> {
@@ -317,4 +368,53 @@ async fn fetch_encryption_key_and_otk(
 	let otk = parse_hex_key(lines.next().ok_or_else(|| anyhow::anyhow!("missing otk"))?)?;
 
 	Ok((encryption_key, otk))
+}
+
+fn save_state_keyring(state: &PersistedState) -> Result<()> {
+	let json = serde_json::to_string(state).context("Serializing persisted state")?;
+
+	let entry = Entry::new("veil-client", "default").context("Opening keyring entry")?;
+
+	entry
+		.set_password(&json)
+		.context("Storing state in keyring")?;
+
+	Ok(())
+}
+
+fn load_state_keyring() -> Result<PersistedState> {
+	let entry = Entry::new("veil-client", "default").context("Opening keyring entry")?;
+
+	let json = entry.get_password().context("Reading state from keyring")?;
+
+	let state: PersistedState =
+		serde_json::from_str(&json).context("Deserializing persisted state")?;
+
+	Ok(state)
+}
+
+async fn save_state(
+	acc: &Arc<Mutex<Account>>,
+	peers: &Arc<DashMap<[u8; 32], PeerSession>>,
+) -> Result<()> {
+	let pickle = acc.lock().await.pickle();
+
+	let mut peers_vec = Vec::with_capacity(peers.len());
+	for entry in peers.iter() {
+		peers_vec.push(PersistedPeer {
+			identity_key: *entry.key(),
+			x25519: entry.x25519,
+			session: entry.session.pickle(),
+		});
+	}
+
+	let state = PersistedState {
+		account: pickle,
+		peers: peers_vec,
+		version: 1,
+	};
+
+	// This is a quick blocking call; fine for occasional saves.
+	// If you expect it to be hot, wrap with tokio::task::spawn_blocking.
+	save_state_keyring(&state)
 }

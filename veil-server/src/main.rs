@@ -81,8 +81,8 @@ async fn socket(socket: WebSocketUpgrade, State(state): State<ServerState>) -> R
 	socket.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(mut socket: WebSocket, state: ServerState) {
-	let (mut sender, mut receiver) = socket.split();
+async fn handle_socket(socket: WebSocket, state: ServerState) {
+	let (sender, mut receiver) = socket.split();
 
 	let public_key = if let Some(Ok(Message::Binary(bytes))) = receiver.next().await {
 		if bytes.len() != 32 {
@@ -140,12 +140,7 @@ async fn handle_socket(mut socket: WebSocket, state: ServerState) {
 					state.key_map.insert(sender_public_key, store);
 
 					eprintln!("Key upload request handled properly.");
-				} // ProtocolMessage::KeyRequest(identity_key) => {
-				  // 	// TODO: Handle key requests
-				  // 	println!("Received a key request.");
-
-				  // 	handle_key_request(identity_key, &state, &public_key).await;
-				  // }
+				}
 			}
 		}
 	}
@@ -177,65 +172,6 @@ async fn pop_otk(
 
 	Some((store.identity_key, store.encryption_key, otk))
 }
-
-// async fn handle_key_request(identity_key: [u8; 32], state: &ServerState, public_key: &[u8; 32]) {
-// 	if let Some(_) = {
-// 		if let Some(store) = state.key_map.get(&identity_key) {
-// 			store
-// 				.one_time_keys
-// 				.iter()
-// 				.next()
-// 				.map(|entry| entry.key().clone())
-// 		} else {
-// 			None
-// 		}
-
-// 		// Be very careful editing this section, you can easily cause a deadlock
-// 	} {
-// 		if let Some((identity_key, encryption_key, otk)) =
-// 			pop_otk(&state.key_map, &identity_key).await
-// 		{
-// 			let response = ProtocolMessage::UploadKeys(UploadKeys {
-// 				identity_key: identity_key,
-// 				encryption_key: encryption_key,
-// 				one_time_keys: vec![otk],
-// 			});
-
-// 			let acc_guard = state.server_account.lock().await;
-
-// 			if let Ok(archived_response) = Signed::new_archived(response, &acc_guard) {
-// 				if let Some(sender) = CLIENTS.write().await.get_mut(public_key) {
-// 					if let Err(e) = sender
-// 						.send(Message::Binary(Bytes::copy_from_slice(&archived_response)))
-// 						.await
-// 					{
-// 						println!(
-// 							"Archived response failed to send to {}: {e:?}",
-// 							display_key(&identity_key)
-// 						);
-// 					} else {
-// 						println!(
-// 							"Archived key: {:?} successfully sent to client: {}",
-// 							&archived_response,
-// 							display_key(&identity_key)
-// 						);
-// 					}
-// 				} else {
-// 					println!("{} is not connected anymore", display_key(&identity_key));
-// 				}
-// 			} else {
-// 				println!("Generating an archived response failed");
-// 			}
-// 		} else {
-// 			println!(
-// 				"No available OTKs to remove for {}",
-// 				display_key(&identity_key)
-// 			);
-// 		}
-// 	} else {
-// 		println!("No available OTKs for {}", display_key(&identity_key));
-// 	}
-// }
 
 async fn get_encryption_key_and_otk(
 	State(state): State<ServerState>,
