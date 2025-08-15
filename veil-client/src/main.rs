@@ -45,10 +45,10 @@ const PROMPT: &str = concat!(SOCKET, " > ");
 async fn main() -> anyhow::Result<()> {
 	// Try to load from keyring; fall back to fresh account + empty map.
 	let (acc, msgable_users): (Arc<Mutex<Account>>, Arc<DashMap<[u8; 32], PeerSession>>) =
-	// Messagable users should store target client identity key, as well as secret
-	// At first, the secret will be your ephemeral secret,
-	// but when you get a call back or receive a key exchange request,
-	// it will be replaced by the diffie hellman derived shared secret
+		// Messagable users should store target client identity key, as well as secret
+		// At first, the secret will be your ephemeral secret,
+		// but when you get a call back or receive a key exchange request,
+		// it will be replaced by the diffie hellman derived shared secret
 		match load_state_keyring() {
 			Ok(state) => {
 				let account = Account::from_pickle(state.account);
@@ -88,8 +88,8 @@ async fn main() -> anyhow::Result<()> {
 	// let write_clone = write.clone();
 
 	let mut acc_guard = acc.lock().await;
-	let pub_key_bytes = acc_guard.ed25519_key().as_bytes().clone();
-	let pub_key_bytes_clone = pub_key_bytes.clone();
+	let pub_key_bytes = *acc_guard.ed25519_key().as_bytes();
+	let pub_key_bytes_clone = pub_key_bytes;
 	// let signing_key_clone = acc_guard.identity_keys().ed25519.clone();
 
 	write
@@ -105,9 +105,7 @@ async fn main() -> anyhow::Result<()> {
 	acc_guard.generate_one_time_keys(OTK_NUM);
 
 	let otks = acc_guard
-		.one_time_keys()
-		.iter()
-		.map(|(_, key)| key.as_bytes().clone())
+		.one_time_keys().values().map(|key| *key.as_bytes())
 		.collect();
 
 	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
@@ -151,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
 									sender_pub_key,
 									PeerSession {
 										x25519: resp.encryption_key,
-										session: session,
+										session,
 									},
 								);
 
@@ -262,45 +260,43 @@ async fn main() -> anyhow::Result<()> {
 
 				if msgable_users.contains_key(&target_client) {
 					// TODO: Start messaging
-				} else {
-					if let Ok((encryption_key, otk)) =
-						fetch_encryption_key_and_otk(&target_client).await
-					{
-						let acc_guard = acc.lock().await;
-						let session = {
-							acc_guard.create_outbound_session(
-								SessionConfig::version_2(),
-								Curve25519PublicKey::from(encryption_key),
-								Curve25519PublicKey::from(otk),
-							)
-						};
+				} else if let Ok((encryption_key, otk)) =
+    						fetch_encryption_key_and_otk(&target_client).await
+    					{
+    						let acc_guard = acc.lock().await;
+    						let session = {
+    							acc_guard.create_outbound_session(
+    								SessionConfig::version_2(),
+    								Curve25519PublicKey::from(encryption_key),
+    								Curve25519PublicKey::from(otk),
+    							)
+    						};
 
-						msgable_users.insert(
-							target_client,
-							PeerSession {
-								x25519: encryption_key,
-								session: session,
-							},
-						);
+    						msgable_users.insert(
+    							target_client,
+    							PeerSession {
+    								x25519: encryption_key,
+    								session,
+    							},
+    						);
 
-						let msg = build_message(
-							acc_guard.curve25519_key().to_bytes(),
-							target_client,
-							&msgable_users,
-						)
-						.await?;
+    						let msg = build_message(
+    							acc_guard.curve25519_key().to_bytes(),
+    							target_client,
+    							&msgable_users,
+    						)
+    						.await?;
 
-						write
-							.lock()
-							.await
-							.send(Message::Binary(Bytes::copy_from_slice(
-								&Signed::new_archived(msg, &acc_guard)?,
-							)))
-							.await?;
+    						write
+    							.lock()
+    							.await
+    							.send(Message::Binary(Bytes::copy_from_slice(
+    								&Signed::new_archived(msg, &acc_guard)?,
+    							)))
+    							.await?;
 
-						println!("Sent a pre-key message to {}", display_key(&target_client));
-					}
-				}
+    						println!("Sent a pre-key message to {}", display_key(&target_client));
+    					}
 
 				if let Err(e) = save_state(&acc, &msgable_users).await {
 					eprintln!("Save state failed: {e:?}");
@@ -357,7 +353,7 @@ async fn build_message(
 async fn fetch_encryption_key_and_otk(
 	target_identity_key: &[u8; 32],
 ) -> anyhow::Result<([u8; 32], [u8; 32])> {
-	let target_client = display_key(&target_identity_key);
+	let target_client = display_key(target_identity_key);
 	let url = format!("{}/clients/{}/otk", URL, target_client);
 
 	let body = reqwest::get(url).await?.text().await?;

@@ -86,7 +86,7 @@ pub async fn process_data(
 	sender_public_key: &[u8; 32],
 ) -> anyhow::Result<([u8; 32], ProtocolMessage)> {
 	let mut aligned: AlignedVec = AlignedVec::new();
-	aligned.extend_from_slice(&bytes);
+	aligned.extend_from_slice(bytes);
 
 	let archived_signed = rkyv::access::<ArchivedSigned, rkyv::rancor::Error>(&aligned)?;
 	let signed = deserialize::<Signed, rkyv::rancor::Error>(archived_signed)?;
@@ -94,7 +94,7 @@ pub async fn process_data(
 	if !signed.verify_sig()? {
 		anyhow::bail!(
 			"Signature was received from {} and deserialized properly, though is invalid.",
-			display_key(&sender_public_key)
+			display_key(sender_public_key)
 		);
 	}
 
