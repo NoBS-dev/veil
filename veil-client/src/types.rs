@@ -10,6 +10,7 @@ pub struct PersistedPeer {
 
 #[derive(Serialize, Deserialize)]
 pub struct PersistedState {
+	pub ip_and_port: String,
 	pub account: AccountPickle,
 	pub peers: Vec<PersistedPeer>,
 }

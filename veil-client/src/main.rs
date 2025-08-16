@@ -7,7 +7,6 @@ use crate::{
 	listener::start_listener,
 	persistence::{load_state_from_keyring, save_state_to_keyring},
 };
-use constcat::concat;
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use messaging::{build_message, fetch_encryption_key_and_otk};
@@ -23,21 +22,26 @@ use vodozemac::{
 	olm::{Account, Session, SessionConfig},
 };
 
-// TODO: Let user specify ip/port
-pub const IP_AND_PORT: &str = "localhost:3000";
-pub const SOCKET: &str = concat!("ws://", IP_AND_PORT);
-pub const URL: &str = concat!("http://", IP_AND_PORT);
-pub const PROMPT: &str = concat!(SOCKET, " > ");
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	print!("Enter profile name (none for default): ");
+	io::stdout().flush()?;
+
+	// Sanitization mebe? I suppose it might not matter because this never leaves the client
+	let mut profile = String::new();
+	io::stdin().read_line(&mut profile)?;
+
+	if profile == "" {
+		profile = "default".to_string();
+	};
+
 	// Try to load from keyring; fall back to fresh account + empty map.
-	let (acc, msgable_users): (Arc<Mutex<Account>>, Arc<DashMap<[u8; 32], PeerSession>>) =
+	let (acc, msgable_users, ip_and_port): (Arc<Mutex<Account>>, Arc<DashMap<[u8; 32], PeerSession>>, String) =
 		// Messagable users should store target client identity key, as well as secret
 		// At first, the secret will be your ephemeral secret,
 		// but when you get a call back or receive a key exchange request,
 		// it will be replaced by the diffie hellman derived shared secret
-		match load_state_from_keyring() {
+		match load_state_from_keyring(&profile) {
 			Ok(state) => {
 				let acc = Account::from_pickle(state.account);
 				let map = Arc::new(DashMap::new());
@@ -54,20 +58,34 @@ async fn main() -> anyhow::Result<()> {
 
 				eprintln!("Prior state found. Loading...");
 
-				(Arc::new(Mutex::new(acc)), map)
+				(Arc::new(Mutex::new(acc)), map, state.ip_and_port)
 			}
 			Err(e) => {
 				eprintln!(
-					"[state] No prior state in keyring (or failed to load): {e:#}. Generating a new profile..."
+					"No prior state found in keyring: {e:#}. Generating a new profile..."
 				);
+
+				print!("Enter server (IP:PORT): ");
+				io::stdout().flush()?;
+
+				let mut ip_and_port = String::new();
+				io::stdin().read_line(&mut ip_and_port)?;
+
 				(
 					Arc::new(Mutex::new(Account::new())),
 					Arc::new(DashMap::new()),
+					ip_and_port.trim().to_string(),
 				)
+
+
 			}
 		};
 
-	let (ws_stream, _) = tokio_tungstenite::connect_async(SOCKET).await?;
+	let socket = format!("ws://{}", &ip_and_port);
+	let url = format!("http://{}", &ip_and_port);
+	let prompt = format!("{} > ", &socket);
+
+	let (ws_stream, _) = tokio_tungstenite::connect_async(socket).await?;
 	let (write, read) = ws_stream.split();
 	let write = Arc::new(Mutex::new(write));
 
@@ -110,19 +128,21 @@ async fn main() -> anyhow::Result<()> {
 
 	drop(acc_guard);
 
-	save_state_to_keyring(&acc, &msgable_users).await?;
+	save_state_to_keyring(&acc, &msgable_users, &ip_and_port, &profile).await?;
 
 	start_listener(
 		read,
 		pub_key_bytes.clone(),
 		acc.clone(),
 		msgable_users.clone(),
+		&ip_and_port,
+		&profile,
 	)
 	.await;
 
 	// Talking to server
 	loop {
-		print!("{PROMPT}");
+		print!("{prompt}");
 		io::stdout().flush()?;
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
@@ -141,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
 				);
 			}
 			"list" => {
-				println!("{:?}", list_clients().await?);
+				println!("{:?}", list_clients(&url).await?);
 			}
 			"quit" | "exit" => {
 				println!("Quitting...");
@@ -153,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
 				}
 			}
 			"msg" | "key-exchange" => {
-				println!("{:?}", list_clients().await?);
+				println!("{:?}", list_clients(&url).await?);
 
 				print!("Enter target client: ");
 				io::stdout().flush()?;
@@ -167,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
 				if msgable_users.contains_key(&target_client) {
 					// TODO: Start messaging
 				} else if let Ok((encryption_key, otk)) =
-					fetch_encryption_key_and_otk(&target_client, URL).await
+					fetch_encryption_key_and_otk(&target_client, &url).await
 				{
 					let acc_guard = acc.lock().await;
 					let session = {
@@ -204,7 +224,9 @@ async fn main() -> anyhow::Result<()> {
 					println!("Sent a pre-key message to {}", display_key(&target_client));
 				}
 
-				if let Err(e) = save_state_to_keyring(&acc, &msgable_users).await {
+				if let Err(e) =
+					save_state_to_keyring(&acc, &msgable_users, &ip_and_port, &profile).await
+				{
 					eprintln!("Save state failed: {e:?}");
 				} else {
 					eprintln!("Saved!");
@@ -216,8 +238,8 @@ async fn main() -> anyhow::Result<()> {
 	}
 }
 
-async fn list_clients() -> anyhow::Result<Vec<String>> {
-	Ok(reqwest::get(format!("{URL}/clients"))
+async fn list_clients(url: &String) -> anyhow::Result<Vec<String>> {
+	Ok(reqwest::get(format!("{url}/clients"))
 		.await?
 		.text()
 		.await?

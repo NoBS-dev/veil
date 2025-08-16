@@ -18,7 +18,12 @@ pub async fn start_listener(
 	pub_key_bytes_clone: [u8; 32],
 	acc_clone: Arc<Mutex<vodozemac::olm::Account>>,
 	msgable_users_clone: Arc<DashMap<[u8; 32], PeerSession>>,
+	ip_and_port: &String,
+	profile: &String,
 ) {
+	let ip_and_port = ip_and_port.clone();
+	let profile = profile.clone();
+
 	tokio::spawn(async move {
 		while let Some(msg) = read.next().await {
 			match msg {
@@ -44,8 +49,13 @@ pub async fn start_listener(
 									},
 								);
 
-								if let Err(e) =
-									save_state_to_keyring(&acc_clone, &msgable_users_clone).await
+								if let Err(e) = save_state_to_keyring(
+									&acc_clone,
+									&msgable_users_clone,
+									&ip_and_port.clone(),
+									&profile,
+								)
+								.await
 								{
 									eprintln!("Save state failed: {e:?}");
 								} else {
@@ -81,9 +91,13 @@ pub async fn start_listener(
 										}
 									}
 
-									if let Err(e) =
-										save_state_to_keyring(&acc_clone, &msgable_users_clone)
-											.await
+									if let Err(e) = save_state_to_keyring(
+										&acc_clone,
+										&msgable_users_clone,
+										&ip_and_port.clone(),
+										&profile,
+									)
+									.await
 									{
 										eprintln!("Save state failed: {e:?}");
 									} else {
