@@ -1,23 +1,19 @@
 use crate::persistence::save_state_to_keyring;
-use dashmap::DashMap;
 use futures_util::StreamExt;
-use std::{
-	io::{self, Write},
-	sync::Arc,
-};
-use tokio::sync::Mutex;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
 use tungstenite::protocol::Message;
 use veil_protocol::{PeerSession, ProtocolMessage, process_data};
 use vodozemac::{
 	Curve25519PublicKey,
-	olm::{OlmMessage, SessionConfig},
+	olm::{Account, OlmMessage, SessionConfig},
 };
 
 pub async fn start_listener(
 	mut read: impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
 	pub_key_bytes_clone: [u8; 32],
-	acc_clone: Arc<Mutex<vodozemac::olm::Account>>,
-	msgable_users_clone: Arc<DashMap<[u8; 32], PeerSession>>,
+	acc_clone: Arc<Mutex<Account>>,
+	msgable_users_clone: Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
 	ip_and_port: &String,
 	profile: &String,
 ) {
@@ -41,7 +37,7 @@ pub async fn start_listener(
 									Curve25519PublicKey::from(resp.one_time_keys[0]),
 								);
 
-								msgable_users_clone.insert(
+								msgable_users_clone.write().await.insert(
 									sender_pub_key,
 									PeerSession {
 										x25519: resp.encryption_key,
@@ -49,18 +45,18 @@ pub async fn start_listener(
 									},
 								);
 
-								if let Err(e) = save_state_to_keyring(
-									&acc_clone,
-									&msgable_users_clone,
-									&ip_and_port.clone(),
-									&profile,
-								)
-								.await
-								{
-									eprintln!("Save state failed: {e:?}");
-								} else {
-									eprintln!("Saved!");
-								}
+								// if let Err(e) = save_state_to_keyring(
+								// 	&acc_clone,
+								// 	&msgable_users_clone,
+								// 	&ip_and_port.clone(),
+								// 	&profile,
+								// )
+								// .await
+								// {
+								// 	eprintln!("Save state failed: {e:?}");
+								// } else {
+								// 	eprintln!("Saved!");
+								// }
 							}
 							ProtocolMessage::EncryptedMessage(message) => {
 								println!("Received a msg: {message:?}");
@@ -73,7 +69,7 @@ pub async fn start_listener(
 										OlmMessage::PreKey(prekey_msg) => {
 											println!("Received prekey message.");
 
-											if let Ok(session) = &acc_guard.create_inbound_session(
+											if let Ok(session) = acc_guard.create_inbound_session(
 												Curve25519PublicKey::from(message.sender_x25519),
 												&prekey_msg,
 											) {
@@ -82,27 +78,51 @@ pub async fn start_listener(
 												let text =
 													String::from_utf8_lossy(&session.plaintext);
 												println!("Message: {text}");
+
+												msgable_users_clone.write().await.insert(
+													sender_pub_key,
+													PeerSession {
+														x25519: message.sender_x25519,
+														session: session.session,
+													},
+												);
 											} else {
 												println!("Failed to create inbound session.");
 											}
 										}
-										OlmMessage::Normal(_) => {
-											println!("Received normal message.");
+										OlmMessage::Normal(normal_msg) => {
+											let mut msgable_users_write =
+												msgable_users_clone.write().await;
+											if let Some(peer) =
+												msgable_users_write.get_mut(&sender_pub_key)
+											{
+												match peer.session.decrypt(&normal_msg.into()) {
+													Ok(pt) => {
+														let text = String::from_utf8_lossy(&pt);
+														println!("Received: {text}");
+													}
+													Err(e) => eprintln!("Decrypt failed: {e:?}"),
+												}
+											} else {
+												eprintln!(
+													"Normal message but no stored session for sender; dropping."
+												);
+											}
 										}
 									}
 
-									if let Err(e) = save_state_to_keyring(
-										&acc_clone,
-										&msgable_users_clone,
-										&ip_and_port.clone(),
-										&profile,
-									)
-									.await
-									{
-										eprintln!("Save state failed: {e:?}");
-									} else {
-										eprintln!("Saved!");
-									}
+									// if let Err(e) = save_state_to_keyring(
+									// 	&acc_clone,
+									// 	&msgable_users_clone,
+									// 	&ip_and_port.clone(),
+									// 	&profile,
+									// )
+									// .await
+									// {
+									// 	eprintln!("Save state failed: {e:?}");
+									// } else {
+									// 	eprintln!("Saved!");
+									// }
 								} else {
 									println!("Invalid message received.");
 								}
@@ -115,8 +135,9 @@ pub async fn start_listener(
 			}
 
 			// TODO: Should prob fix prompting here
-			println!();
-			io::stdout().flush().unwrap();
+			continue;
+			// println!();
+			// io::stdout().flush().unwrap();
 		}
 	});
 }

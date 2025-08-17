@@ -2950,7 +2950,6 @@ dependencies = [
  "anyhow",
  "chacha20poly1305",
  "constcat",
- "dashmap",
  "ed25519-dalek",
  "futures-util",
  "keyring",

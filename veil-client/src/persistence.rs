@@ -1,25 +1,25 @@
 use crate::types::{PersistedPeer, PersistedState};
 use anyhow::{Context, Result};
-use dashmap::DashMap;
 use keyring::Entry;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{Mutex, RwLock};
+use veil_protocol::PeerSession;
 use vodozemac::olm::Account;
 
 pub async fn save_state_to_keyring(
 	acc: &Arc<Mutex<Account>>,
-	peers: &Arc<DashMap<[u8; 32], crate::PeerSession>>,
+	peers: &Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
 	ip_and_port: &String,
 	profile: &String,
 ) -> Result<()> {
 	let pickle = acc.lock().await.pickle();
 
-	let mut peers_vec = Vec::with_capacity(peers.len());
-	for entry in peers.iter() {
+	let mut peers_vec = Vec::with_capacity(peers.read().await.len());
+	for (identity_key, session) in peers.read().await.iter() {
 		peers_vec.push(PersistedPeer {
-			identity_key: *entry.key(),
-			x25519: entry.x25519,
-			session: entry.session.pickle(),
+			identity_key: *identity_key,
+			x25519: session.x25519,
+			session: session.session.pickle(),
 		});
 	}
 

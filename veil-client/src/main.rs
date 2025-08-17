@@ -5,16 +5,16 @@ mod types;
 
 use crate::{
 	listener::start_listener,
+	messaging::{fetch_encryption_key_and_otk, send_message},
 	persistence::{load_state_from_keyring, save_state_to_keyring},
 };
-use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use messaging::{build_message, fetch_encryption_key_and_otk};
 use std::{
+	collections::HashMap,
 	io::{self, Write},
 	sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{PeerSession, ProtocolMessage, Signed, UploadKeys, display_key, parse_hex_key};
 use vodozemac::{
@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
 	};
 
 	// Try to load from keyring; fall back to fresh account + empty map.
-	let (acc, msgable_users, ip_and_port): (Arc<Mutex<Account>>, Arc<DashMap<[u8; 32], PeerSession>>, String) =
+	let (acc, msgable_users, ip_and_port): (Arc<Mutex<Account>>, Arc<RwLock<HashMap<[u8; 32], PeerSession>>>, String) =
 		// Messagable users should store target client identity key, as well as secret
 		// At first, the secret will be your ephemeral secret,
 		// but when you get a call back or receive a key exchange request,
@@ -44,13 +44,13 @@ async fn main() -> anyhow::Result<()> {
 		match load_state_from_keyring(&profile) {
 			Ok(state) => {
 				let acc = Account::from_pickle(state.account);
-				let map = Arc::new(DashMap::new());
-				for p in state.peers {
-					let session = Session::from_pickle(p.session);
+				let mut map = HashMap::new();
+				for peer in state.peers {
+					let session = Session::from_pickle(peer.session);
 					map.insert(
-						p.identity_key,
+						peer.identity_key,
 						PeerSession {
-							x25519: p.x25519,
+							x25519: peer.x25519,
 							session,
 						},
 					);
@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
 				eprintln!("Prior state found. Loading...");
 
-				(Arc::new(Mutex::new(acc)), map, state.ip_and_port)
+				(Arc::new(Mutex::new(acc)), Arc::new(RwLock::new(map)), state.ip_and_port)
 			}
 			Err(e) => {
 				eprintln!(
@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
 
 				(
 					Arc::new(Mutex::new(Account::new())),
-					Arc::new(DashMap::new()),
+					Arc::new(RwLock::new(HashMap::new())),
 					ip_and_port.trim().to_string(),
 				)
 
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 	println!("My public key: {}", display_key(&pub_key_bytes));
 
 	// We're just generating 20 for now, should increase later in prod
-	// Also should add functionality to make
+	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
 	const OTK_NUM: usize = 20;
 	acc_guard.generate_one_time_keys(OTK_NUM);
 
@@ -152,12 +152,9 @@ async fn main() -> anyhow::Result<()> {
 			"help" => {
 				println!("-- Command list --");
 				println!("list: Lists the clients that are connected to the server");
-				println!(
-					"msgable: Lists the clients that you have a session with and can message them properly"
-				);
 				println!("quit | exit: Shuts down the client");
 				println!(
-					"msg | key-exchange: Sends a message to or initiates a key exchange to a client, depending on if you have a valid session with them or not"
+					"msg: Sends a message to or initiates a key exchange to a client, depending on if you have a valid session with them or not"
 				);
 			}
 			"list" => {
@@ -167,12 +164,7 @@ async fn main() -> anyhow::Result<()> {
 				println!("Quitting...");
 				std::process::exit(0);
 			}
-			"msgable" => {
-				for entry in msgable_users.iter() {
-					println!("{}", display_key(entry.key()));
-				}
-			}
-			"msg" | "key-exchange" => {
+			"msg" => {
 				println!("{:?}", list_clients(&url).await?);
 
 				print!("Enter target client: ");
@@ -184,21 +176,29 @@ async fn main() -> anyhow::Result<()> {
 					parse_hex_key(input.trim())?
 				};
 
-				if msgable_users.contains_key(&target_client) {
-					// TODO: Start messaging
+				if msgable_users.read().await.contains_key(&target_client) {
+					if let Err(e) = send_message(
+						&acc,
+						target_client,
+						&msgable_users,
+						&write,
+						&ip_and_port,
+						&profile,
+					)
+					.await
+					{
+						eprintln!("{e:#}");
+					}
 				} else if let Ok((encryption_key, otk)) =
 					fetch_encryption_key_and_otk(&target_client, &url).await
 				{
-					let acc_guard = acc.lock().await;
-					let session = {
-						acc_guard.create_outbound_session(
-							SessionConfig::version_2(),
-							Curve25519PublicKey::from(encryption_key),
-							Curve25519PublicKey::from(otk),
-						)
-					};
+					let session = acc.lock().await.create_outbound_session(
+						SessionConfig::version_2(),
+						Curve25519PublicKey::from(encryption_key),
+						Curve25519PublicKey::from(otk),
+					);
 
-					msgable_users.insert(
+					msgable_users.write().await.insert(
 						target_client,
 						PeerSession {
 							x25519: encryption_key,
@@ -206,30 +206,18 @@ async fn main() -> anyhow::Result<()> {
 						},
 					);
 
-					let msg = build_message(
-						acc_guard.curve25519_key().to_bytes(),
+					if let Err(e) = send_message(
+						&acc,
 						target_client,
 						&msgable_users,
+						&write,
+						&ip_and_port,
+						&profile,
 					)
-					.await?;
-
-					write
-						.lock()
-						.await
-						.send(Message::Binary(Bytes::copy_from_slice(
-							&Signed::new_archived(msg, &acc_guard)?,
-						)))
-						.await?;
-
-					println!("Sent a pre-key message to {}", display_key(&target_client));
-				}
-
-				if let Err(e) =
-					save_state_to_keyring(&acc, &msgable_users, &ip_and_port, &profile).await
-				{
-					eprintln!("Save state failed: {e:?}");
-				} else {
-					eprintln!("Saved!");
+					.await
+					{
+						eprintln!("{e:#}");
+					}
 				}
 			}
 
