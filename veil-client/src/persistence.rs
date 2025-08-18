@@ -14,14 +14,16 @@ pub async fn save_state_to_keyring(
 ) -> Result<()> {
 	let pickle = acc.lock().await.pickle();
 
-	let mut peers_vec = Vec::with_capacity(peers.read().await.len());
-	for (identity_key, session) in peers.read().await.iter() {
-		peers_vec.push(PersistedPeer {
-			identity_key: *identity_key,
-			x25519: session.x25519,
-			session: session.session.pickle(),
-		});
-	}
+	let peers_vec = {
+		let map = peers.read().await;
+		map.iter()
+			.map(|(id, ps)| PersistedPeer {
+				identity_key: *id,
+				x25519: ps.x25519,
+				session: ps.session.pickle(),
+			})
+			.collect()
+	};
 
 	let state = PersistedState {
 		ip_and_port: ip_and_port.clone(),
@@ -30,7 +32,8 @@ pub async fn save_state_to_keyring(
 	};
 
 	let json = serde_json::to_string(&state).context("Serializing persisted state")?;
-	let entry = Entry::new("veil-client", profile).context("Opening keyring entry")?;
+	let entry = Entry::new("veil-client", format!("veil{}", profile).trim())
+		.context("Opening keyring entry")?;
 	entry
 		.set_password(&json)
 		.context("Storing state in keyring")?;
@@ -39,7 +42,8 @@ pub async fn save_state_to_keyring(
 }
 
 pub fn load_state_from_keyring(profile: &String) -> Result<PersistedState> {
-	let entry = Entry::new("veil-client", profile).context("Opening keyring entry")?;
+	let entry = Entry::new("veil-client", format!("veil{}", profile).trim())
+		.context("Opening keyring entry")?;
 	let json = entry.get_password().context("Reading state from keyring")?;
 	let state: PersistedState =
 		serde_json::from_str(&json).context("Deserializing persisted state")?;

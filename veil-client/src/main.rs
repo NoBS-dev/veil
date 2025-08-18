@@ -34,9 +34,10 @@ async fn main() -> anyhow::Result<()> {
 	if profile == "" {
 		profile = "default".to_string();
 	};
+	let profile = profile.trim().to_string();
 
 	// Try to load from keyring; fall back to fresh account + empty map.
-	let (acc, msgable_users, ip_and_port): (Arc<Mutex<Account>>, Arc<RwLock<HashMap<[u8; 32], PeerSession>>>, String) =
+	let (acc, peers, ip_and_port): (Arc<Mutex<Account>>, Arc<RwLock<HashMap<[u8; 32], PeerSession>>>, String) =
 		// Messagable users should store target client identity key, as well as secret
 		// At first, the secret will be your ephemeral secret,
 		// but when you get a call back or receive a key exchange request,
@@ -128,13 +129,13 @@ async fn main() -> anyhow::Result<()> {
 
 	drop(acc_guard);
 
-	save_state_to_keyring(&acc, &msgable_users, &ip_and_port, &profile).await?;
+	save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await?;
 
 	start_listener(
 		read,
 		pub_key_bytes.clone(),
 		acc.clone(),
-		msgable_users.clone(),
+		peers.clone(),
 		&ip_and_port,
 		&profile,
 	)
@@ -176,16 +177,10 @@ async fn main() -> anyhow::Result<()> {
 					parse_hex_key(input.trim())?
 				};
 
-				if msgable_users.read().await.contains_key(&target_client) {
-					if let Err(e) = send_message(
-						&acc,
-						target_client,
-						&msgable_users,
-						&write,
-						&ip_and_port,
-						&profile,
-					)
-					.await
+				if peers.read().await.contains_key(&target_client) {
+					if let Err(e) =
+						send_message(&acc, target_client, &peers, &write, &ip_and_port, &profile)
+							.await
 					{
 						eprintln!("{e:#}");
 					}
@@ -198,7 +193,7 @@ async fn main() -> anyhow::Result<()> {
 						Curve25519PublicKey::from(otk),
 					);
 
-					msgable_users.write().await.insert(
+					peers.write().await.insert(
 						target_client,
 						PeerSession {
 							x25519: encryption_key,
@@ -206,15 +201,9 @@ async fn main() -> anyhow::Result<()> {
 						},
 					);
 
-					if let Err(e) = send_message(
-						&acc,
-						target_client,
-						&msgable_users,
-						&write,
-						&ip_and_port,
-						&profile,
-					)
-					.await
+					if let Err(e) =
+						send_message(&acc, target_client, &peers, &write, &ip_and_port, &profile)
+							.await
 					{
 						eprintln!("{e:#}");
 					}

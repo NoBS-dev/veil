@@ -18,7 +18,7 @@ use vodozemac::olm::Account;
 pub async fn send_message(
 	acc: &Arc<Mutex<Account>>,
 	target_client: [u8; 32],
-	msgable_users: &Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
+	peers: &Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
 	write: &Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
 	ip_and_port: &String,
 	profile: &String,
@@ -30,9 +30,9 @@ pub async fn send_message(
 	let message = message.trim();
 
 	let (msg_type, ciphertext) = {
-		let mut msgable_users_write_lock = msgable_users.write().await;
+		let mut peers_write_lock = peers.write().await;
 
-		let peer_session = match msgable_users_write_lock.get_mut(&target_client) {
+		let peer_session = match peers_write_lock.get_mut(&target_client) {
 			Some(session) => session,
 			None => {
 				anyhow::bail!("No session with that client.")
@@ -60,7 +60,7 @@ pub async fn send_message(
 		.send(Message::Binary(Bytes::copy_from_slice(&signed_bytes)))
 		.await?;
 
-	if let Err(e) = save_state_to_keyring(&acc, &msgable_users, &ip_and_port, &profile).await {
+	if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
 		eprintln!("Save state failed: {e:?}");
 	} else {
 		eprintln!("Saved!");

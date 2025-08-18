@@ -29,7 +29,7 @@ pub async fn start_listener(
 					{
 						match data {
 							ProtocolMessage::UploadKeys(resp) => {
-								println!("Received an OTK: {resp:?}");
+								println!("Received an OTK upload request: {resp:?}");
 
 								let session = acc_clone.lock().await.create_outbound_session(
 									SessionConfig::version_2(),
@@ -44,19 +44,18 @@ pub async fn start_listener(
 										session,
 									},
 								);
-
-								// if let Err(e) = save_state_to_keyring(
-								// 	&acc_clone,
-								// 	&msgable_users_clone,
-								// 	&ip_and_port.clone(),
-								// 	&profile,
-								// )
-								// .await
-								// {
-								// 	eprintln!("Save state failed: {e:?}");
-								// } else {
-								// 	eprintln!("Saved!");
-								// }
+								if let Err(e) = save_state_to_keyring(
+									&acc_clone,
+									&msgable_users_clone,
+									&ip_and_port,
+									&profile,
+								)
+								.await
+								{
+									eprintln!("Save state failed: {e:?}");
+								} else {
+									eprintln!("Saved!");
+								}
 							}
 							ProtocolMessage::EncryptedMessage(message) => {
 								println!("Received a msg: {message:?}");
@@ -64,15 +63,17 @@ pub async fn start_listener(
 								if let Ok(msg) =
 									OlmMessage::from_parts(message.message_type, &message.message)
 								{
-									let mut acc_guard = acc_clone.lock().await;
 									match msg {
 										OlmMessage::PreKey(prekey_msg) => {
 											println!("Received prekey message.");
 
-											if let Ok(session) = acc_guard.create_inbound_session(
-												Curve25519PublicKey::from(message.sender_x25519),
-												&prekey_msg,
-											) {
+											if let Ok(session) =
+												acc_clone.lock().await.create_inbound_session(
+													Curve25519PublicKey::from(
+														message.sender_x25519,
+													),
+													&prekey_msg,
+												) {
 												println!("Inbound session created successfully.");
 
 												let text =
@@ -91,10 +92,10 @@ pub async fn start_listener(
 											}
 										}
 										OlmMessage::Normal(normal_msg) => {
-											let mut msgable_users_write =
-												msgable_users_clone.write().await;
-											if let Some(peer) =
-												msgable_users_write.get_mut(&sender_pub_key)
+											if let Some(peer) = msgable_users_clone
+												.write()
+												.await
+												.get_mut(&sender_pub_key)
 											{
 												match peer.session.decrypt(&normal_msg.into()) {
 													Ok(pt) => {
@@ -111,18 +112,18 @@ pub async fn start_listener(
 										}
 									}
 
-									// if let Err(e) = save_state_to_keyring(
-									// 	&acc_clone,
-									// 	&msgable_users_clone,
-									// 	&ip_and_port.clone(),
-									// 	&profile,
-									// )
-									// .await
-									// {
-									// 	eprintln!("Save state failed: {e:?}");
-									// } else {
-									// 	eprintln!("Saved!");
-									// }
+									if let Err(e) = save_state_to_keyring(
+										&acc_clone,
+										&msgable_users_clone,
+										&ip_and_port,
+										&profile,
+									)
+									.await
+									{
+										eprintln!("Save state failed: {e:?}");
+									} else {
+										eprintln!("Saved!");
+									}
 								} else {
 									println!("Invalid message received.");
 								}
@@ -133,11 +134,6 @@ pub async fn start_listener(
 				Ok(_) => println!("[Notification] Received something of unknown type."),
 				Err(e) => println!("[Notification] Error: {e}"),
 			}
-
-			// TODO: Should prob fix prompting here
-			continue;
-			// println!();
-			// io::stdout().flush().unwrap();
 		}
 	});
 }
