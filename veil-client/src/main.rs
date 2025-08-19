@@ -201,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
 						send_message(&acc, target_client, &peers, &write, &ip_and_port, &profile)
 							.await
 					{
-						eprintln!("{e:#}");
+						eprintln!("Send message error: {e:#}");
 					}
 				} else if let Ok((encryption_key, otk)) =
 					fetch_encryption_key_and_otk(&target_client, &url).await

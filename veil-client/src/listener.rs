@@ -6,14 +6,14 @@ use tungstenite::protocol::Message;
 use veil_protocol::{PeerSession, ProtocolMessage, process_data};
 use vodozemac::{
 	Curve25519PublicKey,
-	olm::{Account, OlmMessage, SessionConfig},
+	olm::{Account, OlmMessage},
 };
 
 pub async fn start_listener(
 	mut read: impl StreamExt<Item = Result<Message, tungstenite::Error>> + Unpin + Send + 'static,
 	pub_key_bytes_clone: [u8; 32],
 	acc_clone: Arc<Mutex<Account>>,
-	msgable_users_clone: Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
+	peers: Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
 	ip_and_port: &String,
 	profile: &String,
 ) {
@@ -31,31 +31,7 @@ pub async fn start_listener(
 							ProtocolMessage::UploadKeys(resp) => {
 								println!("Received an OTK upload request: {resp:?}");
 
-								let session = acc_clone.lock().await.create_outbound_session(
-									SessionConfig::version_2(),
-									Curve25519PublicKey::from(resp.encryption_key),
-									Curve25519PublicKey::from(resp.one_time_keys[0]),
-								);
-
-								msgable_users_clone.write().await.insert(
-									sender_pub_key,
-									PeerSession {
-										x25519: resp.encryption_key,
-										session,
-									},
-								);
-								if let Err(e) = save_state_to_keyring(
-									&acc_clone,
-									&msgable_users_clone,
-									&ip_and_port,
-									&profile,
-								)
-								.await
-								{
-									eprintln!("Save state failed: {e:?}");
-								} else {
-									eprintln!("Saved!");
-								}
+								// TODO: Actually handle the server request
 							}
 							ProtocolMessage::EncryptedMessage(message) => {
 								println!("Received a msg: {message:?}");
@@ -78,11 +54,13 @@ pub async fn start_listener(
 														"Inbound session created successfully."
 													);
 
+													println!("{}", prekey_msg.one_time_key());
+
 													let text =
 														String::from_utf8_lossy(&session.plaintext);
 													println!("Message: {text}");
 
-													msgable_users_clone.write().await.insert(
+													peers.write().await.insert(
 														sender_pub_key,
 														PeerSession {
 															x25519: message.sender_x25519,
@@ -90,14 +68,12 @@ pub async fn start_listener(
 														},
 													);
 												}
-												Err(e) => eprintln!("{e:#}"),
+												Err(e) => eprintln!("Prekey parsing error: {e:#}"),
 											}
 										}
 										OlmMessage::Normal(normal_msg) => {
-											if let Some(peer) = msgable_users_clone
-												.write()
-												.await
-												.get_mut(&sender_pub_key)
+											if let Some(peer) =
+												peers.write().await.get_mut(&sender_pub_key)
 											{
 												match peer.session.decrypt(&normal_msg.into()) {
 													Ok(pt) => {
@@ -116,7 +92,7 @@ pub async fn start_listener(
 
 									if let Err(e) = save_state_to_keyring(
 										&acc_clone,
-										&msgable_users_clone,
+										&peers,
 										&ip_and_port,
 										&profile,
 									)
