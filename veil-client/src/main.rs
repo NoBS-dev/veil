@@ -6,7 +6,7 @@ mod types;
 use crate::{
 	listener::start_listener,
 	messaging::{fetch_encryption_key_and_otk, send_message},
-	persistence::{load_state_from_keyring, save_state_to_keyring},
+	persistence::{delete_state_from_keyring, load_state_from_keyring, save_state_to_keyring},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -106,11 +106,16 @@ async fn main() -> anyhow::Result<()> {
 	const OTK_NUM: usize = 20;
 	acc_guard.generate_one_time_keys(OTK_NUM);
 
-	let otks = acc_guard
+	let otks: Vec<[u8; 32]> = acc_guard
 		.one_time_keys()
 		.values()
 		.map(|key| *key.as_bytes())
 		.collect();
+
+	println!("Publishing {} OTKs:", otks.len());
+	for &otk in &otks {
+		println!("{}", Curve25519PublicKey::from(otk).to_base64())
+	}
 
 	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
 		encryption_key: acc_guard.curve25519_key().to_bytes(),
@@ -150,12 +155,23 @@ async fn main() -> anyhow::Result<()> {
 
 		// Cmds (pre-conversation)
 		match input.to_lowercase().trim() {
-			"help" => {
-				println!("-- Command list --");
-				println!("list: Lists the clients that are connected to the server");
-				println!("quit | exit: Shuts down the client");
+			"curve" => {
 				println!(
-					"msg: Sends a message to or initiates a key exchange to a client, depending on if you have a valid session with them or not"
+					"{}",
+					display_key(acc.lock().await.curve25519_key().as_bytes())
+				);
+
+				println!(
+					"{}",
+					base64::encode(acc.lock().await.curve25519_key().as_bytes())
+				);
+			}
+			"ed" => {
+				println!("{}", display_key(acc.lock().await.ed25519_key().as_bytes()));
+
+				println!(
+					"{}",
+					base64::encode(acc.lock().await.ed25519_key().as_bytes())
 				);
 			}
 			"list" => {
@@ -164,6 +180,9 @@ async fn main() -> anyhow::Result<()> {
 			"quit" | "exit" => {
 				println!("Quitting...");
 				std::process::exit(0);
+			}
+			"remove" => {
+				prompt_delete_profile()?;
 			}
 			"msg" => {
 				println!("{:?}", list_clients(&url).await?);
@@ -207,6 +226,8 @@ async fn main() -> anyhow::Result<()> {
 					{
 						eprintln!("{e:#}");
 					}
+				} else {
+					eprintln!("Fetch died");
 				}
 			}
 
@@ -223,4 +244,26 @@ async fn list_clients(url: &String) -> anyhow::Result<Vec<String>> {
 		.lines()
 		.map(|line| line.trim().to_string())
 		.collect())
+}
+
+fn prompt_delete_profile() -> anyhow::Result<()> {
+	print!("Profile to delete (empty = default): ");
+	io::stdout().flush()?;
+
+	let mut profile = String::new();
+	io::stdin().read_line(&mut profile)?;
+
+	let p = match profile.trim() {
+		"" => "default",
+		anything_else => anything_else,
+	};
+
+	match delete_state_from_keyring(p)? {
+		true => println!(
+			"Removed profile '{}' from keyring.",
+			format!("{}", p).trim()
+		),
+		false => println!("No keyring entry found for '{}'.", format!("{}", p).trim()),
+	}
+	Ok(())
 }

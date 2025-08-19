@@ -1,5 +1,5 @@
 use crate::types::{PersistedPeer, PersistedState};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use keyring::Entry;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
@@ -32,20 +32,44 @@ pub async fn save_state_to_keyring(
 	};
 
 	let json = serde_json::to_string(&state).context("Serializing persisted state")?;
-	let entry = Entry::new("veil-client", format!("veil{}", profile).trim())
-		.context("Opening keyring entry")?;
+	let entry = entry_for(profile)?;
 	entry
 		.set_password(&json)
 		.context("Storing state in keyring")?;
-
 	Ok(())
 }
 
 pub fn load_state_from_keyring(profile: &String) -> Result<PersistedState> {
-	let entry = Entry::new("veil-client", format!("veil{}", profile).trim())
-		.context("Opening keyring entry")?;
+	let entry = entry_for(profile)?;
 	let json = entry.get_password().context("Reading state from keyring")?;
 	let state: PersistedState =
 		serde_json::from_str(&json).context("Deserializing persisted state")?;
 	Ok(state)
+}
+
+pub fn delete_state_from_keyring(profile: &str) -> Result<bool> {
+	let mut removed = false;
+
+	let entry = entry_for(profile)?;
+	match entry.delete_password() {
+		Ok(()) => removed = true,
+		Err(keyring::Error::NoEntry) => { /* fine */ }
+		Err(e) => return Err(anyhow!(e)).context("Deleting profile from keyring"),
+	}
+
+	Ok(removed)
+}
+
+fn normalized_username(profile: &str) -> String {
+	let profile = profile.trim();
+	if profile.is_empty() || profile.eq_ignore_ascii_case("default") {
+		"default".to_string()
+	} else {
+		profile.to_string()
+	}
+}
+
+fn entry_for(profile: &str) -> Result<Entry> {
+	let user = normalized_username(profile);
+	Entry::new("veil-client", &user).context("Opening keyring entry")
 }

@@ -67,28 +67,30 @@ pub async fn start_listener(
 										OlmMessage::PreKey(prekey_msg) => {
 											println!("Received prekey message.");
 
-											if let Ok(session) =
-												acc_clone.lock().await.create_inbound_session(
-													Curve25519PublicKey::from(
-														message.sender_x25519,
-													),
-													&prekey_msg,
-												) {
-												println!("Inbound session created successfully.");
+											match acc_clone.lock().await.create_inbound_session(
+												Curve25519PublicKey::from(
+													prekey_msg.identity_key(),
+												),
+												&prekey_msg,
+											) {
+												Ok(session) => {
+													println!(
+														"Inbound session created successfully."
+													);
 
-												let text =
-													String::from_utf8_lossy(&session.plaintext);
-												println!("Message: {text}");
+													let text =
+														String::from_utf8_lossy(&session.plaintext);
+													println!("Message: {text}");
 
-												msgable_users_clone.write().await.insert(
-													sender_pub_key,
-													PeerSession {
-														x25519: message.sender_x25519,
-														session: session.session,
-													},
-												);
-											} else {
-												println!("Failed to create inbound session.");
+													msgable_users_clone.write().await.insert(
+														sender_pub_key,
+														PeerSession {
+															x25519: message.sender_x25519,
+															session: session.session,
+														},
+													);
+												}
+												Err(e) => eprintln!("{e:#}"),
 											}
 										}
 										OlmMessage::Normal(normal_msg) => {
