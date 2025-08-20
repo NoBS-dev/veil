@@ -13,16 +13,54 @@ use tokio::{
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, Message};
 use veil_protocol::{EncryptedMessage, ProtocolMessage, Signed};
-use vodozemac::olm::Account;
+use vodozemac::olm::{Account, SessionConfig};
 
 pub async fn send_message(
 	acc: &Arc<Mutex<Account>>,
-	target_client: [u8; 32],
 	peers: &Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
 	write: &Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
 	ip_and_port: &String,
 	profile: &String,
+	url: &String,
 ) -> Result<()> {
+	print!("Enter target client: ");
+	io::stdout().flush()?;
+
+	let target_client = {
+		let mut input = String::new();
+		io::stdin().read_line(&mut input)?;
+		parse_hex_key(input.trim())?
+	};
+
+	{
+		let mut peers_write_lock = peers.write().await;
+
+		if !peers_write_lock.contains_key(&target_client) {
+			let (their_x25519, otk) = fetch_encryption_key_and_otk(&target_client, url).await?;
+			let session = acc.lock().await.create_outbound_session(
+				SessionConfig::version_2(),
+				their_x25519.into(),
+				otk.into(),
+			);
+
+			peers_write_lock.insert(
+				target_client,
+				PeerSession {
+					x25519: their_x25519,
+					session,
+				},
+			);
+
+			drop(peers_write_lock);
+
+			if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
+				eprintln!("Save state failed: {e:?}");
+			} else {
+				eprintln!("Saved!");
+			}
+		}
+	}
+
 	print!("Enter message: ");
 	io::stdout().flush()?;
 	let mut message = String::new();
@@ -32,15 +70,21 @@ pub async fn send_message(
 	let (msg_type, ciphertext) = {
 		let mut peers_write_lock = peers.write().await;
 
-		let peer_session = match peers_write_lock.get_mut(&target_client) {
-			Some(session) => session,
+		let peer = match peers_write_lock.get_mut(&target_client) {
+			Some(peer) => peer,
 			None => {
 				anyhow::bail!("No session with that client.")
 			}
 		};
 
-		peer_session.session.encrypt(message).to_parts()
+		peer.session.encrypt(message).to_parts()
 	};
+
+	if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
+		eprintln!("Save state failed: {e:?}");
+	} else {
+		eprintln!("Saved!");
+	}
 
 	let signed_bytes = {
 		let acc_guard = acc.lock().await;
@@ -59,12 +103,6 @@ pub async fn send_message(
 		.await
 		.send(Message::Binary(Bytes::copy_from_slice(&signed_bytes)))
 		.await?;
-
-	if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
-		eprintln!("Save state failed: {e:?}");
-	} else {
-		eprintln!("Saved!");
-	}
 
 	Ok(())
 }

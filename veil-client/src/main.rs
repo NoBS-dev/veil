@@ -5,7 +5,7 @@ mod types;
 
 use crate::{
 	listener::start_listener,
-	messaging::{fetch_encryption_key_and_otk, send_message},
+	messaging::send_message,
 	persistence::{delete_state_from_keyring, load_state_from_keyring, save_state_to_keyring},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -17,10 +17,7 @@ use std::{
 use tokio::sync::{Mutex, RwLock};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{PeerSession, ProtocolMessage, Signed, UploadKeys, display_key, parse_hex_key};
-use vodozemac::{
-	Curve25519PublicKey,
-	olm::{Account, Session, SessionConfig},
-};
+use vodozemac::olm::{Account, Session};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -112,10 +109,10 @@ async fn main() -> anyhow::Result<()> {
 		.map(|key| *key.as_bytes())
 		.collect();
 
-	println!("Publishing {} OTKs:", otks.len());
-	for &otk in &otks {
-		println!("{}", Curve25519PublicKey::from(otk).to_base64())
-	}
+	// println!("Publishing {} OTKs:", otks.len());
+	// for &otk in &otks {
+	// 	println!("{}", Curve25519PublicKey::from(otk).to_base64())
+	// }
 
 	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
 		encryption_key: acc_guard.curve25519_key().to_bytes(),
@@ -146,14 +143,12 @@ async fn main() -> anyhow::Result<()> {
 	)
 	.await;
 
-	// Talking to server
 	loop {
 		print!("{prompt}");
 		io::stdout().flush()?;
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
 
-		// Cmds (pre-conversation)
 		match input.to_lowercase().trim() {
 			"curve" => {
 				println!(
@@ -187,47 +182,10 @@ async fn main() -> anyhow::Result<()> {
 			"msg" => {
 				println!("{:?}", list_clients(&url).await?);
 
-				print!("Enter target client: ");
-				io::stdout().flush()?;
-
-				let target_client = {
-					let mut input = String::new();
-					io::stdin().read_line(&mut input)?;
-					parse_hex_key(input.trim())?
-				};
-
-				if peers.read().await.contains_key(&target_client) {
-					if let Err(e) =
-						send_message(&acc, target_client, &peers, &write, &ip_and_port, &profile)
-							.await
-					{
-						eprintln!("Send message error: {e:#}");
-					}
-				} else if let Ok((encryption_key, otk)) =
-					fetch_encryption_key_and_otk(&target_client, &url).await
+				if let Err(e) =
+					send_message(&acc, &peers, &write, &ip_and_port, &profile, &url).await
 				{
-					let session = acc.lock().await.create_outbound_session(
-						SessionConfig::version_2(),
-						Curve25519PublicKey::from(encryption_key),
-						Curve25519PublicKey::from(otk),
-					);
-
-					peers.write().await.insert(
-						target_client,
-						PeerSession {
-							x25519: encryption_key,
-							session,
-						},
-					);
-
-					if let Err(e) =
-						send_message(&acc, target_client, &peers, &write, &ip_and_port, &profile)
-							.await
-					{
-						eprintln!("{e:#}");
-					}
-				} else {
-					eprintln!("Fetch died");
+					eprintln!("Send message error: {e:#}");
 				}
 			}
 

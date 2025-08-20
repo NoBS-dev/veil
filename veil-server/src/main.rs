@@ -100,7 +100,9 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 	CLIENTS.write().await.insert(public_key, sender);
 
 	while let Some(Ok(Message::Binary(bytes))) = receiver.next().await {
-		if let Ok((sender_public_key, data)) = process_data(&bytes, &public_key).await {
+		if let Ok((sender_public_key, data)) =
+			process_signed_protocol_messages(&bytes, &public_key).await
+		{
 			match data {
 				ProtocolMessage::EncryptedMessage(msg) => {
 					// TODO: Handle encrypted messages

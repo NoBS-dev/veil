@@ -81,7 +81,7 @@ pub fn parse_hex_key(hex: &str) -> anyhow::Result<[u8; 32]> {
 	Ok(array)
 }
 
-pub async fn process_data(
+pub async fn process_signed_protocol_messages(
 	bytes: &Bytes,
 	sender_public_key: &[u8; 32],
 ) -> anyhow::Result<([u8; 32], ProtocolMessage)> {
