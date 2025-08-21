@@ -1,12 +1,13 @@
+mod cli;
 mod listener;
 mod messaging;
 mod persistence;
 mod types;
 
 use crate::{
+	cli::cli,
 	listener::start_listener,
-	messaging::send_message,
-	persistence::{delete_state_from_keyring, load_state_from_keyring, save_state_to_keyring},
+	persistence::{load_state_from_keyring, save_state_to_keyring},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{
@@ -143,85 +144,7 @@ async fn main() -> anyhow::Result<()> {
 	)
 	.await;
 
-	loop {
-		print!("{prompt}");
-		io::stdout().flush()?;
-		let mut input = String::new();
-		io::stdin().read_line(&mut input)?;
+	cli(&prompt, acc, &url, &peers, write, &ip_and_port, &profile).await?;
 
-		match input.to_lowercase().trim() {
-			"curve" => {
-				println!(
-					"{}",
-					display_key(acc.lock().await.curve25519_key().as_bytes())
-				);
-
-				println!(
-					"{}",
-					base64::encode(acc.lock().await.curve25519_key().as_bytes())
-				);
-			}
-			"ed" => {
-				println!("{}", display_key(acc.lock().await.ed25519_key().as_bytes()));
-
-				println!(
-					"{}",
-					base64::encode(acc.lock().await.ed25519_key().as_bytes())
-				);
-			}
-			"list" => {
-				println!("{:?}", list_clients(&url).await?);
-			}
-			"quit" | "exit" => {
-				println!("Quitting...");
-				std::process::exit(0);
-			}
-			"remove" => {
-				prompt_delete_profile()?;
-			}
-			"msg" => {
-				println!("{:?}", list_clients(&url).await?);
-
-				if let Err(e) =
-					send_message(&acc, &peers, &write, &ip_and_port, &profile, &url).await
-				{
-					eprintln!("Send message error: {e:#}");
-				}
-			}
-
-			_ => println!("Invalid option. Ignoring..."),
-		}
-	}
-}
-
-async fn list_clients(url: &String) -> anyhow::Result<Vec<String>> {
-	Ok(reqwest::get(format!("{url}/clients"))
-		.await?
-		.text()
-		.await?
-		.lines()
-		.map(|line| line.trim().to_string())
-		.collect())
-}
-
-fn prompt_delete_profile() -> anyhow::Result<()> {
-	print!("Profile to delete (empty = default): ");
-	io::stdout().flush()?;
-
-	let mut profile = String::new();
-	io::stdin().read_line(&mut profile)?;
-
-	let p = match profile.trim() {
-		"" => "default",
-		anything_else => anything_else,
-	};
-
-	match delete_state_from_keyring(p)? {
-		true => println!(
-			"Removed profile '{}' from keyring.",
-			format!("{}", p).trim()
-		),
-		false => println!("No keyring entry found for '{}'.", format!("{}", p).trim()),
-	}
 	Ok(())
 }

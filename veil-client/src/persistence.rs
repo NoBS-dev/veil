@@ -1,7 +1,11 @@
 use crate::types::{PersistedPeer, PersistedState};
 use anyhow::{Context, Result, anyhow};
 use keyring::Entry;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+	collections::HashMap,
+	io::{self, Write},
+	sync::Arc,
+};
 use tokio::sync::{Mutex, RwLock};
 use veil_protocol::PeerSession;
 use vodozemac::olm::Account;
@@ -72,4 +76,26 @@ fn normalized_username(profile: &str) -> String {
 fn entry_for(profile: &str) -> Result<Entry> {
 	let user = normalized_username(profile);
 	Entry::new("veil-client", &user).context("Opening keyring entry")
+}
+
+pub fn prompt_delete_profile() -> anyhow::Result<()> {
+	print!("Profile to delete (empty = default): ");
+	io::stdout().flush()?;
+
+	let mut profile = String::new();
+	io::stdin().read_line(&mut profile)?;
+
+	let p = match profile.trim() {
+		"" => "default",
+		anything_else => anything_else,
+	};
+
+	match delete_state_from_keyring(p)? {
+		true => println!(
+			"Removed profile '{}' from keyring.",
+			format!("{}", p).trim()
+		),
+		false => println!("No keyring entry found for '{}'.", format!("{}", p).trim()),
+	}
+	Ok(())
 }
