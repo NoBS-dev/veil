@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
 		)
 		.with_state(state);
 
-	axum::serve(TcpListener::bind("localhost:3000").await?, router).await?;
+	axum::serve(TcpListener::bind("0.0.0.0:3000").await?, router).await?;
 
 	Ok(())
 }
