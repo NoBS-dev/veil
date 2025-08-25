@@ -2,15 +2,7 @@ use rkyv::{
 	Archive, Deserialize, Serialize, deserialize, rancor::Error, to_bytes, util::AlignedVec,
 };
 use tungstenite::Bytes;
-use vodozemac::{
-	Ed25519PublicKey, Ed25519Signature,
-	olm::{Account, Session},
-};
-
-pub struct PeerSession {
-	pub x25519: [u8; 32],
-	pub session: Session,
-}
+use vodozemac::{Ed25519PublicKey, Ed25519Signature, olm::Account};
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub struct Signed {

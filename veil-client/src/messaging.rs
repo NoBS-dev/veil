@@ -1,28 +1,19 @@
-use crate::{PeerSession, display_key, parse_hex_key, persistence::save_state_to_keyring};
+use crate::{
+	display_key, parse_hex_key,
+	state::{PeerSession, State},
+};
 use anyhow::Result;
 use futures_util::{SinkExt, stream::SplitSink};
-use std::{
-	collections::HashMap,
-	io::{self, Write},
-	sync::Arc,
-};
-use tokio::{
-	net::TcpStream,
-	sync::{Mutex, RwLock},
-};
+use std::io::{self, Write};
+use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, Message};
 use veil_protocol::{EncryptedMessage, ProtocolMessage, Signed};
-use vodozemac::olm::{Account, SessionConfig};
+use vodozemac::olm::SessionConfig;
 
-pub async fn send_message(
-	acc: &Arc<Mutex<Account>>,
-	peers: &Arc<RwLock<HashMap<[u8; 32], PeerSession>>>,
-	write: &Arc<Mutex<SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>>>,
-	ip_and_port: &String,
-	profile: &String,
-	url: &String,
-) -> Result<()> {
+type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+
+pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
 	print!("Enter target client: ");
 	io::stdout().flush()?;
 
@@ -33,27 +24,20 @@ pub async fn send_message(
 	};
 
 	{
-		let mut peers_write_lock = peers.write().await;
-
-		if !peers_write_lock.contains_key(&target_client) {
+		if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target_client) {
 			let (their_x25519, otk) = fetch_encryption_key_and_otk(&target_client, url).await?;
-			let session = acc.lock().await.create_outbound_session(
+			let session = state.account.create_outbound_session(
 				SessionConfig::version_2(),
 				their_x25519.into(),
 				otk.into(),
 			);
 
-			peers_write_lock.insert(
-				target_client,
-				PeerSession {
-					x25519: their_x25519,
-					session,
-				},
-			);
+			entry.insert(PeerSession {
+				x25519: their_x25519,
+				session,
+			});
 
-			drop(peers_write_lock);
-
-			if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
+			if let Err(e) = state.save_to_keyring() {
 				eprintln!("Save state failed: {e:?}");
 			} else {
 				eprintln!("Saved!");
@@ -68,9 +52,7 @@ pub async fn send_message(
 	let message = message.trim();
 
 	let (msg_type, ciphertext) = {
-		let mut peers_write_lock = peers.write().await;
-
-		let peer = match peers_write_lock.get_mut(&target_client) {
+		let peer = match state.peers.get_mut(&target_client) {
 			Some(peer) => peer,
 			None => {
 				anyhow::bail!("No session with that client.")
@@ -80,27 +62,24 @@ pub async fn send_message(
 		peer.session.encrypt(message).to_parts()
 	};
 
-	if let Err(e) = save_state_to_keyring(&acc, &peers, &ip_and_port, &profile).await {
+	if let Err(e) = state.save_to_keyring() {
 		eprintln!("Save state failed: {e:?}");
 	} else {
 		eprintln!("Saved!");
 	}
 
 	let signed_bytes = {
-		let acc_guard = acc.lock().await;
 		let msg = ProtocolMessage::EncryptedMessage(EncryptedMessage {
-			sender_x25519: acc_guard.curve25519_key().to_bytes(),
+			sender_x25519: state.account.curve25519_key().to_bytes(),
 			recipient_ed25519: target_client,
 			message_type: msg_type,
 			message: ciphertext,
 		});
 
-		Signed::new_archived(msg, &acc_guard)?
+		Signed::new_archived(msg, &state.account)?
 	};
 
 	write
-		.lock()
-		.await
 		.send(Message::Binary(Bytes::copy_from_slice(&signed_bytes)))
 		.await?;
 
