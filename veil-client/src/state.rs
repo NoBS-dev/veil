@@ -1,6 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use keyring::Entry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_with::serde_as;
 use std::collections::HashMap;
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
@@ -30,6 +31,7 @@ fn deserialize_account<'a, D: Deserializer<'a>>(deserializer: D) -> Result<Accou
 		deserializer,
 	)?))
 }
+#[serde_as]
 #[derive(Deserialize, Serialize)]
 pub struct State {
 	#[serde(
@@ -37,6 +39,7 @@ pub struct State {
 		deserialize_with = "deserialize_account"
 	)]
 	pub account: Account,
+	#[serde_as(as = "Vec<(_, _)>")]
 	pub peers: HashMap<[u8; 32], PeerSession>,
 	pub ip_and_port: Box<str>,
 	pub profile: Box<str>,
@@ -47,7 +50,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			ip_and_port: ip_and_port.into(),
-			profile: profile.into(),
+			profile: normalized_profile(profile).into(),
 		})
 	}
 
@@ -76,5 +79,5 @@ pub fn normalized_profile(profile: &str) -> &str {
 }
 
 fn entry_for(profile: &str) -> Result<Entry> {
-	Entry::new("veil-client", normalized_profile(profile)).context("Opening keyring entry")
+	Ok(Entry::new("veil-client", profile)?)
 }
