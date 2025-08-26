@@ -1,13 +1,13 @@
-use crate::state::{PeerSession, State};
-use futures_util::{StreamExt, stream::SplitStream};
+use crate::{
+	ReadStream,
+	state::{PeerSession, State},
+};
+use futures_util::StreamExt;
 use std::sync::Arc;
-use tokio::{net::TcpStream, sync::Mutex};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio::sync::Mutex;
 use tungstenite::protocol::Message;
 use veil_protocol::{EncryptedMessage, ProtocolMessage};
 use vodozemac::olm::OlmMessage;
-
-type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>) {
 	let public_key_bytes = *state.lock().await.account.ed25519_key().as_bytes();

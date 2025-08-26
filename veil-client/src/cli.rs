@@ -1,20 +1,17 @@
-use crate::messaging;
 use crate::state::State;
+use crate::{WriteStream, messaging};
 use anyhow::Result;
-use futures_util::stream::SplitSink;
 use std::{
 	io::{self, Write},
 	sync::Arc,
 };
-use tokio::{net::TcpStream, sync::Mutex};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use tungstenite::Message;
+use tokio::sync::Mutex;
 use veil_protocol::display_key;
 
 pub async fn cli(
 	prompt: &str,
 	url: &str,
-	mut write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+	mut write: WriteStream,
 	state: Arc<Mutex<State>>,
 ) -> Result<()> {
 	loop {

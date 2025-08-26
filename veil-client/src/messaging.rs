@@ -1,17 +1,13 @@
 use crate::{
-	display_key, parse_hex_key,
+	WriteStream, display_key, parse_hex_key,
 	state::{PeerSession, State},
 };
 use anyhow::Result;
-use futures_util::{SinkExt, stream::SplitSink};
+use futures_util::SinkExt;
 use std::io::{self, Write};
-use tokio::net::TcpStream;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, Message};
 use veil_protocol::{EncryptedMessage, ProtocolMessage, Signed};
 use vodozemac::olm::SessionConfig;
-
-type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
 	print!("Enter target client: ");

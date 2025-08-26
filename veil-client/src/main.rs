@@ -4,14 +4,21 @@ mod messaging;
 mod state;
 
 use crate::{cli::cli, state::State};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+	SinkExt, StreamExt,
+	stream::{SplitSink, SplitStream},
+};
 use std::{
 	io::{self, Write},
 	sync::Arc,
 };
-use tokio::sync::Mutex;
+use tokio::{net::TcpStream, sync::Mutex};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{ProtocolMessage, Signed, UploadKeys, display_key, parse_hex_key};
+
+pub type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+pub type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
