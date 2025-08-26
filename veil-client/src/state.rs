@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use keyring::Entry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::{collections::HashMap, net::SocketAddr, str::FromStr};
+use std::collections::HashMap;
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
 fn serialize_session<S: Serializer>(session: &Session, serializer: S) -> Result<S::Ok, S::Error> {
@@ -38,7 +38,7 @@ pub struct State {
 	)]
 	pub account: Account,
 	pub peers: HashMap<[u8; 32], PeerSession>,
-	pub ip_and_port: SocketAddr,
+	pub ip_and_port: Box<str>,
 	pub profile: Box<str>,
 }
 impl State {
@@ -46,7 +46,7 @@ impl State {
 		Ok(Self {
 			account: Account::new(),
 			peers: HashMap::new(),
-			ip_and_port: SocketAddr::from_str(ip_and_port)?,
+			ip_and_port: ip_and_port.into(),
 			profile: profile.into(),
 		})
 	}

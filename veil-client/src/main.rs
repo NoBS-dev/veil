@@ -52,7 +52,7 @@ async fn main() -> anyhow::Result<()> {
 				let mut ip_and_port = String::new();
 				io::stdin().read_line(&mut ip_and_port)?;
 
-				State::new(&ip_and_port, profile)?
+				State::new(ip_and_port.trim(), profile)?
 			}
 		};
 
