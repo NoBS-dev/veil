@@ -46,22 +46,16 @@ static CLIENTS: LazyLock<RwLock<HashMap<[u8; 32], SplitSink<WebSocket, Message>>
 async fn main() -> Result<()> {
 	let key_map: KeyMap = Arc::new(DashMap::new());
 
-	// Init keys so that server can sign things (clients literally dont accept anything that's not signed)
+	// Keys must be generated because clients won't accept anything t hat isn't signed.
 	let state = ServerState {
 		key_map,
 		server_account: Arc::new(Mutex::new(Account::new())),
 	};
-	{
-		let mut server_account_guard = state.server_account.lock().await;
 
-		server_account_guard.generate_one_time_keys(100);
-		server_account_guard.mark_keys_as_published();
-
-		println!(
-			"My public key: {}",
-			display_key(server_account_guard.ed25519_key().as_bytes())
-		);
-	}
+	println!(
+		"My public key: {}",
+		display_key(state.server_account.lock().await.ed25519_key().as_bytes())
+	);
 
 	let router = Router::new()
 		.route("/", routing::any(socket))
