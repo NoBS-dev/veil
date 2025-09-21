@@ -34,6 +34,7 @@ struct ServerState {
 struct ClientStore {
 	identity_key: [u8; 32],
 	encryption_key: [u8; 32],
+	fallback_key: [u8; 32],
 
 	// Be extremely careful with this, it can easily cause deadlocks
 	one_time_keys: Arc<DashMap<String, [u8; 32]>>, // Key ID | Public key
@@ -125,6 +126,7 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					let store = ClientStore {
 						identity_key: sender_public_key,
 						encryption_key: upload.encryption_key,
+						fallback_key: upload.fallback_key,
 						one_time_keys: Arc::new(DashMap::new()),
 					};
 

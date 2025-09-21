@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// We're just generating 20 for now, should increase later in prod
 	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
-	const OTK_NUM: usize = 20;
+	const OTK_NUM: usize = 1;
 	state.account.generate_one_time_keys(OTK_NUM);
 
 	let otks: Vec<[u8; 32]> = state
@@ -87,9 +87,13 @@ async fn main() -> anyhow::Result<()> {
 	// 	println!("{}", Curve25519PublicKey::from(otk).to_base64())
 	// }
 
+	state.account.generate_fallback_key();
+	let (_, fallback_key) = state.account.fallback_key().into_iter().next().unwrap();
+
 	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
 		encryption_key: state.account.curve25519_key().to_bytes(),
 		one_time_keys: otks,
+		fallback_key: fallback_key.to_bytes(),
 	});
 	write
 		.send(Message::Binary(Bytes::copy_from_slice(
