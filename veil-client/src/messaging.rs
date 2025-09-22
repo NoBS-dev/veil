@@ -19,25 +19,24 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 		parse_hex_key(input.trim())?
 	};
 
-	{
-		if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target_client) {
-			let (their_x25519, otk) = fetch_encryption_key_and_otk(&target_client, url).await?;
-			let session = state.account.create_outbound_session(
-				SessionConfig::version_2(),
-				their_x25519.into(),
-				otk.into(),
-			);
+	if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target_client) {
+		let (their_x25519, otk) = fetch_encryption_key_and_otk(&target_client, url).await?;
 
-			entry.insert(PeerSession {
-				x25519: their_x25519,
-				session,
-			});
+		let session = state.account.create_outbound_session(
+			SessionConfig::version_2(),
+			their_x25519.into(),
+			otk.into(),
+		);
 
-			if let Err(e) = state.save_to_keyring() {
-				eprintln!("Save state failed: {e:?}");
-			} else {
-				eprintln!("Saved!");
-			}
+		entry.insert(PeerSession {
+			x25519: their_x25519,
+			session,
+		});
+
+		if let Err(e) = state.save_to_keyring() {
+			eprintln!("Save state failed: {e:?}");
+		} else {
+			eprintln!("Saved!");
 		}
 	}
 

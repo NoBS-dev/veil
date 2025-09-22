@@ -117,7 +117,10 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 							);
 						}
 					} else {
-						eprintln!("Client {} not connected", display_key(&public_key));
+						eprintln!(
+							"Client {} not connected",
+							display_key(&msg.recipient_ed25519)
+						);
 					}
 				}
 				ProtocolMessage::UploadKeys(upload) => {
@@ -160,15 +163,24 @@ async fn pop_otk(
 	key_map: &KeyMap,
 	identity_key: &[u8; 32],
 ) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
-	let otk_key = {
-		let store = key_map.get(identity_key)?;
-		store.one_time_keys.iter().next().map(|e| e.key().clone())
-	}?;
+	// let otk_key = {
+	// 	let store = key_map.get(identity_key)?;
+	// 	store.one_time_keys.iter().next().map(|e| e.key().clone())
+	// }?;
 
 	let store = key_map.get(identity_key)?;
-	let (_, otk) = store.one_time_keys.remove(&otk_key)?;
+	// let (_, otk) = store.one_time_keys.remove(&otk_key)?;
 
-	Some((store.identity_key, store.encryption_key, otk))
+	let otk = if let Some(k) = store.one_time_keys.iter().next().map(|e| e.key().clone()) {
+		store.one_time_keys.remove(&k).map(|(_, v)| v)
+	} else {
+		None
+	};
+
+	let chosen = otk.unwrap_or(store.fallback_key);
+	Some((store.identity_key, store.encryption_key, chosen))
+
+	// Some((store.identity_key, store.encryption_key, otk))
 }
 
 async fn get_encryption_key_and_otk(
