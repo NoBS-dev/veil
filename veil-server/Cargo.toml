@@ -12,5 +12,4 @@ axum = { version = "0.8", features = ["ws"] }
 futures = "0.3"
 itertools = "0.14"
 tokio = { version = "1", features = ["full"] }
-dashmap = "6"
 vodozemac = "0.9"

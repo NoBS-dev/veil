@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
 
 	// We're just generating 20 for now, should increase later in prod
 	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
-	const OTK_NUM: usize = 1;
+	const OTK_NUM: usize = 20;
 	state.account.generate_one_time_keys(OTK_NUM);
 
 	let otks: Vec<[u8; 32]> = state

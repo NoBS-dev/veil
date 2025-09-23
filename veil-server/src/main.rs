@@ -10,7 +10,6 @@ use axum::{
 	response::{IntoResponse, Response},
 	routing,
 };
-use dashmap::DashMap;
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use std::{
 	collections::HashMap,
@@ -23,7 +22,7 @@ use tokio::{
 use veil_protocol::*;
 use vodozemac::olm::Account;
 
-type KeyMap = Arc<DashMap<[u8; 32], ClientStore>>;
+type KeyMap = Arc<RwLock<HashMap<[u8; 32], ClientStore>>>;
 
 #[derive(Clone)]
 struct ServerState {
@@ -36,8 +35,7 @@ struct ClientStore {
 	encryption_key: [u8; 32],
 	fallback_key: [u8; 32],
 
-	// Be extremely careful with this, it can easily cause deadlocks
-	one_time_keys: Arc<DashMap<String, [u8; 32]>>, // Key ID | Public key
+	one_time_keys: HashMap<String, [u8; 32]>, // Key ID | Public key
 }
 
 static CLIENTS: LazyLock<RwLock<HashMap<[u8; 32], SplitSink<WebSocket, Message>>>> =
@@ -45,7 +43,7 @@ static CLIENTS: LazyLock<RwLock<HashMap<[u8; 32], SplitSink<WebSocket, Message>>
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	let key_map: KeyMap = Arc::new(DashMap::new());
+	let key_map: KeyMap = Arc::new(RwLock::new(HashMap::new()));
 
 	// Keys must be generated because clients won't accept anything t hat isn't signed.
 	let state = ServerState {
@@ -126,11 +124,11 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				ProtocolMessage::UploadKeys(upload) => {
 					eprintln!("Received a key upload request.");
 
-					let store = ClientStore {
+					let mut store = ClientStore {
 						identity_key: sender_public_key,
 						encryption_key: upload.encryption_key,
 						fallback_key: upload.fallback_key,
-						one_time_keys: Arc::new(DashMap::new()),
+						one_time_keys: HashMap::new(),
 					};
 
 					for (i, otk) in upload.one_time_keys.iter().enumerate() {
@@ -138,7 +136,7 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 						store.one_time_keys.insert(key_id, *otk);
 					}
 
-					state.key_map.insert(sender_public_key, store);
+					state.key_map.write().await.insert(sender_public_key, store);
 
 					eprintln!("Key upload request handled properly.");
 				}
@@ -163,24 +161,19 @@ async fn pop_otk(
 	key_map: &KeyMap,
 	identity_key: &[u8; 32],
 ) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
-	// let otk_key = {
-	// 	let store = key_map.get(identity_key)?;
-	// 	store.one_time_keys.iter().next().map(|e| e.key().clone())
-	// }?;
+	let mut map_guard = key_map.write().await;
 
-	let store = key_map.get(identity_key)?;
-	// let (_, otk) = store.one_time_keys.remove(&otk_key)?;
+	let store = map_guard.get_mut(identity_key)?;
 
-	let otk = if let Some(k) = store.one_time_keys.iter().next().map(|e| e.key().clone()) {
-		store.one_time_keys.remove(&k).map(|(_, v)| v)
+	let otk = if let Some(id) = store.one_time_keys.keys().next().cloned() {
+		store.one_time_keys.remove(&id)
 	} else {
 		None
 	};
 
-	let chosen = otk.unwrap_or(store.fallback_key);
-	Some((store.identity_key, store.encryption_key, chosen))
+	let key = otk.unwrap_or(store.fallback_key);
 
-	// Some((store.identity_key, store.encryption_key, otk))
+	Some((store.identity_key, store.encryption_key, key))
 }
 
 async fn get_encryption_key_and_otk(
