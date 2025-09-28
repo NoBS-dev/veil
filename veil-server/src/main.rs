@@ -98,7 +98,6 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 		{
 			match data {
 				ProtocolMessage::EncryptedMessage(msg) => {
-					// TODO: Handle encrypted messages
 					eprintln!("Received an encrypted message");
 
 					if let Some(sender) = CLIENTS.write().await.get_mut(&msg.recipient_ed25519) {
@@ -140,6 +139,9 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 
 					eprintln!("Key upload request handled properly.");
 				}
+				ProtocolMessage::RemainingOneTimeKeys(notification) => eprintln!(
+					"Received a remaining OTKs notification. Should be impossible. Client is either broken or malicious.\nNotification: {notification:?}"
+				),
 			}
 		}
 	}
@@ -160,7 +162,7 @@ async fn list_clients() -> impl IntoResponse {
 async fn pop_otk(
 	key_map: &KeyMap,
 	identity_key: &[u8; 32],
-) -> Option<([u8; 32], [u8; 32], [u8; 32])> {
+) -> Option<([u8; 32], [u8; 32], [u8; 32], u16)> {
 	let mut map_guard = key_map.write().await;
 
 	let store = map_guard.get_mut(identity_key)?;
@@ -173,7 +175,12 @@ async fn pop_otk(
 
 	let key = otk.unwrap_or(store.fallback_key);
 
-	Some((store.identity_key, store.encryption_key, key))
+	Some((
+		store.identity_key,
+		store.encryption_key,
+		key,
+		store.one_time_keys.len() as u16,
+	))
 }
 
 async fn get_encryption_key_and_otk(
@@ -186,11 +193,27 @@ async fn get_encryption_key_and_otk(
 	};
 
 	match pop_otk(&state.key_map, &identity_key).await {
-		Some((_, encryption_key, otk)) => {
+		Some((_, encryption_key, otk, remaining_otks)) => {
 			let encryption_key_hex = display_key(&encryption_key);
 			let otk_hex = display_key(&otk);
 
 			let body = format!("{encryption_key_hex}\n{otk_hex}");
+
+			if let Some(client) = CLIENTS.write().await.get_mut(&identity_key) {
+				let account = state.server_account.lock().await;
+
+				client
+					.send(Message::Binary(Bytes::copy_from_slice(
+						&Signed::new_archived(
+							ProtocolMessage::RemainingOneTimeKeys(remaining_otks),
+							&account,
+						)
+						.unwrap(),
+					)))
+					.await
+					.unwrap();
+			}
+
 			Ok(body)
 		}
 		None => Err((StatusCode::NOT_FOUND, "No OTKs available".into())),

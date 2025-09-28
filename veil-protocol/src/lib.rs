@@ -39,6 +39,7 @@ impl Signed {
 pub enum ProtocolMessage {
 	UploadKeys(UploadKeys),
 	EncryptedMessage(EncryptedMessage),
+	RemainingOneTimeKeys(u16),
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]

@@ -73,33 +73,14 @@ async fn main() -> anyhow::Result<()> {
 	// We're just generating 20 for now, should increase later in prod
 	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
 	const OTK_NUM: usize = 20;
-	state.account.generate_one_time_keys(OTK_NUM);
+	let key_upload_request = generate_key_upload_request(OTK_NUM, &mut state);
 
-	let otks: Vec<[u8; 32]> = state
-		.account
-		.one_time_keys()
-		.values()
-		.map(|key| *key.as_bytes())
-		.collect();
-
-	// println!("Publishing {} OTKs:", otks.len());
-	// for &otk in &otks {
-	// 	println!("{}", Curve25519PublicKey::from(otk).to_base64())
-	// }
-
-	state.account.generate_fallback_key();
-	let (_, fallback_key) = state.account.fallback_key().into_iter().next().unwrap();
-
-	let key_upload_request = ProtocolMessage::UploadKeys(UploadKeys {
-		encryption_key: state.account.curve25519_key().to_bytes(),
-		one_time_keys: otks,
-		fallback_key: fallback_key.to_bytes(),
-	});
 	write
 		.send(Message::Binary(Bytes::copy_from_slice(
 			&Signed::new_archived(key_upload_request, &state.account)?,
 		)))
 		.await?;
+
 	state.account.mark_keys_as_published();
 	state.save_to_keyring()?;
 
@@ -108,4 +89,24 @@ async fn main() -> anyhow::Result<()> {
 	cli(&prompt, &url, write, state).await?;
 
 	Ok(())
+}
+
+fn generate_key_upload_request(num_to_gen: usize, state: &mut State) -> ProtocolMessage {
+	state.account.generate_one_time_keys(num_to_gen);
+
+	let otks = state
+		.account
+		.one_time_keys()
+		.values()
+		.map(|key| *key.as_bytes())
+		.collect();
+
+	state.account.generate_fallback_key();
+	let (_, fallback_key) = state.account.fallback_key().into_iter().next().unwrap();
+
+	ProtocolMessage::UploadKeys(UploadKeys {
+		encryption_key: state.account.curve25519_key().to_bytes(),
+		one_time_keys: otks,
+		fallback_key: fallback_key.to_bytes(),
+	})
 }

@@ -23,11 +23,6 @@ pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>) {
 					.await
 				{
 					match signed_protocol_message {
-						ProtocolMessage::UploadKeys(resp) => {
-							println!("Received an OTK upload request: {resp:?}");
-
-							// TODO: Actually handle the server request
-						}
 						ProtocolMessage::EncryptedMessage(encrypted_message) => {
 							println!("Received a msg: {encrypted_message:?}");
 							process_encrypted_message(
@@ -36,6 +31,17 @@ pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>) {
 								encrypted_message,
 							)
 							.await;
+						}
+						ProtocolMessage::RemainingOneTimeKeys(remaining_otks) => {
+							println!("We have {remaining_otks} OTKs left.");
+
+							// If we have less than half OTKs in our pool, regen some more
+						}
+						protocol_message => {
+							println!(
+								"Received a protocol message that we don't usually handle: {:?}",
+								protocol_message
+							);
 						}
 					}
 				}
