@@ -13,6 +13,7 @@ use axum::{
 use futures::{SinkExt, StreamExt, stream::SplitSink};
 use std::{
 	collections::HashMap,
+	io::{self, Write},
 	sync::{Arc, LazyLock},
 };
 use tokio::{
@@ -43,9 +44,22 @@ static CLIENTS: LazyLock<RwLock<HashMap<[u8; 32], SplitSink<WebSocket, Message>>
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	// let ip = "0.0.0.0";
+	// let port_number: u16 = 9876;
+	// let address = format!("{}:{}", ip, port_number);
+
+	print!("Enter server address (empty for 0.0.0.0:9876): ");
+	io::stdout().flush()?;
+	let mut input = String::new();
+	io::stdin().read_line(&mut input).expect("Invalid input.");
+	let mut address = input.trim();
+	if address.is_empty() {
+		address = "0.0.0.0:9876";
+	}
+
 	let key_map: KeyMap = Arc::new(RwLock::new(HashMap::new()));
 
-	// Keys must be generated because clients won't accept anything t hat isn't signed.
+	// Keys must be generated because clients won't accept anything that isn't signed.
 	let state = ServerState {
 		key_map,
 		server_account: Arc::new(Mutex::new(Account::new())),
@@ -65,7 +79,7 @@ async fn main() -> Result<()> {
 		)
 		.with_state(state);
 
-	axum::serve(TcpListener::bind("0.0.0.0:9876").await?, router).await?;
+	axum::serve(TcpListener::bind(address).await?, router).await?;
 
 	Ok(())
 }
