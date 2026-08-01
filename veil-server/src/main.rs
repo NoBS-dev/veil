@@ -25,7 +25,7 @@ use tokio::{
 	sync::{Mutex, RwLock},
 };
 use veil_protocol::{
-	identity::{DeviceAddress, DeviceId, UserId, verify_device_claim},
+	identity::{DeviceAddress, DeviceId, UserId},
 	*,
 };
 use vodozemac::olm::Account;
@@ -197,23 +197,17 @@ async fn authenticate(
 		anyhow::bail!("client echoed the wrong challenge");
 	}
 
-	// Three checks, and all three are needed:
+	// Walks the whole §5.4 chain:
 	//
-	//   1. the envelope signature (already verified) proves the peer holds the
-	//      device signing key it is using;
-	//   2. `verify_device_claim` proves the master key derives the claimed user
-	//      id, and that the same master key signed *this* device;
-	//   3. the signer must be the device being claimed, or a device could
-	//      present someone else's valid binding.
+	//   device key <-signed by- SSK <-signed by- MSK ->hashes to-> user id
 	//
-	// Drop any one and a peer can be routed under an identity it does not own.
-	verify_device_claim(
-		&claim.user,
-		&claim.master_key,
-		&claim.device,
-		&opened.sender,
-		&claim.binding,
-	)?;
+	// and the device key checked is `opened.sender` — the key that actually
+	// signed this envelope — so a peer cannot present someone else's valid
+	// enrolment. Drop any link and a peer can be routed under an identity it
+	// does not own.
+	claim
+		.keys
+		.verify_device(&claim.user, &claim.device, &opened.sender, &claim.binding)?;
 
 	Ok((DeviceAddress::new(claim.user, claim.device), opened.sender))
 }

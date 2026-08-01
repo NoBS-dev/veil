@@ -1,5 +1,7 @@
+pub mod crosssign;
 pub mod identity;
 
+use crosssign::CrossSigningPublic;
 use identity::{DeviceAddress, DeviceId, UserId};
 
 use rkyv::{
@@ -212,10 +214,10 @@ pub enum ProtocolMessage {
 	/// Client -> server, echoing the challenge inside a signed envelope and
 	/// declaring which identity this connection speaks for.
 	///
-	/// The envelope proves the device holds its own key; `binding` is what
-	/// proves the device belongs to `user` (§5.1-5.3). Without it a device
-	/// could quote any public master key and claim that user's identity.
-	Authenticate(Authenticate),
+	/// The envelope proves the device holds its own key; `keys` plus `binding`
+	/// prove the device belongs to `user` (§5.4). Without them a device could
+	/// quote any public master key and claim that user's identity.
+	Authenticate(Box<Authenticate>),
 	UploadKeys(UploadKeys),
 	EncryptedMessage(EncryptedMessage),
 	RemainingOneTimeKeys(u16),
@@ -227,10 +229,12 @@ pub struct Authenticate {
 	pub challenge: [u8; 32],
 	pub user: UserId,
 	pub device: DeviceId,
-	/// The user's master key. Public by design — it is checked against `user`,
-	/// which is derived from it.
-	pub master_key: [u8; 32],
-	/// Master key's signature over (user, device, device signing key).
+	/// The user's cross-signing keys (§5.4). Public by design — the master key
+	/// is checked against `user`, which is derived from it, and it must have
+	/// signed both subkeys.
+	pub keys: CrossSigningPublic,
+	/// The **self-signing** key's signature over (user, device, device key).
+	/// Verified against `keys`, so the chain runs device -> SSK -> MSK -> user.
 	pub binding: [u8; 64],
 }
 

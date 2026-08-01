@@ -138,9 +138,17 @@ explicitly — each one closes a specific attack.
    changed one.
 7. **OTK exhaustion degrades, it does not fail.** Past the per-identity budget
    the server serves the fallback key instead of consuming a real OTK.
+8. **A device's claim to a user is verified, not asserted.** The handshake walks
+   `device key <- SSK <- MSK -> user id` (§5.4), against the key that actually
+   signed the envelope. Master keys are public, so quoting one proves nothing on
+   its own.
+9. **Enrolling a device never touches the master key.** That is why the
+   self-signing key exists; a master-key signature over a device is *not*
+   accepted as a device signature.
 
-`veil-protocol` has 9 tests covering envelope forgery, re-attribution, replay,
-and the rate limiter. Extend them when touching those paths.
+`veil-protocol` has 26 tests covering envelope forgery, re-attribution, replay,
+the rate limiter, user/device identity (§5.1-5.3) and cross-signing (§5.4).
+Extend them when touching those paths.
 
 ## Working agreements
 

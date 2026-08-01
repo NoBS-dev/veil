@@ -3,28 +3,15 @@ use keyring::Entry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use std::collections::HashMap;
-use veil_protocol::identity::{DeviceAddress, DeviceId, DeviceList, UserId, sign_device_binding};
-use vodozemac::{
-	Ed25519SecretKey,
-	olm::{Account, AccountPickle, Session, SessionPickle},
+use veil_protocol::{
+	crosssign::{CrossSigningPublic, CrossSigningSecrets},
+	identity::{DeviceAddress, DeviceId, DeviceList, UserId},
 };
+use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
 /// Bumped whenever `State` changes shape. Profiles from an older version are
 /// refused rather than migrated — see `load_from_keyring`.
-const STATE_VERSION: u32 = 2;
-
-fn serialize_master_key<S: Serializer>(
-	key: &Ed25519SecretKey,
-	serializer: S,
-) -> Result<S::Ok, S::Error> {
-	key.to_base64().serialize(serializer)
-}
-fn deserialize_master_key<'a, D: Deserializer<'a>>(
-	deserializer: D,
-) -> Result<Ed25519SecretKey, D::Error> {
-	let encoded = String::deserialize(deserializer)?;
-	Ed25519SecretKey::from_base64(&encoded).map_err(serde::de::Error::custom)
-}
+const STATE_VERSION: u32 = 3;
 
 fn serialize_session<S: Serializer>(session: &Session, serializer: S) -> Result<S::Ok, S::Error> {
 	session.pickle().serialize(serializer)
@@ -34,6 +21,22 @@ fn deserialize_session<'a, D: Deserializer<'a>>(deserializer: D) -> Result<Sessi
 		deserializer,
 	)?))
 }
+/// A person we have verified out of band (§5.4, §6.1).
+///
+/// Holding one of these means every device that user owns — including devices
+/// added afterwards — verifies through their cross-signing chain without any
+/// further action from us. That is the whole point of verifying a *person*
+/// rather than a device.
+#[serde_as]
+#[derive(Deserialize, Serialize)]
+pub struct VerifiedUser {
+	pub master_key: [u8; 32],
+	/// Our user-signing key's signature over their master key.
+	#[serde_as(as = "[_; 64]")]
+	pub attestation: [u8; 64],
+	pub verified_at: u64,
+}
+
 #[derive(Deserialize, Serialize)]
 pub struct PeerSession {
 	pub x25519: [u8; 32],
@@ -64,15 +67,12 @@ fn deserialize_account<'a, D: Deserializer<'a>>(deserializer: D) -> Result<Accou
 pub struct State {
 	pub version: u32,
 
-	// ---- who the user is (§5.1) ----
-	/// Root of identity. Rotating it changes `user_id` and forces every peer to
-	/// re-verify, so it is generated once and otherwise left alone (§5.5).
-	#[serde(
-		serialize_with = "serialize_master_key",
-		deserialize_with = "deserialize_master_key"
-	)]
-	master_key: Ed25519SecretKey,
-	/// Derived from `master_key`; stored so callers need not re-derive it.
+	// ---- who the user is (§5.1, §5.4) ----
+	/// Master, self-signing and user-signing keys. The master is the root of
+	/// identity — rotating it changes `user_id` and forces every peer to
+	/// re-verify, so day-to-day work uses the subkeys instead (§5.5).
+	cross_signing: CrossSigningSecrets,
+	/// Derived from the master key; stored so callers need not re-derive it.
 	pub user_id: UserId,
 
 	// ---- which device this is (§5.2) ----
@@ -93,6 +93,10 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// People we have verified. Keyed by user, never by device (§5.4).
+	#[serde_as(as = "Vec<(_, _)>")]
+	#[serde(default)]
+	pub verified_users: HashMap<UserId, VerifiedUser>,
 
 	pub ip_and_port: Box<str>,
 	pub profile: Box<str>,
@@ -107,17 +111,18 @@ impl State {
 	pub fn new(server_address: &str, profile: &str) -> Result<Self> {
 		let (ip_and_port, use_tls) = parse_server_address(server_address);
 
-		let master_key = Ed25519SecretKey::new();
-		let user_id = UserId::from_master_key(&master_key.public_key());
+		let cross_signing = CrossSigningSecrets::new();
+		let user_id = cross_signing.user_id();
 
 		Ok(Self {
 			version: STATE_VERSION,
-			master_key,
+			cross_signing,
 			user_id,
 			device_id: DeviceId::generate(),
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			verified_users: HashMap::new(),
 			ip_and_port,
 			profile: normalized_profile(profile).into(),
 			server_identity: None,
@@ -131,20 +136,46 @@ impl State {
 	}
 
 	pub fn master_public_key(&self) -> [u8; 32] {
-		*self.master_key.public_key().as_bytes()
+		self.cross_signing.master_public()
 	}
 
-	/// Proof that this device belongs to this user, presented at handshake.
+	/// The publishable cross-signing keys, presented at handshake so peers can
+	/// walk the chain down to a device.
+	pub fn cross_signing_public(&self) -> CrossSigningPublic {
+		self.cross_signing.public()
+	}
+
+	/// Proof that this device belongs to this user (§5.4).
 	///
-	/// Signed by the master key directly for now; §5.4 will move it behind a
-	/// self-signing key so the master can stay cold.
+	/// Made with the **self-signing** key, so enrolling a device never touches
+	/// the master key.
 	pub fn device_binding(&self) -> [u8; 64] {
-		sign_device_binding(
-			&self.master_key,
-			&self.user_id,
-			&self.device_id,
-			self.account.ed25519_key().as_bytes(),
-		)
+		self.cross_signing
+			.sign_device(&self.device_id, self.account.ed25519_key().as_bytes())
+	}
+
+	/// Records that we have verified another person, after comparing safety
+	/// numbers out of band. Every device they own — now and later — follows
+	/// from this one signature (§5.4).
+	pub fn verify_user(&mut self, subject_master: &[u8; 32]) -> Result<UserId> {
+		let key = vodozemac::Ed25519PublicKey::from_slice(subject_master)?;
+		let subject = UserId::from_master_key(&key);
+
+		let attestation = self.cross_signing.attest_user(&subject, subject_master);
+		self.verified_users.insert(
+			subject,
+			VerifiedUser {
+				master_key: *subject_master,
+				attestation,
+				verified_at: veil_protocol::now_ms()?,
+			},
+		);
+
+		Ok(subject)
+	}
+
+	pub fn is_verified(&self, user: &UserId) -> bool {
+		self.verified_users.contains_key(user)
 	}
 
 	pub fn schemes(&self) -> (&'static str, &'static str) {
@@ -182,9 +213,13 @@ impl State {
 		// The stored identity must still hang together — a tampered or corrupt
 		// keyring entry should fail here rather than silently give this client a
 		// user id its master key does not derive.
-		if !state.user_id.matches(&state.master_key.public_key()) {
-			anyhow::bail!("profile {profile:?} has a user id its master key does not derive");
-		}
+		state
+			.cross_signing
+			.public()
+			.verify(&state.user_id)
+			.map_err(|e| {
+				anyhow::anyhow!("profile {profile:?} has an inconsistent identity: {e}")
+			})?;
 
 		Ok(state)
 	}

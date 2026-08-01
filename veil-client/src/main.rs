@@ -138,16 +138,16 @@ async fn handshake(
 
 	write
 		.send(Message::Binary(Bytes::copy_from_slice(&Envelope::seal(
-			// The envelope proves this device holds its signing key; the binding
-			// proves the device belongs to this user (§5.1-5.3). Both are needed
-			// — a master key is public, so quoting one proves nothing.
-			&ProtocolMessage::Authenticate(Authenticate {
+			// The envelope proves this device holds its signing key; the keys
+			// and binding prove the device belongs to this user (§5.4). Both are
+			// needed — a master key is public, so quoting one proves nothing.
+			&ProtocolMessage::Authenticate(Box::new(Authenticate {
 				challenge,
 				user: state.user_id,
 				device: state.device_id,
-				master_key: state.master_public_key(),
+				keys: state.cross_signing_public(),
 				binding: state.device_binding(),
-			}),
+			})),
 			&state.account,
 		)?)))
 		.await?;

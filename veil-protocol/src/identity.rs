@@ -15,7 +15,7 @@ use data_encoding::BASE32_NOPAD;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as De, Serialize as Ser};
 use sha2::{Digest, Sha256};
-use vodozemac::{Ed25519PublicKey, Ed25519SecretKey, Ed25519Signature};
+use vodozemac::Ed25519PublicKey;
 
 const USER_ID_DOMAIN: &[u8] = b"veil-user-id-v1";
 const DEVICE_BINDING_DOMAIN: &[u8] = b"veil-device-binding-v1";
@@ -164,10 +164,14 @@ impl Device {
 	}
 }
 
-/// Bytes the master key signs to bind a device to its owner.
+/// Bytes signed to bind a device to its owner.
 ///
 /// Domain-separated and covering all three of user, device and device key, so a
-/// binding cannot be lifted onto a different device or a different user.
+/// signature cannot be lifted onto a different device or a different user.
+///
+/// Signed by the user's **self-signing key** (§5.4), not the master key — see
+/// `crosssign`. This lives here because it names identity types, not because
+/// identity owns the signing policy.
 pub fn device_binding_input(
 	user: &UserId,
 	device: &DeviceId,
@@ -179,57 +183,6 @@ pub fn device_binding_input(
 	buffer.extend_from_slice(device.as_bytes());
 	buffer.extend_from_slice(device_ed25519);
 	buffer
-}
-
-pub fn sign_device_binding(
-	master_key: &Ed25519SecretKey,
-	user: &UserId,
-	device: &DeviceId,
-	device_ed25519: &[u8; 32],
-) -> [u8; 64] {
-	master_key
-		.sign(&device_binding_input(user, device, device_ed25519))
-		.to_bytes()
-}
-
-/// Verifies a device's whole claim to a user identity.
-///
-/// Two independent checks, and both are load-bearing:
-///
-/// 1. the master key hashes to the claimed `UserId` — nobody can rename
-///    themselves into someone else's identity;
-/// 2. that master key signed this device — the device is genuinely part of the
-///    user's set rather than an impostor quoting a public key.
-///
-/// Without (2) the first check alone proves nothing useful, since master keys
-/// are public: anyone could quote a stranger's key and claim their `UserId`.
-///
-/// **This is the interim shape.** §5.4 puts a self-signing key between the
-/// master key and the device so the master can stay cold; cross-signing (Tier 1
-/// item 2) replaces this direct signature with that chain. The property checked
-/// here does not change, only the number of links.
-pub fn verify_device_claim(
-	user: &UserId,
-	master_key: &[u8; 32],
-	device: &DeviceId,
-	device_ed25519: &[u8; 32],
-	binding: &[u8; 64],
-) -> anyhow::Result<()> {
-	let master_key = Ed25519PublicKey::from_slice(master_key)?;
-
-	if !user.matches(&master_key) {
-		anyhow::bail!("master key does not derive the claimed user id {user}");
-	}
-
-	let signature = Ed25519Signature::from_slice(binding)?;
-	master_key
-		.verify(
-			&device_binding_input(user, device, device_ed25519),
-			&signature,
-		)
-		.map_err(|e| anyhow::anyhow!("device {device} is not bound to user {user}: {e}"))?;
-
-	Ok(())
 }
 
 /// A user's published set of devices.
@@ -428,103 +381,5 @@ mod tests {
 		// be made to look newer than it is.
 		assert!(!list.remove(&DeviceId::generate(), 99));
 		assert_eq!(list.updated_at, 11);
-	}
-
-	fn keypair() -> (Ed25519SecretKey, UserId) {
-		let secret = Ed25519SecretKey::new();
-		let user = UserId::from_master_key(&secret.public_key());
-		(secret, user)
-	}
-
-	#[test]
-	fn a_bound_device_verifies() {
-		let (master, user) = keypair();
-		let device = DeviceId::generate();
-		let device_key = [7u8; 32];
-
-		let binding = sign_device_binding(&master, &user, &device, &device_key);
-		assert!(
-			verify_device_claim(
-				&user,
-				master.public_key().as_bytes(),
-				&device,
-				&device_key,
-				&binding
-			)
-			.is_ok()
-		);
-	}
-
-	/// The attack the binding exists to stop: master keys are public, so
-	/// quoting someone else's must not be enough to claim their identity.
-	#[test]
-	fn quoting_a_strangers_master_key_is_not_enough() {
-		let (victim_master, victim) = keypair();
-		let device = DeviceId::generate();
-		let device_key = [7u8; 32];
-
-		// The impostor knows the victim's user id and public master key — both
-		// are public — but cannot produce a binding for its own device.
-		let (impostor_master, _) = keypair();
-		let forged = sign_device_binding(&impostor_master, &victim, &device, &device_key);
-
-		assert!(
-			verify_device_claim(
-				&victim,
-				victim_master.public_key().as_bytes(),
-				&device,
-				&device_key,
-				&forged
-			)
-			.is_err()
-		);
-	}
-
-	#[test]
-	fn a_binding_cannot_be_lifted_onto_another_device_or_user() {
-		let (master, user) = keypair();
-		let device = DeviceId::generate();
-		let device_key = [7u8; 32];
-		let binding = sign_device_binding(&master, &user, &device, &device_key);
-		let master_bytes = *master.public_key().as_bytes();
-
-		// same binding, different device
-		assert!(
-			verify_device_claim(
-				&user,
-				&master_bytes,
-				&DeviceId::generate(),
-				&device_key,
-				&binding
-			)
-			.is_err()
-		);
-		// same binding, different device key
-		assert!(verify_device_claim(&user, &master_bytes, &device, &[8u8; 32], &binding).is_err());
-		// same binding, different user
-		let (_, other_user) = keypair();
-		assert!(
-			verify_device_claim(&other_user, &master_bytes, &device, &device_key, &binding)
-				.is_err()
-		);
-	}
-
-	#[test]
-	fn a_mismatched_master_key_is_rejected_before_the_signature() {
-		let (_, user) = keypair();
-		let (other_master, _) = keypair();
-		let device = DeviceId::generate();
-		let binding = sign_device_binding(&other_master, &user, &device, &[7u8; 32]);
-
-		let err = verify_device_claim(
-			&user,
-			other_master.public_key().as_bytes(),
-			&device,
-			&[7u8; 32],
-			&binding,
-		)
-		.unwrap_err()
-		.to_string();
-		assert!(err.contains("does not derive"), "got: {err}");
 	}
 }
