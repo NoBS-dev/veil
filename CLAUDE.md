@@ -152,8 +152,15 @@ explicitly — each one closes a specific attack.
     the message, so a claimed id cannot disagree with the content. Duplicates
     are dropped *before* any Olm work, since decrypting twice would advance a
     ratchet for a message already handled.
+12. **A community's encryption mode is inside its id.** `CommunityId` hashes the
+    root record, mode included, so a host cannot serve a different mode under
+    the same id. Anything that might ever change belongs in the signed policy
+    chain instead — a root field is frozen for the community's life.
+13. **Policy needs k *distinct* controllers.** One controller signing twice must
+    not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
+    advance, or a stale migration could redirect a community backwards.
 
-`veil-protocol` has 36 tests covering envelope forgery, re-attribution, replay,
+`veil-protocol` has 48 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.

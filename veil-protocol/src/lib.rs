@@ -1,3 +1,4 @@
+pub mod community;
 pub mod crosssign;
 pub mod identity;
 pub mod message;
