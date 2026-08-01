@@ -164,7 +164,7 @@ explicitly — each one closes a specific attack.
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
 
-`veil-protocol` has 53 tests covering envelope forgery, re-attribution, replay,
+`veil-protocol` has 60 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.

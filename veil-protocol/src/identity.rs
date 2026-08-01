@@ -29,7 +29,9 @@ const USER_ID_LEN: usize = 16;
 ///
 /// Derived from the master key rather than assigned, so it cannot be reassigned
 /// by anyone and cannot disagree with the key it names.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+	Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[rkyv(attr(derive(Debug)))]
 #[derive(Ser, De)]
 pub struct UserId([u8; USER_ID_LEN]);
@@ -89,7 +91,9 @@ impl std::fmt::Display for UserId {
 
 /// Identifies one device belonging to a user. Random rather than derived: a
 /// device's keys rotate (§5.5) and the id must survive that.
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+	Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[rkyv(attr(derive(Debug)))]
 #[derive(Ser, De)]
 pub struct DeviceId([u8; 16]);
@@ -119,7 +123,9 @@ impl std::fmt::Display for DeviceId {
 /// Where a message goes. Sessions are established **device to device**, never
 /// user to user, so a message addressed to a user fans out to one of these per
 /// active device (§5.2).
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+	Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord,
+)]
 #[rkyv(attr(derive(Debug)))]
 #[derive(Ser, De)]
 pub struct DeviceAddress {

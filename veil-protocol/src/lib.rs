@@ -1,5 +1,6 @@
 pub mod community;
 pub mod crosssign;
+pub mod groupkeys;
 pub mod identity;
 pub mod message;
 pub mod version;

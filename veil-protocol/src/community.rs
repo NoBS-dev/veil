@@ -51,7 +51,21 @@ impl std::fmt::Display for Mode {
 	}
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash, Ser, De)]
+#[derive(
+	Archive,
+	Deserialize,
+	Serialize,
+	Debug,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Hash,
+	PartialOrd,
+	Ord,
+	Ser,
+	De,
+)]
 #[rkyv(attr(derive(Debug)))]
 pub struct CommunityId([u8; COMMUNITY_ID_LEN]);
 

@@ -93,12 +93,12 @@ to.
 | Prekey/roster rate limiting | **[built]** |
 | Blind relay, tunnel, anti-open-proxy checks | designed, §3.2 |
 | DM store-and-forward mailboxes | designed, §3.3–3.4 |
-| Protocol version negotiation | designed, §3.6 |
+| Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
 | Community roots, policy chain, mode binding | **[built]** `community.rs`, not yet wired to a transport |
 | Moderation and reporting under Sealed | designed, §7.6 |
-| Megolm group messaging, `GroupKeyProvider` | designed, §8.1–8.4 |
+| Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, not yet wired to a transport |
 | Roles: read-vs-rest split, signed role state | designed, §8.5 |
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
