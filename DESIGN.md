@@ -94,14 +94,14 @@ to.
 | Blind relay, tunnel, anti-open-proxy checks | designed, §3.2 |
 | DM store-and-forward mailboxes | designed, §3.3–3.4 |
 | Protocol version negotiation | designed, §3.6 |
-| User/device separation, multi-device | designed, §5.1–5.3 |
-| Cross-signing | designed, §5.4 |
-| Encryption tiers, transitions, mode binding | designed, §7.1–7.4 |
+| User/device separation, multi-device | **[built]** `identity.rs` |
+| Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
+| Community roots, policy chain, mode binding | **[built]** `community.rs`, not yet wired to a transport |
 | Moderation and reporting under Sealed | designed, §7.6 |
 | Megolm group messaging, `GroupKeyProvider` | designed, §8.1–8.4 |
 | Roles: read-vs-rest split, signed role state | designed, §8.5 |
 | Calls and real-time media | designed, §9 |
-| Message model, hash chain, `seen_head` | designed, §10–10.1 |
+| Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | designed, §10.2 |
 | Presence, typing, read state | designed, §10.3 |
 | Search (client-side index) | designed, §10.4 |
@@ -488,6 +488,12 @@ not silently accepted.
 
 - **Device key** — device generates new keys, SSK signs them, publishes. Cheap,
   routine, invisible to peers. The answer to a suspected device compromise.
+- **Subkey (SSK or USK)** — master signs a replacement. **Currently has no
+  rollback defence**: nothing in a published key set says how recent it is, so a
+  device still holding an old set could reinstate it, and devices enrolled under
+  the new subkey would then fail verification. If the subkey was rotated *because*
+  of a compromise, the attacker holds exactly such a device. Needs a monotonic
+  marker on the key set before subkey rotation is safe to rely on.
 - **Device removal** — user removes it from their list and re-signs. Forces
   Megolm rotation in every Sealed group they belong to (§8.3).
 - **MSK** — changes the `UserId`. All peers must re-verify, and see an explicit

@@ -48,8 +48,49 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 		parse_address(&input)?
 	};
 
-	if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target) {
+	if !state.peers.contains_key(&target) {
+		// The prekey bundle comes from the host, which is untrusted for identity
+		// (§4.3). Taking it at face value would let a malicious host hand over
+		// its *own* keys and sit in the middle of the session — so the device is
+		// checked against the peer's cross-signing chain first, and the bundle
+		// must then match what that chain vouches for.
+		let (_, devices) = fetch_device_list(&target.user, url).await?;
+
+		let device = devices
+			.iter()
+			.find(|d| d.device_id == target.device)
+			.ok_or_else(|| {
+				anyhow::anyhow!(
+					"{} is not in {}'s verified device list — the host may be inventing it",
+					target.device,
+					target.user
+				)
+			})?;
+
 		let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, url).await?;
+
+		if their_ed25519 != device.ed25519 {
+			anyhow::bail!(
+				"the host served a signing key for {target} that its own device list does not \
+				 vouch for — refusing to open a session"
+			);
+		}
+		if their_x25519 != device.curve25519 {
+			anyhow::bail!(
+				"the host served an identity key for {target} that its own device list does not \
+				 vouch for — refusing to open a session"
+			);
+		}
+
+		// The device provably belongs to that user. Whether we know *who* that
+		// user is remains a separate question (§5.4).
+		if !state.is_verified(&target.user) {
+			eprintln!(
+				"warning: {} is not verified. The device is genuinely theirs, but nothing yet \
+				 confirms who they are — run `safety` to compare numbers.",
+				target.user
+			);
+		}
 
 		let session = state.account.create_outbound_session(
 			SessionConfig::version_2(),
@@ -57,16 +98,19 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 			otk.into(),
 		);
 
-		entry.insert(PeerSession {
-			x25519: their_x25519,
-			seen_head: MessageId::ROOT,
-			seen_ids: Default::default(),
-			sent_ids: Default::default(),
-			// Pinned here, and required to match on everything that arrives
-			// from this address afterwards.
-			ed25519: their_ed25519,
-			session,
-		});
+		state.peers.insert(
+			target,
+			PeerSession {
+				x25519: their_x25519,
+				seen_head: MessageId::ROOT,
+				seen_ids: Default::default(),
+				sent_ids: Default::default(),
+				// Pinned here, and required to match on everything that arrives
+				// from this address afterwards.
+				ed25519: their_ed25519,
+				session,
+			},
+		);
 
 		if let Err(e) = state.save_to_keyring() {
 			eprintln!("Save state failed: {e:?}");

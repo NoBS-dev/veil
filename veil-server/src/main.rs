@@ -252,11 +252,25 @@ trait UserRecords {
 
 impl UserRecords for HashMap<UserId, UserRecord> {
 	fn insert_device(&mut self, user: UserId, keys: CrossSigningPublic, device: Device) {
-		let record = self.entry(user).or_insert_with(|| UserRecord {
-			keys,
-			devices: HashMap::new(),
-		});
-		record.devices.insert(device.device_id, device);
+		match self.get_mut(&user) {
+			Some(record) => {
+				// Refresh rather than keep the first set ever seen. A user who
+				// rotates a subkey (§5.5) would otherwise have the stale keys
+				// served forever, and every device enrolled under the new key
+				// would fail verification for anyone fetching the list.
+				//
+				// Safe to take: these keys were verified during the handshake
+				// that produced this call, so they derive `user` and the master
+				// key signed both subkeys.
+				record.keys = keys;
+				record.devices.insert(device.device_id, device);
+			}
+			None => {
+				let mut devices = HashMap::new();
+				devices.insert(device.device_id, device);
+				self.insert(user, UserRecord { keys, devices });
+			}
+		}
 	}
 }
 
@@ -528,9 +542,19 @@ async fn get_device_list(
 		.get(&user)
 		.ok_or((StatusCode::NOT_FOUND, "No such user".to_owned()))?;
 
+	// A device is recorded at handshake but its Olm identity key only arrives
+	// with the key upload that follows. Serving the half-built entry would make
+	// a peer's device-list check disagree with the prekey bundle and refuse a
+	// perfectly good device, so incomplete entries are withheld until complete.
+	let devices: Vec<_> = record
+		.devices
+		.values()
+		.filter(|d| d.curve25519 != [0; 32])
+		.collect();
+
 	Ok(axum::Json(serde_json::json!({
 		"user": user.to_string(),
 		"keys": record.keys,
-		"devices": record.devices.values().collect::<Vec<_>>(),
+		"devices": devices,
 	})))
 }
