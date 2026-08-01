@@ -31,6 +31,17 @@ veil-server/     axum WebSocket relay + HTTP prekey/roster endpoints
 veil-client/     CLI client (cli, listener, messaging, state)
 ```
 
+Planned (§17): `veil-client-core` (Rust library — sessions, keys, storage,
+search, network, **no UI dependency**), `veil-daemon` wrapping it behind a local
+socket, and `veil-gui` in **C++/Qt** talking to that socket. **No FFI between
+them** — Tauri/Electron are ruled out too. Mobile links the core directly and
+uses native UI, deferred. Today's `veil-client` interleaves protocol work with
+`println!`; separating that is a precondition for the GUI.
+
+`spike/qt-ipc/` is a working reference for that architecture — `./run.sh`. It has
+its own `[workspace]`, so `cargo build --workspace` at the root ignores it. It
+needs `qt6-base` and `qt6-declarative`.
+
 `veil-protocol` is the crate to treat most carefully — it defines the wire
 format and the security primitives. Changes there affect both other crates and
 any stored state.

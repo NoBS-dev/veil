@@ -105,6 +105,7 @@ to.
 | Attachments and media | designed, §10.2 |
 | Presence, typing, read state | designed, §10.3 |
 | Search (client-side index) | designed, §10.4 |
+| Deletion, tombstoning, erasure | designed, §10.5 |
 | Attestations and verification | designed, §11.2–11.2.1 |
 | Reputation, discovery, finding people | designed, §11.4–11.6 |
 | Persistence, delivery, push | designed, §12.1–12.2 |
@@ -112,6 +113,8 @@ to.
 | Key backup and device enrolment | designed, §12.5 |
 | Horizontal scaling | designed, §13.1–13.3 |
 | Time synchronisation | designed, §13.4 |
+| Client architecture (seam, Qt, mobile) | designed, §17 |
+| Client split: Rust daemon + C++/Qt over a socket | **validated by spike**, §17.3 |
 | Communities, channels, bots | **not designed** |
 
 §4 (threat model), §6 (trust establishment), §14 (metadata) and §15 (sequencing)
@@ -1221,6 +1224,61 @@ for this threat model.
 works on a fresh device. That asymmetry is the tier trade working as intended, and
 it is one of the better honest arguments for choosing Open.
 
+### 10.5 Deletion and erasure
+
+**Durability and deletion are in direct tension, and this design chose
+durability.** Member-held copies (§12.3) are what make a community outlive its
+operator — and they are equally what make "delete this everywhere" impossible to
+guarantee. That trade was made deliberately; what follows is being honest about
+its consequences rather than pretending they do not exist.
+
+#### The chain survives deletion, by construction
+
+Deleting a message must not break the hash chain (§10.1), and it does not,
+because the chain links **`message_id`s** — and `message_id` is a hash of the
+*original* content (§10). Blanking a row's stored content leaves its identity and
+its position untouched, so the chain still verifies end to end.
+
+So deletion is **tombstoning**: retain `message_id`, `seq`, `prev_hash`, and
+sender; discard the content. The one cost is that a tombstoned entry can no
+longer be re-derived from its content, so that single link becomes unverifiable
+to anyone who did not keep a copy. The chain around it is unaffected.
+
+This property falls out of content-addressing for free. It would have been
+expensive to add later, and it is a good reason not to chain over stored rows.
+
+#### What deletion actually guarantees
+
+| Scope | Guarantee |
+| --- | --- |
+| The host's copy | **Removed.** Tombstoned, not recoverable from the server |
+| Clients that are online and well-behaved | Removed on receipt of the delete event |
+| Member exports and offline clients | **Not removed.** Nothing reaches them |
+
+This is the same guarantee every messaging system actually provides — Signal,
+Discord and Matrix all issue a delete request that honest clients honour, and
+none can reach a copy someone already kept. The difference here is that Veil
+*encourages* members to keep copies, so the gap is wider and more predictable.
+
+**Say so in the UI.** "Deleted for everyone" is a lie in every product that
+prints it; here it would be a larger one.
+
+#### Erasure requests and account deletion
+
+An erasure request reaches the host and no further. The operator can tombstone
+every message a user sent and drop their account, and cannot touch the copies
+members hold — for a Sealed community, cannot even read what it is being asked to
+remove.
+
+This is the same shape as §7.6's legal analysis: the blunt instruments exist and
+work, targeted removal beyond the server does not. Operators should know that
+before they run a public community, and it belongs in their published policy.
+
+Account deletion has a further limit worth stating: a `UserId` is derived from a
+key (§5.1) and past messages are signed by that user's device keys, so **the
+authorship of existing messages cannot be unmade** — only their content
+tombstoned and their account closed.
+
 ---
 
 ## 11. Abuse resistance
@@ -1972,16 +2030,27 @@ Two carry more weight than their position suggests:
 - **Roles (§8.5)** are Tier 3 as a feature, but their *signed read-membership
   state* is Tier 1 item 4, because senders rely on it to decide key distribution.
 
-### 15.1 Measurement tasks
+### 15.1 Unverified numbers
 
-Two numbers in this document are guesses and are marked as such in §16. Run these
-during Tier 1, not after — both would change written design if the answer is bad.
+Two figures here are **engineering estimates, not measurements**, and are accepted
+as low risk on the basis that comparable systems already work: Element runs
+encrypted rooms and encrypted video calls in production at these scales.
 
-- **Megolm rotation cost** at 50 / 200 / 500 members × ~2 devices under scripted
-  join/leave churn. Governs §7.1's "few hundred members" ceiling.
-- **Relay media capacity** — concurrent relayed video and screenshare streams on
-  a domestic uplink, with selective forwarding and simulcast on. Governs §1.3's
-  "a few dozen friends" invariant.
+- **§7.1's "few hundred members"** Sealed ceiling — governed by Megolm rotation
+  cost at roughly Σ(devices per member) per rotation.
+- **§1.3's "a few dozen friends"** relay invariant — governed by concurrent
+  relayed video and screenshare, with selective forwarding, simulcast, and the
+  P2P escalation (§9.1) all bounding it.
+
+Neither blocks Tier 1. Worth a sanity check whenever load-testing is convenient,
+mainly so the numbers in this document can stop being estimates — but they should
+not gate the build.
+
+One caveat on the comparison, so it is not leaned on too hard: Element's success
+with encrypted calls demonstrates that **the cryptography** is not the
+bottleneck. It says nothing about a **domestic uplink**, since Element Call
+deployments run on real server bandwidth. If self-hosters ever report poor call
+quality, uplink saturation is the first thing to check, not the crypto.
 
 ---
 
@@ -1994,36 +2063,170 @@ during Tier 1, not after — both would change written design if the answer is b
   channels and moderation logs**, which nobody else is entitled to hold. Accepted:
   every alternative is worse, since widening who can decrypt them is precisely
   the ACL bypass filtering was introduced to avoid.
-- **Relay capacity is a media question, not a user-count question.**
-  *(Measurement task. The number in §1.3 is currently unverified.)* Text and
-  signalling are negligible — a WebSocket carrying DMs costs almost nothing, and
-  the "few dozen friends" figure is comfortable for messaging. The entire
-  constraint is **concurrent relayed video and screenshare** (§9.1) at 1–8 Mbps
-  per stream, against a domestic uplink. So the thing to measure is not users but
-  **simultaneous relayed streams before quality degrades**, with selective
-  forwarding and simulcast enabled. Restate §1.3 in those terms once measured.
-- **Megolm cost at real membership and churn.** *(Measurement task. The "few
-  hundred members" ceiling in §7.1 is currently unverified.)* No public benchmarks
-  for large encrypted Matrix rooms could be found, so the figure cannot be
-  validated from the literature and must be measured directly: rotation wall-clock
-  and to-device volume at 50 / 200 / 500 members × ~2 devices, under scripted
-  join/leave churn. Matrix's own experience is qualitative but pointed — its
-  history-sharing proposal describes per-session-per-device fan-out as
-  "prohibitive" (§12.5), which is the same fan-out shape that governs rotation.
-- **Sybil resistance rests on per-account verification cost, not server
-  reputation.** An earlier draft framed this as "an attacker ages home servers
-  for months, then floods." Direct verification (§11.2.1) largely dissolved that:
-  a community checks each user itself, so an aged home server no longer smuggles
-  accounts in — its standing only buys relay throughput (§11.4). What remains is
-  the honest floor: a public community can be sybil-attacked for roughly the cost
-  of bulk email addresses plus solved captchas, which is low. Phone raises it;
-  invite-only defaults (§11.3) sidestep it. There is no mechanism here that
-  proves distinct humans, and verification proves someone completed an OTP —
-  nothing more.
-- **Phone verification is a real-world identifier held by strangers.** Direct
-  verification (§11.2.1) is right on trust grounds, but a user joining several
-  public communities hands their number to several unrelated operators. Salted
-  hashes and immediate discard (§11.2.1) are policy, not enforcement — nothing
-  stops a host retaining it. Is there a mechanism that proves possession of a
-  distinct number without revealing it, and that does not require a trusted
-  third party?
+- **Relay capacity on a domestic uplink is an estimate.** *Accepted as low risk.*
+  Text and signalling are negligible; the whole constraint is concurrent relayed
+  video and screenshare (§9.1) at 1–8 Mbps per stream, bounded by selective
+  forwarding, simulcast, and the P2P escalation. Element runs encrypted calls in
+  production, so the cryptography is not the bottleneck — but that says nothing
+  about home bandwidth, so uplink saturation is the first suspect if self-hosters
+  report poor call quality (§15.1).
+- **The Sealed membership ceiling is an estimate.** *Accepted as low risk.*
+  §7.1's "few hundred members" is not measured, and no public benchmarks for large
+  encrypted Matrix rooms could be found — but Element runs encrypted rooms at
+  these scales in production. The binding cost is churn × devices (§8.3), and
+  large communities default to Open anyway, which keeps Megolm off the critical
+  path (§15.1).
+- **Sybil resistance is a per-community policy choice, and its floor is low.**
+  *Resolved by §11.2.1's method menu.* Direct verification means a community
+  checks each user itself, so home server standing only buys relay throughput
+  (§11.4). Each community picks what it demands, and the honest floor for the
+  cheapest options — proof-of-work plus email — is roughly the cost of bulk
+  addresses plus compute. Communities needing more escalate up the menu;
+  invite-only (§11.3) sidesteps it entirely. **No mechanism here proves distinct
+  humans**, and verification proves only that someone completed a challenge.
+- **Phone verification exposes a real-world identifier, and there is no clean
+  alternative.** *Researched; accepted.* A mechanism proving possession of a
+  distinct number without revealing it would need either a trusted issuer (blind
+  signatures, anonymous credentials) or trusted hardware (Signal's enclave-based
+  contact discovery). Both breach §1.3, which is why phone is never the default
+  and never protocol-required. The §11.2.1 mitigations — salted hash per
+  community, discard after the OTP, public communities only — remain **policy,
+  not enforcement**: nothing stops a host retaining the number.
+- **Deletion cannot reach member-held copies.** *Accepted; the cost of choosing
+  durability.* §10.5 covers what is and is not guaranteed. Flagged here because it
+  is the one place where a headline property of the design (communities outlive
+  their operators) directly removes a capability users will expect.
+
+---
+
+## 17. Client architecture
+
+Everything above is protocol. This section is the client, and it is **partly
+decided**: the seam is settled, the toolkit within Qt is not.
+
+### 17.1 The seam is the load-bearing decision
+
+```
+veil-protocol/      wire types, envelope, crypto primitives        [exists]
+veil-client-core/   sessions, key management, storage, Tantivy     [to build]
+                    index, network, message pipeline — NO UI
+veil-gui/           Qt bridge + UI                                 [to build]
+veil-server/                                                       [exists]
+```
+
+**`veil-client-core` must never know a UI exists.** That single rule buys three
+things: the CLI keeps working, mobile (§17.4) reuses it wholesale, and if the
+desktop toolkit turns out wrong in two years only `veil-gui` is rewritten.
+
+Everything security-sensitive lives in the core — Olm/Megolm state, the keyring,
+key backup, the search index — and never crosses into UI code. Today's client
+mixes these: `state.rs`, `messaging.rs` and `listener.rs` all interleave protocol
+work with `println!`. Untangling that is a precondition for any GUI.
+
+**Threading.** The core owns a tokio runtime on its own threads. Signals marshal
+to the Qt UI thread via queued connections. The UI thread never touches crypto and
+never blocks on I/O.
+
+### 17.2 Desktop: Qt, and explicitly not a webview
+
+Webview shells (Tauri, Electron) are **ruled out** — WebKitGTK on Linux is
+unreliable enough to disqualify the approach, and a chat client cannot afford a
+flaky renderer on a tier-one platform.
+
+Qt earns it on the merits that matter here:
+
+- **Text.** HarfBuzz and `QTextLayout` give correct IME, RTL, complex emoji, and
+  selection. This is where immature toolkits fail hardest and a chat client
+  cannot compromise.
+- **Docking.** `QDockWidget` has shipped draggable, floatable, persistable panels
+  for two decades (`saveState()` / `restoreState()`); KDDockWidgets extends it.
+  Panel rearrangement is a *native strength*, not something web does better.
+- **Maturity.** Twenty-five years of desktop deployment.
+
+Ruled out and why: **egui / iced** — `egui_dock` gives cheap docking, but
+immediate-mode text handling is weak exactly where this app cannot afford it
+(CJK input, emoji, RTL, accessibility, cross-message selection).
+
+### 17.3 Decided: split process, Widgets shell, QML islands
+
+| | Widgets (C++) | QML (cxx-qt) |
+| --- | --- | --- |
+| Docking | `QDockWidget`, built in | build it, or glue KDDockWidgets |
+| Rich text | `QTextDocument`, markdown-capable | more manual |
+| Message list, animation | fiddly | strong |
+| Discord-like styling | fights native look | natural |
+| Rust bridge | **cxx** — very mature | **cxx-qt** — maintained, smaller |
+
+**Decided: Rust backend, C++/Qt frontend, and the boundary is a socket rather
+than a linker.** Both options were built and both worked; the split was chosen.
+
+```
+veil-client-core   Rust library — sessions, keys, storage, Tantivy, network
+veil-daemon        thin Rust binary wrapping it, local socket    <- desktop
+veil-gui           C++/Qt — Widgets shell + QML islands          <- no Rust
+```
+
+The UI is a **Widgets shell** carrying the `QDockWidget` skeleton, with
+`QQuickWidget` islands hosting QML for the message view and anything needing
+custom styling. That takes docking for free *and* QML rendering where it matters.
+
+#### Why a socket and not FFI
+
+A linked build via `cxx` was spiked first and worked cleanly — both directions,
+threading included, about thirty lines of bridge. It is not fragile. The split
+was still preferred:
+
+| | Linked (`cxx`) | Split (socket) |
+| --- | --- | --- |
+| Build coupling | cargo invoked from cmake | **none — independent builds** |
+| Crash isolation | GUI fault takes the keys with it | **key material in its own address space** |
+| Debugging | across an FFI boundary | **read the socket** |
+| Other clients | must link the core | **CLI and third parties speak the same protocol** |
+| Binary | ~3.9 MB GUI | ~124 KB GUI |
+
+The isolation is the real argument, not the ergonomics: the GUI parses untrusted
+images, embeds and link previews, and in the split model it does so in a process
+holding no key material. This is the LSP shape — structured messages over a pipe,
+each side free to be written in whatever suits it.
+
+#### Validated by spike
+
+`spike/qt-ipc/` is a working reference — `./run.sh`. Every load-bearing claim was
+exercised: independent builds with no cargo in `CMakeLists.txt`; a real
+`vodozemac` account in the daemon whose identity reaches the status bar;
+request/response *and* daemon-initiated push; QML → C++ → socket → Rust;
+`QDockWidget` panels persisting across a restart; and the daemon surviving a
+`SIGKILL` of the GUI while continuing to serve.
+
+Two things it deliberately does not settle, both wanted before real traffic:
+**length-prefixed framing** in place of newline-delimited JSON, since messages
+will carry binary; and authentication, reconnect, and backpressure on the socket.
+
+### 17.4 Mobile: shared core, native UI
+
+Qt runs on iOS and Android, and mobile is the weakest part of Qt's story:
+
+- **Licensing.** LGPL requires dynamic linking or relinkable objects, and whether
+  that satisfies App Store distribution has been a gray area for years. Many
+  shops buy a commercial licence to stop thinking about it. AGPL-3 on our own
+  code is not the friction — store distribution is.
+- **Feel.** Qt Quick Controls approximate platform look rather than being it.
+- **Integration.** Push via APNs/FCM (§12.2), background fetch, iOS Keychain and
+  Android Keystore, share sheets, biometrics — all platform-specific glue that
+  Qt does not save you. Qt does not remove the hard part of mobile.
+
+**So mobile is native UI over the shared core** — SwiftUI and Compose on
+`veil-client-core`, which is what Signal does with libsignal. Deferred entirely;
+§17.1 is what keeps the option open at no present cost.
+
+### 17.5 Panel layout, staged
+
+Rearrangeable panels are a **nice-to-have and must not gate the message
+pipeline**. Note that "move the friends list" is panel *rearrangement*, not
+IDE-style floating windows — a much smaller problem.
+
+| Stage | What | Cost |
+| --- | --- | --- |
+| v1 | Fixed layout | none |
+| v2 | Rearrangeable panels, persisted | `QDockWidget`, or QML `SplitView` |
+| v3 | Floating windows, tab groups | KDDockWidgets |

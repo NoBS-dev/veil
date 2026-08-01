@@ -1,1 +1,4 @@
 /target
+spike/qt-ipc/gui/build/
+spike/qt-ipc/daemon/target/
+spike/qt-ipc/shot.png
