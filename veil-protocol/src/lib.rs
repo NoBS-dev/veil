@@ -1,8 +1,10 @@
 pub mod crosssign;
 pub mod identity;
+pub mod message;
 
 use crosssign::CrossSigningPublic;
 use identity::{DeviceAddress, DeviceId, UserId};
+use message::MessageId;
 
 use rkyv::{
 	Archive, Deserialize, Serialize, deserialize, rancor::Error, to_bytes, util::AlignedVec,
@@ -258,9 +260,29 @@ pub struct EncryptedMessage {
 	pub recipient: DeviceAddress,
 	pub sender_x25519: [u8; 32],
 
+	/// Distinguishes two otherwise identical messages, and is reused on retry so
+	/// a resend lands on the same id and dedups (§10).
+	pub nonce: [u8; 16],
+	/// Sender's clock. Untrusted — it is an input to the message id, not an
+	/// ordering authority.
+	pub origin_ts: u64,
+	/// The latest message this sender had seen from us when they sent (§10.1).
+	///
+	/// Sender-attested and inside the signed envelope, so a relay cannot forge
+	/// or alter it. `ROOT` on the first message of a conversation.
+	pub seen_head: MessageId,
+
 	// I don't know why they're using usize instead of u8/bool but whatever
 	pub message_type: usize, // 0: Normal, 1: PreKey
 	pub message: Vec<u8>,
+}
+
+impl EncryptedMessage {
+	/// Recomputed by the receiver rather than carried, so a sender cannot claim
+	/// an id that disagrees with its content (§10).
+	pub fn id(&self) -> MessageId {
+		MessageId::derive(&self.sender, self.origin_ts, &self.nonce, &self.message)
+	}
 }
 
 pub fn display_key(bytes: &[u8; 32]) -> String {

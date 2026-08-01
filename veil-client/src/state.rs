@@ -6,12 +6,13 @@ use std::collections::HashMap;
 use veil_protocol::{
 	crosssign::{CrossSigningPublic, CrossSigningSecrets},
 	identity::{DeviceAddress, DeviceId, DeviceList, UserId},
+	message::{MessageId, SeenWindow},
 };
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
 /// Bumped whenever `State` changes shape. Profiles from an older version are
 /// refused rather than migrated — see `load_from_keyring`.
-const STATE_VERSION: u32 = 3;
+const STATE_VERSION: u32 = 4;
 
 fn serialize_session<S: Serializer>(session: &Session, serializer: S) -> Result<S::Ok, S::Error> {
 	session.pickle().serialize(serializer)
@@ -47,11 +48,41 @@ pub struct PeerSession {
 	/// the key that signed the envelope, so this at least stops a third party
 	/// taking over an established session by claiming someone else's address.
 	pub ed25519: [u8; 32],
+	/// Id of the most recent message received from this device. Sent back as
+	/// `seen_head` so the peer knows where we are (§10.1).
+	#[serde(default = "MessageId::root")]
+	pub seen_head: MessageId,
+	/// Ids already processed from this device, newest last. Bounded — a replayed
+	/// message only needs catching inside a useful window, and this is a client
+	/// cache rather than the authoritative log.
+	#[serde(default)]
+	pub seen_ids: SeenWindow,
+	/// Ids we have sent to this device. Kept so that when the peer tells us
+	/// what they last saw, we can tell whether we actually sent it (§10.1).
+	#[serde(default)]
+	pub sent_ids: SeenWindow,
 	#[serde(
 		serialize_with = "serialize_session",
 		deserialize_with = "deserialize_session"
 	)]
 	pub session: Session,
+}
+
+impl PeerSession {
+	/// Records a received message, reporting whether it is new.
+	pub fn observe(&mut self, id: MessageId) -> bool {
+		if !self.seen_ids.observe(id) {
+			return false;
+		}
+		self.seen_head = id;
+		true
+	}
+
+	/// Records a message we have sent, so the peer's `seen_head` can be checked
+	/// against something.
+	pub fn record_sent(&mut self, id: MessageId) {
+		self.sent_ids.observe(id);
+	}
 }
 
 fn serialize_account<S: Serializer>(account: &Account, serializer: S) -> Result<S::Ok, S::Error> {

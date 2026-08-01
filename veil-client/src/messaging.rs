@@ -10,6 +10,7 @@ use veil_protocol::{
 	EncryptedMessage, Envelope, ProtocolMessage,
 	crosssign::CrossSigningPublic,
 	identity::{Device, DeviceAddress, DeviceId, UserId},
+	message::{MessageId, random_nonce},
 };
 use vodozemac::olm::SessionConfig;
 
@@ -58,6 +59,9 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 
 		entry.insert(PeerSession {
 			x25519: their_x25519,
+			seen_head: MessageId::ROOT,
+			seen_ids: Default::default(),
+			sent_ids: Default::default(),
 			// Pinned here, and required to match on everything that arrives
 			// from this address afterwards.
 			ed25519: their_ed25519,
@@ -89,15 +93,30 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	}
 
 	let signed_bytes = {
-		let msg = ProtocolMessage::EncryptedMessage(EncryptedMessage {
+		let outgoing = EncryptedMessage {
 			sender: state.address(),
 			recipient: target,
 			sender_x25519: state.account.curve25519_key().to_bytes(),
+			nonce: random_nonce(),
+			origin_ts: veil_protocol::now_ms()?,
+			// Tells the peer where we were in the conversation. They can spot a
+			// message they sent that we never acknowledged.
+			seen_head: state
+				.peers
+				.get(&target)
+				.map(|p| p.seen_head)
+				.unwrap_or(MessageId::ROOT),
 			message_type: msg_type,
 			message: ciphertext,
-		});
+		};
 
-		Envelope::seal(&msg, &state.account)?
+		// Remember what we sent, so when the peer echoes it back as their
+		// `seen_head` we can tell it is genuinely ours.
+		if let Some(peer) = state.peers.get_mut(&target) {
+			peer.record_sent(outgoing.id());
+		}
+
+		Envelope::seal(&ProtocolMessage::EncryptedMessage(outgoing), &state.account)?
 	};
 
 	write

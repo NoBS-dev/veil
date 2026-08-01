@@ -148,9 +148,14 @@ explicitly — each one closes a specific attack.
 10. **Device lists served by a host are untrusted input.** Every entry is
     checked against the owner's cross-signing keys before it is believed;
     entries that fail are dropped rather than failing the whole list.
+11. **A message's id is recomputed, never read off the wire.** It is a hash of
+    the message, so a claimed id cannot disagree with the content. Duplicates
+    are dropped *before* any Olm work, since decrypting twice would advance a
+    ratchet for a message already handled.
 
-`veil-protocol` has 27 tests covering envelope forgery, re-attribution, replay,
-the rate limiter, user/device identity (§5.1-5.3) and cross-signing (§5.4).
+`veil-protocol` has 36 tests covering envelope forgery, re-attribution, replay,
+the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
+message model (§10).
 Extend them when touching those paths.
 
 ## Working agreements

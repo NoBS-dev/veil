@@ -891,7 +891,6 @@ structured readable data in Open.
 ```
 Message {
   // --- authored and signed by the sending device ---
-  message_id:  [u8; 32],   // = H(sender || origin_ts || nonce || content)
   channel_id:  ChannelId,
   sender:      (UserId, device_id),
   nonce:       [u8; 16],
@@ -911,10 +910,18 @@ reference prior messages. Adding identity and ordering after stored history
 exists means migrating every stored message and every reference. The cost today
 is a struct definition.
 
-- **`message_id` is content-addressed**, as Matrix event IDs are from room version
-  4 onward. Any change to the message changes its ID, so it cannot be altered
-  while keeping its identity. The `nonce` keeps two identical messages distinct;
-  a retry reuses the same nonce, so idempotency and dedup still work.
+- **`message_id` is content-addressed and *derived, not transmitted*.** It is
+  `H(sender || origin_ts || nonce || content)`, as Matrix event IDs are from room
+  version 4 onward, so any change to the message changes its identity. Carrying
+  it on the wire would only let a sender claim an id disagreeing with its
+  content, and every receiver has to recompute it to check anyway — computing it
+  is strictly less to go wrong. The `nonce` keeps two identical messages
+  distinct; a retry reuses it, so idempotency and dedup still work.
+- **Duplicate suppression is separate from replay defence.** `ReplayGuard` stops
+  a captured *envelope* being re-sent; a bounded window of seen `message_id`s
+  stops the same *message* being processed twice. That second one matters
+  because decrypting twice advances an Olm ratchet for something already
+  handled, and ordinary retries cause it far more often than attacks do.
 - `seq` is host-assigned because clients cannot be trusted to order honestly.
 - `seen_head` is **sender-attested and inside the signed envelope** (§10.1).
 - In Sealed, reply and reaction *targets* live inside the ciphertext so the host

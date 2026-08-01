@@ -6,7 +6,9 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tungstenite::protocol::Message;
-use veil_protocol::{EncryptedMessage, ProtocolMessage, ReplayGuard, display_key, open_envelope};
+use veil_protocol::{
+	EncryptedMessage, ProtocolMessage, ReplayGuard, display_key, message::MessageId, open_envelope,
+};
 use vodozemac::olm::OlmMessage;
 
 pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_identity: [u8; 32]) {
@@ -30,7 +32,6 @@ pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_ide
 
 				match opened.message {
 					ProtocolMessage::EncryptedMessage(encrypted_message) => {
-						println!("Received a msg: {encrypted_message:?}");
 						process_encrypted_message(state.clone(), opened.sender, encrypted_message)
 							.await;
 					}
@@ -105,6 +106,33 @@ async fn process_encrypted_message(
 		return;
 	}
 
+	// Recomputed rather than taken from the wire, so it cannot disagree with
+	// what actually arrived (§10).
+	let id = message.id();
+
+	// Duplicates are dropped before any Olm work: decrypting twice would
+	// advance a ratchet for a message we have already handled. Retries are the
+	// common cause, not attacks.
+	if let Some(peer) = state.peers.get(&sender)
+		&& peer.seen_ids.contains(&id)
+	{
+		eprintln!("Ignoring a duplicate of {id} from {sender}.");
+		return;
+	}
+
+	// The peer tells us where they were in the conversation. A head we never
+	// sent means our view and theirs disagree — worth surfacing rather than
+	// silently ignoring (§10.1).
+	if !message.seen_head.is_root()
+		&& let Some(peer) = state.peers.get(&sender)
+		&& !peer.sent_ids.contains(&message.seen_head)
+	{
+		eprintln!(
+			"note: {sender} references {} as last seen, which we have no record of sending.",
+			message.seen_head
+		);
+	}
+
 	match olm_message {
 		OlmMessage::PreKey(prekey_msg) => {
 			if !state.peers.contains_key(&sender) {
@@ -116,20 +144,25 @@ async fn process_encrypted_message(
 					Ok(session) => {
 						println!("Message: {}", String::from_utf8_lossy(&session.plaintext));
 
-						state.peers.insert(
-							sender,
-							PeerSession {
-								x25519: message.sender_x25519,
-								ed25519: signing_device_key,
-								session: session.session,
-							},
-						);
+						let mut peer = PeerSession {
+							x25519: message.sender_x25519,
+							ed25519: signing_device_key,
+							seen_head: MessageId::ROOT,
+							seen_ids: Default::default(),
+							sent_ids: Default::default(),
+							session: session.session,
+						};
+						peer.observe(id);
+						state.peers.insert(sender, peer);
 					}
 					Err(e) => eprintln!("Prekey parsing error: {e:#}"),
 				}
 			} else if let Some(peer) = state.peers.get_mut(&sender) {
 				match peer.session.decrypt(&prekey_msg.into()) {
-					Ok(pt) => println!("{sender}: {}", String::from_utf8_lossy(&pt)),
+					Ok(pt) => {
+						peer.observe(id);
+						println!("{sender}: {}", String::from_utf8_lossy(&pt));
+					}
 					Err(e) => eprintln!("Decrypt failed: {e:?}"),
 				}
 			}
@@ -138,7 +171,10 @@ async fn process_encrypted_message(
 		OlmMessage::Normal(normal_msg) => {
 			if let Some(peer) = state.peers.get_mut(&sender) {
 				match peer.session.decrypt(&normal_msg.into()) {
-					Ok(pt) => println!("{sender}: {}", String::from_utf8_lossy(&pt)),
+					Ok(pt) => {
+						peer.observe(id);
+						println!("{sender}: {}", String::from_utf8_lossy(&pt));
+					}
 					Err(e) => eprintln!("Decrypt failed: {e:?}"),
 				}
 			} else {
