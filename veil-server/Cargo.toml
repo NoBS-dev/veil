@@ -8,6 +8,7 @@ veil-protocol = { path = "../veil-protocol" }
 rkyv = { version = "0.8", features = ["bytecheck", "alloc"] }
 rkyv_derive = "0.8"
 anyhow = "1"
+data-encoding = "2"
 axum = { version = "0.8", features = ["ws"] }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 futures = "0.3"

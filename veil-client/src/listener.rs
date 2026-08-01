@@ -66,7 +66,7 @@ pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_ide
 
 async fn process_encrypted_message(
 	state: Arc<Mutex<State>>,
-	sender_public_key: [u8; 32],
+	signing_device_key: [u8; 32],
 	message: EncryptedMessage,
 ) {
 	let olm_message = match OlmMessage::from_parts(message.message_type, &message.message) {
@@ -78,61 +78,71 @@ async fn process_encrypted_message(
 	};
 
 	let mut state = state.lock().await;
+
+	// Sessions are per device (§5.2), so a peer with three devices is three
+	// sessions and each is addressed separately.
+	let sender = message.sender;
+
+	if message.recipient != state.address() {
+		eprintln!(
+			"Dropping a message addressed to {} — this device is {}.",
+			message.recipient,
+			state.address()
+		);
+		return;
+	}
+
+	// The envelope proves *some* device key signed this; the payload *claims* a
+	// device address. Nothing links the two until cross-signing (§5.4), so the
+	// key is pinned on first contact and enforced from then on.
+	if let Some(peer) = state.peers.get(&sender)
+		&& peer.ed25519 != signing_device_key
+	{
+		eprintln!(
+			"Dropping a message claiming to be {sender}: signed by a different device key \
+			 than the one pinned for that address."
+		);
+		return;
+	}
+
 	match olm_message {
 		OlmMessage::PreKey(prekey_msg) => {
-			println!("Received prekey message.");
-
-			if !state.peers.contains_key(&sender_public_key) {
+			if !state.peers.contains_key(&sender) {
+				println!("New session from {sender}.");
 				match state
 					.account
 					.create_inbound_session(prekey_msg.identity_key(), &prekey_msg)
 				{
 					Ok(session) => {
-						println!("Inbound session created successfully.");
-
-						let text = String::from_utf8_lossy(&session.plaintext);
-						println!("Message: {text}");
+						println!("Message: {}", String::from_utf8_lossy(&session.plaintext));
 
 						state.peers.insert(
-							sender_public_key,
+							sender,
 							PeerSession {
 								x25519: message.sender_x25519,
+								ed25519: signing_device_key,
 								session: session.session,
 							},
 						);
 					}
-					Err(e) => {
-						eprintln!("Prekey parsing error: {e:#}")
-					}
+					Err(e) => eprintln!("Prekey parsing error: {e:#}"),
 				}
-			} else {
-				eprintln!("Already had a session.");
-
-				// TODO: don't repeat yourself
-				if let Some(peer) = state.peers.get_mut(&sender_public_key) {
-					match peer.session.decrypt(&prekey_msg.into()) {
-						Ok(pt) => {
-							println!("Received: {}", String::from_utf8_lossy(&pt));
-						}
-						Err(e) => eprintln!("Decrypt failed: {e:?}"),
-					}
-				} else {
-					eprintln!("Normal message but no stored session for sender; dropping.");
+			} else if let Some(peer) = state.peers.get_mut(&sender) {
+				match peer.session.decrypt(&prekey_msg.into()) {
+					Ok(pt) => println!("{sender}: {}", String::from_utf8_lossy(&pt)),
+					Err(e) => eprintln!("Decrypt failed: {e:?}"),
 				}
 			}
 		}
 
 		OlmMessage::Normal(normal_msg) => {
-			if let Some(peer) = state.peers.get_mut(&sender_public_key) {
+			if let Some(peer) = state.peers.get_mut(&sender) {
 				match peer.session.decrypt(&normal_msg.into()) {
-					Ok(pt) => {
-						let text = String::from_utf8_lossy(&pt);
-						println!("Received: {text}");
-					}
+					Ok(pt) => println!("{sender}: {}", String::from_utf8_lossy(&pt)),
 					Err(e) => eprintln!("Decrypt failed: {e:?}"),
 				}
 			} else {
-				eprintln!("Normal message but no stored session for sender; dropping.");
+				eprintln!("Message from {sender} but no session for that device; dropping.");
 			}
 		}
 	}

@@ -6,7 +6,7 @@ use std::{
 	sync::Arc,
 };
 use tokio::sync::Mutex;
-use veil_protocol::{display_key, parse_hex_key, safety_number};
+use veil_protocol::{display_key, identity::UserId, safety_number};
 
 pub async fn cli(
 	prompt: &str,
@@ -67,18 +67,24 @@ pub async fn cli(
 /// these digits to each other over a channel an attacker doesn't control is
 /// what closes that gap.
 fn show_safety_number(state: &State) -> Result<()> {
-	print!("Enter peer identity key: ");
+	print!("Enter peer master key (hex): ");
 	io::stdout().flush()?;
 	let mut input = String::new();
 	io::stdin().read_line(&mut input)?;
-	let peer = parse_hex_key(input.trim())?;
+	let peer_master = veil_protocol::parse_hex_key(input.trim())?;
 
-	let mine = *state.account.ed25519_key().as_bytes();
-	println!("\n{}\n", safety_number(&mine, &peer));
+	// Compared over *master* keys, not device keys (§6.1). One comparison then
+	// covers every device the peer owns, rather than needing to be repeated for
+	// each one — per-device verification does not survive contact with users.
+	let mine = state.master_public_key();
+	println!("\n{}\n", safety_number(&mine, &peer_master));
 	println!("Both of you should see the same digits. Compare them out of band.");
 
-	if !state.peers.contains_key(&peer) {
-		println!("(No session with this peer yet.)");
+	// Showing the derived id lets the user check the key belongs to the person
+	// they meant, without trusting a server to tell them so.
+	match vodozemac::Ed25519PublicKey::from_slice(&peer_master) {
+		Ok(key) => println!("That key belongs to user {}", UserId::from_master_key(&key)),
+		Err(e) => println!("(Not a valid ed25519 key: {e})"),
 	}
 
 	Ok(())

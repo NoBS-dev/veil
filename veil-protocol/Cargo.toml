@@ -10,6 +10,7 @@ hex = "0.4"
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
+serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 thiserror = "2"
 x25519-dalek = { version = "2", features = ["getrandom"] }

@@ -6,21 +6,48 @@ use anyhow::Result;
 use futures_util::SinkExt;
 use std::io::{self, Write};
 use tungstenite::{Bytes, Message};
-use veil_protocol::{EncryptedMessage, Envelope, ProtocolMessage, display_key, parse_hex_key};
+use veil_protocol::{
+	EncryptedMessage, Envelope, ProtocolMessage,
+	identity::{DeviceAddress, DeviceId, UserId},
+};
 use vodozemac::olm::SessionConfig;
 
+/// Accepts `user/device`, the form `DeviceAddress` renders.
+///
+/// Addressing a device rather than a user is deliberate: sessions are
+/// device-to-device (§5.2). Sending to a *user* means fanning out over their
+/// device list, which needs cross-signing (§5.4) before it can be trusted, so
+/// for now the target is named explicitly.
+fn parse_address(input: &str) -> Result<DeviceAddress> {
+	let (user, device) = input
+		.trim()
+		.split_once('/')
+		.ok_or_else(|| anyhow::anyhow!("expected an address of the form <user-id>/<device-id>"))?;
+
+	Ok(DeviceAddress::new(
+		UserId::parse(user)?,
+		DeviceId::from_bytes(
+			data_encoding::BASE32_NOPAD
+				.decode(device.trim().to_ascii_uppercase().as_bytes())?
+				.as_slice()
+				.try_into()
+				.map_err(|_| anyhow::anyhow!("device id must be 16 bytes"))?,
+		),
+	))
+}
+
 pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
-	print!("Enter target client: ");
+	print!("Enter target device (<user-id>/<device-id>): ");
 	io::stdout().flush()?;
 
-	let target_client = {
+	let target = {
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
-		parse_hex_key(input.trim())?
+		parse_address(&input)?
 	};
 
-	if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target_client) {
-		let (their_x25519, otk) = fetch_encryption_key_and_otk(&target_client, url).await?;
+	if let std::collections::hash_map::Entry::Vacant(entry) = state.peers.entry(target) {
+		let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, url).await?;
 
 		let session = state.account.create_outbound_session(
 			SessionConfig::version_2(),
@@ -30,13 +57,14 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 
 		entry.insert(PeerSession {
 			x25519: their_x25519,
+			// Pinned here, and required to match on everything that arrives
+			// from this address afterwards.
+			ed25519: their_ed25519,
 			session,
 		});
 
 		if let Err(e) = state.save_to_keyring() {
 			eprintln!("Save state failed: {e:?}");
-		} else {
-			eprintln!("Saved!");
 		}
 	}
 
@@ -47,11 +75,9 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	let message = message.trim();
 
 	let (msg_type, ciphertext) = {
-		let peer = match state.peers.get_mut(&target_client) {
+		let peer = match state.peers.get_mut(&target) {
 			Some(peer) => peer,
-			None => {
-				anyhow::bail!("No session with that client.")
-			}
+			None => anyhow::bail!("No session with that device."),
 		};
 
 		peer.session.encrypt(message).to_parts()
@@ -59,14 +85,13 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 
 	if let Err(e) = state.save_to_keyring() {
 		eprintln!("Save state failed: {e:?}");
-	} else {
-		eprintln!("Saved!");
 	}
 
 	let signed_bytes = {
 		let msg = ProtocolMessage::EncryptedMessage(EncryptedMessage {
+			sender: state.address(),
+			recipient: target,
 			sender_x25519: state.account.curve25519_key().to_bytes(),
-			recipient_ed25519: target_client,
 			message_type: msg_type,
 			message: ciphertext,
 		});
@@ -81,18 +106,27 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	Ok(())
 }
 
-pub async fn fetch_encryption_key_and_otk(
-	target_identity_key: &[u8; 32],
+/// Fetches a device's prekey bundle: signing key, Olm identity key, and a
+/// one-time key to open a session with.
+pub async fn fetch_prekey_bundle(
+	target: &DeviceAddress,
 	url: &str,
-) -> Result<([u8; 32], [u8; 32])> {
-	let target_client = display_key(target_identity_key);
-	let url = format!("{}/clients/{}/otk", url, target_client);
+) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
+	let url = format!("{url}/devices/{}/{}/otk", target.user, target.device);
 
 	let body = reqwest::get(url).await?.text().await?;
 	let mut lines = body.lines();
-	let encryption_key =
-		parse_hex_key(lines.next().ok_or_else(|| anyhow::anyhow!("missing key"))?)?;
-	let otk = parse_hex_key(lines.next().ok_or_else(|| anyhow::anyhow!("missing otk"))?)?;
 
-	Ok((encryption_key, otk))
+	let mut next = |what: &str| -> Result<[u8; 32]> {
+		let line = lines
+			.next()
+			.ok_or_else(|| anyhow::anyhow!("prekey bundle is missing its {what}"))?;
+		veil_protocol::parse_hex_key(line.trim())
+	};
+
+	let ed25519 = next("signing key")?;
+	let x25519 = next("identity key")?;
+	let otk = next("one-time key")?;
+
+	Ok((ed25519, x25519, otk))
 }

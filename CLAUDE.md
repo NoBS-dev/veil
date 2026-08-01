@@ -55,9 +55,8 @@ cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
 
-Two pre-existing clippy warnings are known and intentionally left alone
-(`CLIENTS` type complexity in the server, a redundant `&` in a `format!` in the
-client). Everything else should stay clean.
+One pre-existing clippy warning is known and left alone (a redundant `&` in a
+`format!` in the client). Everything else should stay clean.
 
 ## Environment
 
@@ -103,6 +102,10 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `safety`, `remove`, `quit`.
+
+Addresses are `<user-id>/<device-id>` in base32 (§5.3) — `msg` and the prekey
+endpoint both take that form, not a raw key. Profiles predating the identity
+model are refused on load rather than migrated; use `remove` or a new profile.
 
 ## Conventions
 

@@ -15,7 +15,9 @@ use std::{
 use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, protocol::Message};
-use veil_protocol::{Envelope, ProtocolMessage, UploadKeys, display_key, open_envelope};
+use veil_protocol::{
+	Authenticate, Envelope, ProtocolMessage, UploadKeys, display_key, open_envelope,
+};
 
 pub type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 pub type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -70,8 +72,13 @@ async fn main() -> anyhow::Result<()> {
 
 	let (mut write, mut read) = tokio_tungstenite::connect_async(socket).await?.0.split();
 
-	let pub_key_bytes = *state.account.ed25519_key().as_bytes();
-	println!("My public key: {}", display_key(&pub_key_bytes));
+	println!("My address: {}", state.address());
+	println!(
+		"  user   {}\n  device {}\n  key    {}",
+		state.user_id,
+		state.device_id,
+		display_key(state.account.ed25519_key().as_bytes())
+	);
 
 	let server_identity = handshake(&mut write, &mut read, &mut state).await?;
 
@@ -131,7 +138,16 @@ async fn handshake(
 
 	write
 		.send(Message::Binary(Bytes::copy_from_slice(&Envelope::seal(
-			&ProtocolMessage::Authenticate(challenge),
+			// The envelope proves this device holds its signing key; the binding
+			// proves the device belongs to this user (§5.1-5.3). Both are needed
+			// — a master key is public, so quoting one proves nothing.
+			&ProtocolMessage::Authenticate(Authenticate {
+				challenge,
+				user: state.user_id,
+				device: state.device_id,
+				master_key: state.master_public_key(),
+				binding: state.device_binding(),
+			}),
 			&state.account,
 		)?)))
 		.await?;

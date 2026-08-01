@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 constcat = "0.6"
+data-encoding = "2"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }

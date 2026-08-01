@@ -1,5 +1,7 @@
 pub mod identity;
 
+use identity::{DeviceAddress, DeviceId, UserId};
+
 use rkyv::{
 	Archive, Deserialize, Serialize, deserialize, rancor::Error, to_bytes, util::AlignedVec,
 };
@@ -207,11 +209,29 @@ pub enum ProtocolMessage {
 	/// the challenge back to prove it holds the private half of the identity it
 	/// claims before the server will route anything to it.
 	Challenge([u8; 32]),
-	/// Client -> server, echoing the challenge inside a signed envelope.
-	Authenticate([u8; 32]),
+	/// Client -> server, echoing the challenge inside a signed envelope and
+	/// declaring which identity this connection speaks for.
+	///
+	/// The envelope proves the device holds its own key; `binding` is what
+	/// proves the device belongs to `user` (§5.1-5.3). Without it a device
+	/// could quote any public master key and claim that user's identity.
+	Authenticate(Authenticate),
 	UploadKeys(UploadKeys),
 	EncryptedMessage(EncryptedMessage),
 	RemainingOneTimeKeys(u16),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Authenticate {
+	pub challenge: [u8; 32],
+	pub user: UserId,
+	pub device: DeviceId,
+	/// The user's master key. Public by design — it is checked against `user`,
+	/// which is derived from it.
+	pub master_key: [u8; 32],
+	/// Master key's signature over (user, device, device signing key).
+	pub binding: [u8; 64],
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -225,8 +245,12 @@ pub struct UploadKeys {
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(attr(derive(Debug)))]
 pub struct EncryptedMessage {
+	/// Sessions are device-to-device (§5.2), so both ends address a device
+	/// rather than a user. A message to a user fans out to one of these per
+	/// active device.
+	pub sender: DeviceAddress,
+	pub recipient: DeviceAddress,
 	pub sender_x25519: [u8; 32],
-	pub recipient_ed25519: [u8; 32],
 
 	// I don't know why they're using usize instead of u8/bool but whatever
 	pub message_type: usize, // 0: Normal, 1: PreKey
