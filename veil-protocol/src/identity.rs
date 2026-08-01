@@ -14,6 +14,7 @@
 use data_encoding::BASE32_NOPAD;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::{Deserialize as De, Serialize as Ser};
+use serde_with::serde_as;
 use sha2::{Digest, Sha256};
 use vodozemac::Ed25519PublicKey;
 
@@ -140,10 +141,12 @@ impl std::fmt::Display for DeviceAddress {
 
 /// A device as published in its owner's device list.
 ///
-/// **Not yet verifiable.** §5.2 gives this an `ssk_signature` proving the device
-/// belongs to the user, and that field arrives with cross-signing (§5.4, Tier 1
-/// item 2). Until then, presence in a list is an assertion by whoever served the
-/// list — treat it as routing information, never as proof of ownership.
+/// `ssk_signature` is what makes an entry *provable* rather than merely
+/// asserted: it is the owner's self-signing key over (user, device, device key),
+/// and it chains up to the user id through [`crate::crosssign`]. A device list
+/// served by a host is therefore untrusted input — every entry is checked
+/// against the owner's cross-signing keys before it is believed (§5.4).
+#[serde_as]
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 #[rkyv(attr(derive(Debug)))]
 #[derive(Ser, De)]
@@ -153,6 +156,9 @@ pub struct Device {
 	pub ed25519: [u8; 32],
 	/// Olm identity key used to establish sessions.
 	pub curve25519: [u8; 32],
+	/// Owner's self-signing key over (user, device, `ed25519`).
+	#[serde_as(as = "[_; 64]")]
+	pub ssk_signature: [u8; 64],
 	pub display_name: String,
 	pub created_at: u64,
 	pub last_seen: u64,
@@ -312,6 +318,7 @@ mod tests {
 				device_id: phone,
 				ed25519: [1; 32],
 				curve25519: [2; 32],
+				ssk_signature: [0; 64],
 				display_name: "phone".into(),
 				created_at: 1,
 				last_seen: 1,
@@ -323,6 +330,7 @@ mod tests {
 				device_id: DeviceId::generate(),
 				ed25519: [3; 32],
 				curve25519: [4; 32],
+				ssk_signature: [0; 64],
 				display_name: "laptop".into(),
 				created_at: 2,
 				last_seen: 2,
@@ -337,6 +345,7 @@ mod tests {
 				device_id: phone,
 				ed25519: [9; 32],
 				curve25519: [9; 32],
+				ssk_signature: [0; 64],
 				display_name: "phone".into(),
 				created_at: 1,
 				last_seen: 3,
@@ -369,6 +378,7 @@ mod tests {
 				device_id: id,
 				ed25519: [1; 32],
 				curve25519: [2; 32],
+				ssk_signature: [0; 64],
 				display_name: "d".into(),
 				created_at: 0,
 				last_seen: 0,

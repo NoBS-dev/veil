@@ -52,6 +52,11 @@ pub async fn cli(
 					eprintln!("Send message error: {e:#}");
 				}
 			}
+			"devices" => {
+				if let Err(e) = show_devices(&mut state, url).await {
+					eprintln!("Device list error: {e:#}");
+				}
+			}
 			"safety" => {
 				if let Err(e) = show_safety_number(&mut state) {
 					eprintln!("Safety number error: {e:#}");
@@ -66,6 +71,76 @@ pub async fn cli(
 /// the server having handed us its own prekey bundle in a peer's name. Reading
 /// these digits to each other over a channel an attacker doesn't control is
 /// what closes that gap.
+/// Fetches a peer's devices and reports what actually verified.
+///
+/// Two independent questions, deliberately shown separately (§5.4): whether a
+/// device genuinely belongs to that user, and whether we have verified who that
+/// user is. A device can pass the first and fail the second.
+async fn show_devices(state: &mut State, url: &str) -> Result<()> {
+	print!("Enter user id: ");
+	io::stdout().flush()?;
+	let mut input = String::new();
+	io::stdin().read_line(&mut input)?;
+	let user = UserId::parse(input.trim())?;
+
+	let (keys, devices) = messaging::fetch_device_list(&user, url).await?;
+
+	if devices.is_empty() {
+		println!("No devices for {user} survived verification.");
+		return Ok(());
+	}
+
+	let verified_person = state.is_verified(&user);
+	println!(
+		"\n{user} — {} device(s), {}\n",
+		devices.len(),
+		if verified_person {
+			"person verified"
+		} else {
+			"person NOT verified — run `safety` to compare numbers"
+		}
+	);
+
+	for device in &devices {
+		println!(
+			"  {}  {:<16} {}",
+			device.device_id,
+			if device.display_name.is_empty() {
+				"(unnamed)"
+			} else {
+				&device.display_name
+			},
+			if verified_person {
+				"trusted"
+			} else {
+				"belongs to this user, but the user is unverified"
+			}
+		);
+	}
+
+	// Cached so a later send can address a device without refetching. Only the
+	// entries that verified are stored.
+	state.peer_devices.insert(
+		user,
+		veil_protocol::identity::DeviceList {
+			user,
+			devices,
+			updated_at: veil_protocol::now_ms()?,
+		},
+	);
+	state.save_to_keyring()?;
+
+	// Offer the master key so the user can go and verify the person.
+	if !verified_person {
+		println!(
+			"\nTheir master key, for `safety`:\n  {}",
+			display_key(&keys.master)
+		);
+	}
+
+	Ok(())
+}
+
 fn show_safety_number(state: &mut State) -> Result<()> {
 	print!("Enter peer master key (hex): ");
 	io::stdout().flush()?;

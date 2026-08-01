@@ -101,7 +101,7 @@ printf 'bob\n127.0.0.1:9876\n'   > b.in
 printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
-Client CLI commands: `curve`, `ed`, `list`, `msg`, `safety`, `remove`, `quit`.
+Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `remove`, `quit`.
 
 Addresses are `<user-id>/<device-id>` in base32 (§5.3) — `msg` and the prekey
 endpoint both take that form, not a raw key. Profiles predating the identity
@@ -145,8 +145,11 @@ explicitly — each one closes a specific attack.
 9. **Enrolling a device never touches the master key.** That is why the
    self-signing key exists; a master-key signature over a device is *not*
    accepted as a device signature.
+10. **Device lists served by a host are untrusted input.** Every entry is
+    checked against the owner's cross-signing keys before it is believed;
+    entries that fail are dropped rather than failing the whole list.
 
-`veil-protocol` has 26 tests covering envelope forgery, re-attribution, replay,
+`veil-protocol` has 27 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3) and cross-signing (§5.4).
 Extend them when touching those paths.
 

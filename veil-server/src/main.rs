@@ -25,7 +25,8 @@ use tokio::{
 	sync::{Mutex, RwLock},
 };
 use veil_protocol::{
-	identity::{DeviceAddress, DeviceId, UserId},
+	crosssign::CrossSigningPublic,
+	identity::{Device, DeviceAddress, DeviceId, UserId},
 	*,
 };
 use vodozemac::olm::Account;
@@ -41,9 +42,23 @@ const RATE_WINDOW_MS: u64 = 60_000;
 
 type KeyMap = Arc<RwLock<HashMap<DeviceAddress, ClientStore>>>;
 
+/// A user's published identity: their cross-signing keys plus the devices they
+/// have enrolled.
+///
+/// The server stores and serves this but is **not trusted for it** — every
+/// entry carries the owner's own signature, so a client checks the whole set
+/// against the keys rather than taking the server's word (§4.3).
+struct UserRecord {
+	keys: CrossSigningPublic,
+	devices: HashMap<DeviceId, Device>,
+}
+
+type UserMap = Arc<RwLock<HashMap<UserId, UserRecord>>>;
+
 #[derive(Clone)]
 struct ServerState {
 	key_map: KeyMap,
+	users: UserMap,
 	server_account: Arc<Mutex<Account>>,
 	replay_guard: Arc<Mutex<ReplayGuard>>,
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
@@ -109,6 +124,7 @@ async fn main() -> Result<()> {
 	// Keys must be generated because clients won't accept anything that isn't signed.
 	let state = ServerState {
 		key_map: Arc::new(RwLock::new(HashMap::new())),
+		users: Arc::new(RwLock::new(HashMap::new())),
 		server_account: Arc::new(Mutex::new(Account::new())),
 		replay_guard: Arc::new(Mutex::new(ReplayGuard::default())),
 		ip_limiter: Arc::new(Mutex::new(RateLimiter::new(
@@ -133,6 +149,7 @@ async fn main() -> Result<()> {
 			"/devices/{user}/{device}/otk",
 			routing::get(get_prekey_bundle),
 		)
+		.route("/users/{user}/devices", routing::get(get_device_list))
 		.with_state(state);
 
 	let listener = TcpListener::bind(address).await?;
@@ -209,7 +226,38 @@ async fn authenticate(
 		.keys
 		.verify_device(&claim.user, &claim.device, &opened.sender, &claim.binding)?;
 
+	// Everything needed for a device-list entry has just been verified, so
+	// record it here rather than trusting a later self-report.
+	state.users.write().await.insert_device(
+		claim.user,
+		claim.keys.clone(),
+		Device {
+			device_id: claim.device,
+			ed25519: opened.sender,
+			curve25519: [0; 32], // filled in by the key upload
+			ssk_signature: claim.binding,
+			display_name: String::new(),
+			created_at: now_ms().unwrap_or_default(),
+			last_seen: now_ms().unwrap_or_default(),
+		},
+	);
+
 	Ok((DeviceAddress::new(claim.user, claim.device), opened.sender))
+}
+
+/// Small helper so the insert-or-update dance is written once.
+trait UserRecords {
+	fn insert_device(&mut self, user: UserId, keys: CrossSigningPublic, device: Device);
+}
+
+impl UserRecords for HashMap<UserId, UserRecord> {
+	fn insert_device(&mut self, user: UserId, keys: CrossSigningPublic, device: Device) {
+		let record = self.entry(user).or_insert_with(|| UserRecord {
+			keys,
+			devices: HashMap::new(),
+		});
+		record.devices.insert(device.device_id, device);
+	}
 }
 
 async fn handle_socket(socket: WebSocket, state: ServerState) {
@@ -307,6 +355,15 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				}
 
 				key_map.insert(address, store);
+				drop(key_map);
+
+				if let Some(record) = state.users.write().await.get_mut(&address.user)
+					&& let Some(device) = record.devices.get_mut(&address.device)
+				{
+					device.curve25519 = upload.encryption_key;
+					device.display_name = upload.display_name.clone();
+					device.last_seen = opened.timestamp_ms;
+				}
 
 				eprintln!("Key upload request handled properly.");
 			}
@@ -445,4 +502,35 @@ fn parse_address(user: &str, device: &str) -> anyhow::Result<DeviceAddress> {
 		UserId::parse(user)?,
 		DeviceId::from_bytes(device),
 	))
+}
+
+/// A user's cross-signing keys and enrolled devices.
+///
+/// Served as-is. The client verifies every entry against the keys before
+/// believing any of it, so this endpoint being wrong or hostile costs
+/// correctness, not security (§5.4).
+async fn get_device_list(
+	State(state): State<ServerState>,
+	ConnectInfo(peer): ConnectInfo<SocketAddr>,
+	Path(user): Path<String>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+	let now = now_ms().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
+		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests".into()));
+	}
+
+	let user = UserId::parse(&user)
+		.map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid user id: {e}")))?;
+
+	let users = state.users.read().await;
+	let record = users
+		.get(&user)
+		.ok_or((StatusCode::NOT_FOUND, "No such user".to_owned()))?;
+
+	Ok(axum::Json(serde_json::json!({
+		"user": user.to_string(),
+		"keys": record.keys,
+		"devices": record.devices.values().collect::<Vec<_>>(),
+	})))
 }

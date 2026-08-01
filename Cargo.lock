@@ -3346,6 +3346,7 @@ dependencies = [
  "rkyv",
  "rkyv_derive",
  "rustls",
+ "serde_json",
  "tokio",
  "veil-protocol",
  "vodozemac",

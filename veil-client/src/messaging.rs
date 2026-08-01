@@ -8,7 +8,8 @@ use std::io::{self, Write};
 use tungstenite::{Bytes, Message};
 use veil_protocol::{
 	EncryptedMessage, Envelope, ProtocolMessage,
-	identity::{DeviceAddress, DeviceId, UserId},
+	crosssign::CrossSigningPublic,
+	identity::{Device, DeviceAddress, DeviceId, UserId},
 };
 use vodozemac::olm::SessionConfig;
 
@@ -129,4 +130,40 @@ pub async fn fetch_prekey_bundle(
 	let otk = next("one-time key")?;
 
 	Ok((ed25519, x25519, otk))
+}
+
+/// Fetches a peer's device list and returns only the entries that verify.
+///
+/// The host is untrusted for identity (§4.3), so what comes back is a claim
+/// until every device chains up to the user id through their cross-signing keys
+/// — and the keys themselves are checked against the `UserId`, which is derived
+/// from the master key. A hostile host can withhold devices or serve junk; it
+/// cannot get a device it controls accepted.
+pub async fn fetch_device_list(
+	user: &UserId,
+	url: &str,
+) -> Result<(CrossSigningPublic, Vec<Device>)> {
+	#[derive(serde::Deserialize)]
+	struct Response {
+		keys: CrossSigningPublic,
+		devices: Vec<Device>,
+	}
+
+	let response: Response = reqwest::get(format!("{url}/users/{user}/devices"))
+		.await?
+		.error_for_status()?
+		.json()
+		.await?;
+
+	let verified = response.keys.verify_device_list(user, &response.devices)?;
+
+	if verified.len() != response.devices.len() {
+		eprintln!(
+			"warning: {} of {}'s advertised devices failed verification and were discarded",
+			response.devices.len() - verified.len(),
+			user
+		);
+	}
+
+	Ok((response.keys, verified))
 }

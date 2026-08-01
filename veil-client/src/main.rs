@@ -155,6 +155,14 @@ async fn handshake(
 	Ok(opened.sender)
 }
 
+/// A hint for peers picking between a user's devices. Cosmetic — never a
+/// security boundary, since the server can lie about it.
+fn whoami_device_name() -> String {
+	std::env::var("HOSTNAME")
+		.or_else(|_| std::env::var("HOST"))
+		.unwrap_or_else(|_| "device".to_owned())
+}
+
 fn generate_key_upload_request(num_to_gen: usize, state: &mut State) -> ProtocolMessage {
 	state.account.generate_one_time_keys(num_to_gen);
 
@@ -172,5 +180,6 @@ fn generate_key_upload_request(num_to_gen: usize, state: &mut State) -> Protocol
 		encryption_key: state.account.curve25519_key().to_bytes(),
 		one_time_keys: otks,
 		fallback_key: fallback_key.to_bytes(),
+		display_name: whoami_device_name(),
 	})
 }

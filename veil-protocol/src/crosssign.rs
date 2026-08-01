@@ -214,6 +214,35 @@ impl CrossSigningPublic {
 		Ok(())
 	}
 
+	/// Checks every device in a list, discarding any that fails.
+	///
+	/// A device list arrives from a host, which is untrusted for identity
+	/// (§4.3), so it is treated as a *claim* until each entry chains up to the
+	/// user id. Entries that fail are dropped rather than rejecting the whole
+	/// list, so one bad or malicious entry cannot deny service to the rest —
+	/// but nothing that fails is ever returned.
+	pub fn verify_device_list(
+		&self,
+		user: &UserId,
+		devices: &[crate::identity::Device],
+	) -> anyhow::Result<Vec<crate::identity::Device>> {
+		self.verify(user)?;
+
+		Ok(devices
+			.iter()
+			.filter(|device| {
+				self.verify_device(
+					user,
+					&device.device_id,
+					&device.ed25519,
+					&device.ssk_signature,
+				)
+				.is_ok()
+			})
+			.cloned()
+			.collect())
+	}
+
 	/// Have *we* verified this person? Checks our own user-signing key's
 	/// signature over their master key.
 	///
@@ -412,6 +441,42 @@ mod tests {
 			)
 			.is_err()
 		);
+	}
+
+	/// A host serving a device list is untrusted for identity, so an entry it
+	/// invents must not survive verification — while the genuine entries do.
+	#[test]
+	fn a_forged_entry_is_dropped_from_a_device_list() {
+		use crate::identity::Device;
+
+		let alice = CrossSigningSecrets::new();
+		let mallory = CrossSigningSecrets::new();
+		let user = alice.user_id();
+
+		let entry = |secrets: &CrossSigningSecrets, name: &str| {
+			let (id, key) = device();
+			Device {
+				device_id: id,
+				ed25519: key,
+				curve25519: [0; 32],
+				ssk_signature: secrets.sign_device(&id, &key),
+				display_name: name.into(),
+				created_at: 0,
+				last_seen: 0,
+			}
+		};
+
+		// Two real devices, plus one Mallory signed with her own key and slipped
+		// into the list the host serves.
+		let devices = vec![
+			entry(&alice, "phone"),
+			entry(&mallory, "injected"),
+			entry(&alice, "laptop"),
+		];
+
+		let verified = alice.public().verify_device_list(&user, &devices).unwrap();
+		let names: Vec<_> = verified.iter().map(|d| d.display_name.as_str()).collect();
+		assert_eq!(names, ["phone", "laptop"]);
 	}
 
 	#[test]

@@ -244,6 +244,8 @@ pub struct UploadKeys {
 	pub encryption_key: [u8; 32], // x25519 key
 	pub one_time_keys: Vec<[u8; 32]>,
 	pub fallback_key: [u8; 32],
+	/// Shown to peers so they can find this device without having messaged it.
+	pub display_name: String,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
