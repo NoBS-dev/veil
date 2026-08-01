@@ -2,10 +2,12 @@ pub mod community;
 pub mod crosssign;
 pub mod identity;
 pub mod message;
+pub mod version;
 
 use crosssign::CrossSigningPublic;
 use identity::{DeviceAddress, DeviceId, UserId};
 use message::MessageId;
+use version::VersionRange;
 
 use rkyv::{
 	Archive, Deserialize, Serialize, deserialize, rancor::Error, to_bytes, util::AlignedVec,
@@ -213,7 +215,7 @@ pub enum ProtocolMessage {
 	/// Server -> client, sent first on every connection. The client must sign
 	/// the challenge back to prove it holds the private half of the identity it
 	/// claims before the server will route anything to it.
-	Challenge([u8; 32]),
+	Challenge(Challenge),
 	/// Client -> server, echoing the challenge inside a signed envelope and
 	/// declaring which identity this connection speaks for.
 	///
@@ -226,10 +228,28 @@ pub enum ProtocolMessage {
 	RemainingOneTimeKeys(u16),
 }
 
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Challenge {
+	pub challenge: [u8; 32],
+	/// What the server can speak (§3.6). Carried inside this signed envelope
+	/// rather than exchanged separately, so tampering breaks the signature
+	/// instead of silently forcing a downgrade.
+	pub versions: VersionRange,
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 #[rkyv(attr(derive(Debug)))]
 pub struct Authenticate {
 	pub challenge: [u8; 32],
+	/// What the client can speak.
+	pub versions: VersionRange,
+	/// The server's range as the client received it.
+	///
+	/// Transcript binding: the server checks this against what it actually
+	/// advertised, so an attacker who rewrites the challenge in flight is
+	/// caught even though they could not have forged either signature.
+	pub server_versions_seen: VersionRange,
 	pub user: UserId,
 	pub device: DeviceId,
 	/// The user's cross-signing keys (§5.4). Public by design — the master key

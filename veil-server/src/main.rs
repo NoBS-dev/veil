@@ -27,6 +27,7 @@ use tokio::{
 use veil_protocol::{
 	crosssign::CrossSigningPublic,
 	identity::{Device, DeviceAddress, DeviceId, UserId},
+	version::VersionRange,
 	*,
 };
 use vodozemac::olm::Account;
@@ -182,13 +183,21 @@ async fn authenticate(
 	sender: &mut SplitSink<WebSocket, Message>,
 	receiver: &mut SplitStream<WebSocket>,
 	state: &ServerState,
-) -> Result<(DeviceAddress, [u8; 32])> {
+) -> Result<(DeviceAddress, [u8; 32], u16)> {
 	let mut challenge = [0u8; 32];
 	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut challenge);
 
+	let ours = VersionRange::supported();
+
 	let framed = {
 		let account = state.server_account.lock().await;
-		Envelope::seal(&ProtocolMessage::Challenge(challenge), &account)?
+		Envelope::seal(
+			&ProtocolMessage::Challenge(Challenge {
+				challenge,
+				versions: ours,
+			}),
+			&account,
+		)?
 	};
 	sender
 		.send(Message::Binary(Bytes::copy_from_slice(&framed)))
@@ -213,6 +222,21 @@ async fn authenticate(
 	if claim.challenge != challenge {
 		anyhow::bail!("client echoed the wrong challenge");
 	}
+
+	// Transcript binding (§3.6). Both ranges were signed, so neither could be
+	// forged — but an attacker could still have swapped the challenge envelope
+	// for an older, genuinely-signed one advertising a weaker range. Requiring
+	// the client to echo what it saw catches that, because it will not match
+	// what this connection actually advertised.
+	if claim.server_versions_seen != ours {
+		anyhow::bail!(
+			"client saw our version range as {} but we advertised {ours} — the handshake \
+			 was tampered with",
+			claim.server_versions_seen
+		);
+	}
+
+	let agreed = ours.agree(&claim.versions)?;
 
 	// Walks the whole §5.4 chain:
 	//
@@ -242,7 +266,11 @@ async fn authenticate(
 		},
 	);
 
-	Ok((DeviceAddress::new(claim.user, claim.device), opened.sender))
+	Ok((
+		DeviceAddress::new(claim.user, claim.device),
+		opened.sender,
+		agreed,
+	))
 }
 
 /// Small helper so the insert-or-update dance is written once.
@@ -277,15 +305,16 @@ impl UserRecords for HashMap<UserId, UserRecord> {
 async fn handle_socket(socket: WebSocket, state: ServerState) {
 	let (mut sender, mut receiver) = socket.split();
 
-	let (address, signing_key) = match authenticate(&mut sender, &mut receiver, &state).await {
-		Ok(identity) => identity,
-		Err(e) => {
-			eprintln!("Handshake failed, dropping connection: {e:#}");
-			return;
-		}
-	};
+	let (address, signing_key, version) =
+		match authenticate(&mut sender, &mut receiver, &state).await {
+			Ok(identity) => identity,
+			Err(e) => {
+				eprintln!("Handshake failed, dropping connection: {e:#}");
+				return;
+			}
+		};
 
-	println!("{address} connected");
+	println!("{address} connected, speaking protocol v{version}");
 	CLIENTS.write().await.insert(address, sender);
 
 	while let Some(Ok(Message::Binary(bytes))) = receiver.next().await {

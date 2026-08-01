@@ -16,7 +16,8 @@ use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
-	Authenticate, Envelope, ProtocolMessage, UploadKeys, display_key, open_envelope,
+	Authenticate, Envelope, ProtocolMessage, ReplayGuard, UploadKeys, display_key, open_envelope,
+	version::VersionRange,
 };
 
 pub type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
@@ -80,7 +81,8 @@ async fn main() -> anyhow::Result<()> {
 		display_key(state.account.ed25519_key().as_bytes())
 	);
 
-	let server_identity = handshake(&mut write, &mut read, &mut state).await?;
+	let (server_identity, version) = handshake(&mut write, &mut read, &mut state).await?;
+	println!("Speaking protocol v{version} with the server.");
 
 	// We're just generating 20 for now, should increase later in prod
 	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
@@ -111,16 +113,25 @@ async fn handshake(
 	write: &mut WriteStream,
 	read: &mut ReadStream,
 	state: &mut State,
-) -> anyhow::Result<[u8; 32]> {
+) -> anyhow::Result<([u8; 32], u16)> {
 	let Some(Ok(Message::Binary(bytes))) = read.next().await else {
 		anyhow::bail!("server closed the connection before sending a challenge");
 	};
 
 	let opened = open_envelope(&bytes)?;
+
+	// A replayed challenge is a downgrade vector: an old envelope is genuinely
+	// signed, so only its freshness rules out an attacker replaying one that
+	// advertises a weaker version range (§3.6).
+	ReplayGuard::default().check(opened.timestamp_ms, opened.nonce)?;
+
 	let challenge = match opened.message {
 		ProtocolMessage::Challenge(challenge) => challenge,
 		other => anyhow::bail!("expected a challenge from the server, got {other:?}"),
 	};
+
+	let ours = VersionRange::supported();
+	let agreed = ours.agree(&challenge.versions)?;
 
 	match state.server_identity {
 		Some(pinned) if pinned != opened.sender => anyhow::bail!(
@@ -142,7 +153,9 @@ async fn handshake(
 			// and binding prove the device belongs to this user (§5.4). Both are
 			// needed — a master key is public, so quoting one proves nothing.
 			&ProtocolMessage::Authenticate(Box::new(Authenticate {
-				challenge,
+				challenge: challenge.challenge,
+				versions: ours,
+				server_versions_seen: challenge.versions,
 				user: state.user_id,
 				device: state.device_id,
 				keys: state.cross_signing_public(),
@@ -152,7 +165,7 @@ async fn handshake(
 		)?)))
 		.await?;
 
-	Ok(opened.sender)
+	Ok((opened.sender, agreed))
 }
 
 /// A hint for peers picking between a user's devices. Cosmetic — never a
