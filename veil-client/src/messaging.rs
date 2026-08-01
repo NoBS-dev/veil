@@ -1,12 +1,12 @@
 use crate::{
-	WriteStream, display_key, parse_hex_key,
+	WriteStream,
 	state::{PeerSession, State},
 };
 use anyhow::Result;
 use futures_util::SinkExt;
 use std::io::{self, Write};
 use tungstenite::{Bytes, Message};
-use veil_protocol::{EncryptedMessage, ProtocolMessage, Signed};
+use veil_protocol::{EncryptedMessage, Envelope, ProtocolMessage, display_key, parse_hex_key};
 use vodozemac::olm::SessionConfig;
 
 pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
@@ -71,7 +71,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 			message: ciphertext,
 		});
 
-		Signed::new_archived(msg, &state.account)?
+		Envelope::seal(&msg, &state.account)?
 	};
 
 	write

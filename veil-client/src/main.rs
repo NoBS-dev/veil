@@ -15,7 +15,7 @@ use std::{
 use tokio::{net::TcpStream, sync::Mutex};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tungstenite::{Bytes, protocol::Message};
-use veil_protocol::{ProtocolMessage, Signed, UploadKeys, display_key, parse_hex_key};
+use veil_protocol::{Envelope, ProtocolMessage, UploadKeys, display_key, open_envelope};
 
 pub type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 pub type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
@@ -46,7 +46,7 @@ async fn main() -> anyhow::Result<()> {
 					"No prior state found in keyring: {e:#}. Generating a new profile..."
 				);
 
-				print!("Enter server (IP:PORT): ");
+				print!("Enter server (IP:PORT, or wss://IP:PORT for TLS): ");
 				io::stdout().flush()?;
 
 				let mut ip_and_port = String::new();
@@ -56,19 +56,24 @@ async fn main() -> anyhow::Result<()> {
 			}
 		};
 
-	let socket = format!("ws://{}", state.ip_and_port);
-	let url = format!("http://{}", state.ip_and_port);
+	let (ws_scheme, http_scheme) = state.schemes();
+	let socket = format!("{ws_scheme}://{}", state.ip_and_port);
+	let url = format!("{http_scheme}://{}", state.ip_and_port);
 	let prompt = format!("{} > ", &socket);
 
-	let (mut write, read) = tokio_tungstenite::connect_async(socket).await?.0.split();
+	if !state.use_tls {
+		eprintln!(
+			"WARNING: connecting without TLS. Messages stay end-to-end encrypted, but\n\
+			 your identity key and who you talk to are readable on the wire."
+		);
+	}
+
+	let (mut write, mut read) = tokio_tungstenite::connect_async(socket).await?.0.split();
 
 	let pub_key_bytes = *state.account.ed25519_key().as_bytes();
-
-	write
-		.send(Message::Binary(Bytes::copy_from_slice(&pub_key_bytes)))
-		.await?;
-
 	println!("My public key: {}", display_key(&pub_key_bytes));
+
+	let server_identity = handshake(&mut write, &mut read, &mut state).await?;
 
 	// We're just generating 20 for now, should increase later in prod
 	// TODO: Ask server first. If we have over 50% of this OTK number on the server, we should just leave it be, but listen for server requests for more keys.
@@ -76,19 +81,62 @@ async fn main() -> anyhow::Result<()> {
 	let key_upload_request = generate_key_upload_request(OTK_NUM, &mut state);
 
 	write
-		.send(Message::Binary(Bytes::copy_from_slice(
-			&Signed::new_archived(key_upload_request, &state.account)?,
-		)))
+		.send(Message::Binary(Bytes::copy_from_slice(&Envelope::seal(
+			&key_upload_request,
+			&state.account,
+		)?)))
 		.await?;
 
 	state.account.mark_keys_as_published();
 	state.save_to_keyring()?;
 
 	let state = Arc::new(Mutex::new(state));
-	tokio::spawn(listener::listener(read, state.clone()));
+	tokio::spawn(listener::listener(read, state.clone(), server_identity));
 	cli(&prompt, &url, write, state).await?;
 
 	Ok(())
+}
+
+/// Answers the server's challenge, proving we hold the private half of the
+/// identity we're about to be routed under, and pins the key the server signs
+/// with so a substituted server is caught on the next connect.
+async fn handshake(
+	write: &mut WriteStream,
+	read: &mut ReadStream,
+	state: &mut State,
+) -> anyhow::Result<[u8; 32]> {
+	let Some(Ok(Message::Binary(bytes))) = read.next().await else {
+		anyhow::bail!("server closed the connection before sending a challenge");
+	};
+
+	let opened = open_envelope(&bytes)?;
+	let challenge = match opened.message {
+		ProtocolMessage::Challenge(challenge) => challenge,
+		other => anyhow::bail!("expected a challenge from the server, got {other:?}"),
+	};
+
+	match state.server_identity {
+		Some(pinned) if pinned != opened.sender => anyhow::bail!(
+			"server identity changed: pinned {}, but it now signs as {}. Refusing to \
+			 continue — either the server was rebuilt or something is impersonating it.",
+			display_key(&pinned),
+			display_key(&opened.sender)
+		),
+		Some(_) => {}
+		None => {
+			println!("Pinning server identity {}", display_key(&opened.sender));
+			state.server_identity = Some(opened.sender);
+		}
+	}
+
+	write
+		.send(Message::Binary(Bytes::copy_from_slice(&Envelope::seal(
+			&ProtocolMessage::Authenticate(challenge),
+			&state.account,
+		)?)))
+		.await?;
+
+	Ok(opened.sender)
 }
 
 fn generate_key_upload_request(num_to_gen: usize, state: &mut State) -> ProtocolMessage {

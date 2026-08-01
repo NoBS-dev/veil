@@ -9,7 +9,10 @@ rkyv = { version = "0.8", features = ["bytecheck", "alloc"] }
 rkyv_derive = "0.8"
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 futures = "0.3"
 itertools = "0.14"
+rand = "0.8"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"] }
 tokio = { version = "1", features = ["full"] }
 vodozemac = "0.9"

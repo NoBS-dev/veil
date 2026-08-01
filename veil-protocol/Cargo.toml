@@ -6,9 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 hex = "0.4"
-rkyv = { version = "0.8", features = ["alloc"] }
+rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
-tungstenite = "0.27"
+rand = "0.8"
+sha2 = "0.10"
 thiserror = "2"
 x25519-dalek = { version = "2", features = ["getrandom"] }
 vodozemac = "0.9"

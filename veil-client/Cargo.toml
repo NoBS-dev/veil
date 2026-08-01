@@ -8,11 +8,11 @@ anyhow = "1"
 constcat = "0.6"
 futures-util = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = "0.27"
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 url = "2"
 veil-protocol = { path = "../veil-protocol" }
 tungstenite = "0.27"
-reqwest = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots"] }
 rkyv = { version = "0.8", features = ["std", "alloc"] }
 zstd = "0.13"
 x25519-dalek = { version = "2", features = ["getrandom"] }

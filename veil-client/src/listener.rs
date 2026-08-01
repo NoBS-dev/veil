@@ -6,43 +6,55 @@ use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tungstenite::protocol::Message;
-use veil_protocol::{EncryptedMessage, ProtocolMessage};
+use veil_protocol::{EncryptedMessage, ProtocolMessage, ReplayGuard, display_key, open_envelope};
 use vodozemac::olm::OlmMessage;
 
-pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>) {
-	let public_key_bytes = *state.lock().await.account.ed25519_key().as_bytes();
+pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_identity: [u8; 32]) {
+	let mut replay_guard = ReplayGuard::default();
 
 	while let Some(incoming_data) = read.next().await {
 		match incoming_data {
 			Ok(Message::Binary(protocol_message)) => {
-				if let Ok((sender_public_key, signed_protocol_message)) =
-					veil_protocol::process_signed_protocol_messages(
-						&protocol_message,
-						&public_key_bytes,
-					)
-					.await
-				{
-					match signed_protocol_message {
-						ProtocolMessage::EncryptedMessage(encrypted_message) => {
-							println!("Received a msg: {encrypted_message:?}");
-							process_encrypted_message(
-								state.clone(),
-								sender_public_key,
-								encrypted_message,
-							)
-							.await;
-						}
-						ProtocolMessage::RemainingOneTimeKeys(remaining_otks) => {
-							println!("We have {remaining_otks} OTKs left.");
+				let opened = match open_envelope(&protocol_message) {
+					Ok(opened) => opened,
+					Err(e) => {
+						eprintln!("[Notification] Discarding an unverifiable envelope: {e:#}");
+						continue;
+					}
+				};
 
-							// If we have less than half OTKs in our pool, regen some more
-						}
-						protocol_message => {
-							println!(
-								"Received a protocol message that we don't usually handle: {:?}",
-								protocol_message
+				if let Err(e) = replay_guard.check(opened.timestamp_ms, opened.nonce) {
+					eprintln!("[Notification] Discarding a replayed envelope: {e:#}");
+					continue;
+				}
+
+				match opened.message {
+					ProtocolMessage::EncryptedMessage(encrypted_message) => {
+						println!("Received a msg: {encrypted_message:?}");
+						process_encrypted_message(state.clone(), opened.sender, encrypted_message)
+							.await;
+					}
+					ProtocolMessage::RemainingOneTimeKeys(remaining_otks) => {
+						// Only the server has a view of the pool, so anyone else
+						// claiming to report on it is trying to talk us into
+						// regenerating keys.
+						if opened.sender != server_identity {
+							eprintln!(
+								"[Notification] Ignoring an OTK count from {}, which is not the server.",
+								display_key(&opened.sender)
 							);
+							continue;
 						}
+
+						println!("We have {remaining_otks} OTKs left.");
+
+						// If we have less than half OTKs in our pool, regen some more
+					}
+					protocol_message => {
+						println!(
+							"Received a protocol message that we don't usually handle: {:?}",
+							protocol_message
+						);
 					}
 				}
 			}

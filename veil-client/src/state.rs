@@ -43,15 +43,33 @@ pub struct State {
 	pub peers: HashMap<[u8; 32], PeerSession>,
 	pub ip_and_port: Box<str>,
 	pub profile: Box<str>,
+	/// Pinned on first connect. A server that later signs with a different key
+	/// is refused rather than trusted afresh.
+	#[serde(default)]
+	pub server_identity: Option<[u8; 32]>,
+	#[serde(default)]
+	pub use_tls: bool,
 }
 impl State {
-	pub fn new(ip_and_port: &str, profile: &str) -> Result<Self> {
+	pub fn new(server_address: &str, profile: &str) -> Result<Self> {
+		let (ip_and_port, use_tls) = parse_server_address(server_address);
+
 		Ok(Self {
 			account: Account::new(),
 			peers: HashMap::new(),
-			ip_and_port: ip_and_port.into(),
+			ip_and_port,
 			profile: normalized_profile(profile).into(),
+			server_identity: None,
+			use_tls,
 		})
+	}
+
+	pub fn schemes(&self) -> (&'static str, &'static str) {
+		if self.use_tls {
+			("wss", "https")
+		} else {
+			("ws", "http")
+		}
 	}
 
 	pub fn load_from_keyring(profile: &str) -> Result<Self> {
@@ -67,6 +85,25 @@ impl State {
 		entry_for(&self.profile)?.delete_password()?;
 		Ok(())
 	}
+}
+
+/// Accepts `host:port`, `ws://host:port` or `wss://host:port`, splitting the
+/// transport choice out from the authority.
+fn parse_server_address(input: &str) -> (Box<str>, bool) {
+	let input = input.trim();
+
+	for (prefix, use_tls) in [
+		("wss://", true),
+		("https://", true),
+		("ws://", false),
+		("http://", false),
+	] {
+		if let Some(authority) = input.strip_prefix(prefix) {
+			return (authority.trim_end_matches('/').into(), use_tls);
+		}
+	}
+
+	(input.into(), false)
 }
 
 pub fn normalized_profile(profile: &str) -> &str {
