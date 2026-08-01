@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+data-encoding = "2"
 hex = "0.4"
 rkyv = { version = "0.8", features = ["alloc", "bytecheck"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }

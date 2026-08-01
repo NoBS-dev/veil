@@ -3317,6 +3317,7 @@ name = "veil-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "data-encoding",
  "ed25519-dalek",
  "hex",
  "rand 0.8.5",
