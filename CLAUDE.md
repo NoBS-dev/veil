@@ -222,6 +222,30 @@ explicitly — each one closes a specific attack.
 16. **Policy needs k *distinct* controllers.** One controller signing twice must
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
+17. **A deposit is terminal.** A server accepts mail only for its own users and
+    never forwards it onward. Otherwise every server is an open relay for every
+    other, and two servers each believing the other is home loop between them.
+    Deposits are refused on the client endpoint for the same reason §3.4 exists:
+    a client that could deposit into any mailbox is an unrate-limitable spam
+    vector, where a sending *server* has standing.
+18. **The TLS certificate is bound to the Veil identity, never to a CA.** A host
+    signs a hash of its own certificate into the challenge, and the client
+    refuses if what it negotiated does not match — which is what stops a relay
+    terminating the inner session. Requiring a certificate authority would break
+    §1.3 outright, since a self-hoster's certificate is self-signed. Anything
+    that starts validating against a CA instead has silently made self-hosting
+    impossible.
+19. **Ordering in a channel is the host's, never the sender's.** A member sends
+    one message and the host assigns its sequence and previous hash. This is
+    what removes the need for state resolution, and it only works because a
+    community lives on one host (§3.3). The guarantee is tamper-*evidence* —
+    breaking the chain is detectable — not tamper-proofing, because one host
+    could always serve two clients different histories. Do not describe it as
+    more than that.
+20. **Never send plaintext under a Sealed id.** The mode is inside the community
+    id, so that id is what tells everyone else the content is protected. A
+    client that cannot encrypt must refuse to post rather than fall back — the
+    fallback is worse than the failure.
 
 ### Tests
 
