@@ -182,6 +182,21 @@ impl Store {
 			     created_at INTEGER NOT NULL
 			 );
 
+			 -- Reports awaiting a moderator (§7.6). Held rather than acted on:
+			 -- a host cannot judge a Sealed community's content and is not
+			 -- being asked to.
+			 CREATE TABLE IF NOT EXISTS reports (
+			     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			     community_id BLOB    NOT NULL,
+			     channel      TEXT    NOT NULL,
+			     sequence     INTEGER NOT NULL,
+			     reporter     BLOB    NOT NULL,
+			     quoted       TEXT    NOT NULL,
+			     reason       TEXT    NOT NULL,
+			     attributed   INTEGER NOT NULL,
+			     received_at  INTEGER NOT NULL
+			 );
+
 			 CREATE TABLE IF NOT EXISTS server_identity (
 			     id      INTEGER PRIMARY KEY CHECK (id = 1),
 			     pickle  TEXT NOT NULL
@@ -772,6 +787,62 @@ impl Store {
 		Ok(self
 			.db
 			.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |r| r.get(0))?)
+	}
+
+	// ---- reports (§7.6) ---------------------------------------------------
+
+	/// Files a report for a moderator to look at.
+	///
+	/// `attributed` records whether the reporter supplied proof of authorship,
+	/// not whether that proof checked out — verification is the moderator's,
+	/// since only a reader can do it.
+	#[allow(clippy::too_many_arguments)]
+	pub fn file_report(
+		&self,
+		community: &CommunityId,
+		channel: &str,
+		sequence: u64,
+		reporter: &UserId,
+		quoted: &str,
+		reason: &str,
+		attributed: bool,
+		now: u64,
+	) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO reports
+			   (community_id, channel, sequence, reporter, quoted, reason, attributed, received_at)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+			params![
+				community.as_bytes().as_slice(),
+				channel,
+				sequence,
+				reporter.as_bytes().as_slice(),
+				quoted,
+				reason,
+				attributed as i64,
+				now,
+			],
+		)?;
+		Ok(())
+	}
+
+	/// Outstanding reports for a community, newest first.
+	pub fn reports(&self, community: &CommunityId) -> Result<Vec<(String, u64, String, bool)>> {
+		let mut stmt = self.db.prepare(
+			"SELECT channel, sequence, reason, attributed FROM reports
+			 WHERE community_id = ?1 ORDER BY id DESC LIMIT 100",
+		)?;
+
+		Ok(stmt
+			.query_map(params![community.as_bytes().as_slice()], |r| {
+				Ok((
+					r.get(0)?,
+					r.get::<_, i64>(1)? as u64,
+					r.get(2)?,
+					r.get::<_, i64>(3)? == 1,
+				))
+			})?
+			.collect::<Result<Vec<_>, _>>()?)
 	}
 
 	// ---- the server's own identity ----------------------------------------

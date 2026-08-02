@@ -105,6 +105,16 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"queue" => {
+				if let Err(e) = communities::queue(&write, &state).await {
+					eprintln!("Could not read the queue: {e:#}");
+				}
+			}
+			"report" => {
+				if let Err(e) = communities::report(&write, &state).await {
+					eprintln!("Could not report: {e:#}");
+				}
+			}
 			"attach" => {
 				if let Err(e) = communities::attach(&write, &mut state, url).await {
 					eprintln!("Could not attach: {e:#}");

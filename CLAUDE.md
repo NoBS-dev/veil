@@ -131,7 +131,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`, `attach`, `delete`.
+`history`, `attach`, `delete`, `report`, `queue`.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
 can be sent to it — `readers` writes one. Without it `say` refuses, because

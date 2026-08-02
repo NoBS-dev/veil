@@ -50,6 +50,14 @@ const TUNNELS_PER_USER_PER_WINDOW: u32 = 20;
 /// Largest blob a host will store (§10.2). Bounded because the host cannot see
 /// what it is holding, so size is the only thing it can enforce.
 const MAX_BLOB: usize = 16 << 20;
+/// Total blob storage a host will give up before refusing more.
+///
+/// The only quota available to a Sealed host: it cannot tell a video from a
+/// novel, and §10.2 notes that opaque sizes are sufficient. A real deployment
+/// would make this per-community and configurable; a hard cap is the honest
+/// starting point, because the alternative is unbounded disk use by anyone who
+/// can connect.
+const MAX_BLOB_STORAGE: i64 = 4 << 30;
 /// Deposits one server may make per window (§3.4). Generous — a busy server
 /// legitimately carries mail for many users — but bounded.
 const DEPOSITS_PER_SERVER_PER_WINDOW: u32 = 600;
@@ -685,6 +693,24 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::Report(report) => {
+				let response = community::report(&state, &address, *report).await;
+				reply(&state, &address, response.into_message()).await;
+			}
+			ProtocolMessage::FetchReports(id) => {
+				let message = match community::reports(&state, &address, id).await {
+					Ok(entries) => ProtocolMessage::ReportQueue {
+						community: id,
+						entries,
+					},
+					Err(e) => ProtocolMessage::CommunityResult {
+						community: id,
+						ok: false,
+						detail: format!("{e:#}"),
+					},
+				};
+				reply(&state, &address, message).await;
+			}
 			ProtocolMessage::UploadBlob(bytes) => {
 				if bytes.len() > MAX_BLOB {
 					eprintln!("Refusing an oversized blob from {address}");
@@ -698,6 +724,17 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let id = veil_protocol::attachment::blob_id(&bytes);
 				let size = bytes.len() as u64;
 				let now = state.clock.read().await.now_ms();
+
+				let held = state
+					.store
+					.lock()
+					.await
+					.blob_bytes_held()
+					.unwrap_or(MAX_BLOB_STORAGE);
+				if held.saturating_add(bytes.len() as i64) > MAX_BLOB_STORAGE {
+					eprintln!("Refusing a blob from {address}: storage is full");
+					continue;
+				}
 
 				match state.store.lock().await.put_blob(&id, &bytes, now) {
 					Ok(()) => {
@@ -826,6 +863,7 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			ProtocolMessage::CommunityState(_)
 			| ProtocolMessage::Delivery(_)
 			| ProtocolMessage::BlobStored { .. }
+			| ProtocolMessage::ReportQueue { .. }
 			| ProtocolMessage::BlobContent { .. }
 			| ProtocolMessage::CommunityResult { .. } => {
 				eprintln!("Received a host-to-client community frame from {address}. Ignoring.")

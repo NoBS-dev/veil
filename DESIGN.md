@@ -100,7 +100,7 @@ to.
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
 | Community roots, policy chain, mode binding | **[built]** `community.rs`, served over a transport |
 | Communities and channels on a host | **[built]** `veil-server/src/community.rs` — create, join, post, backfill, host-assigned ordering |
-| Moderation and reporting under Sealed | designed, §7.6 |
+| Moderation and reporting under Sealed | **[built]** reports held for a moderator; unattributed accepted |
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
 | Calls and real-time media | designed, §9 |
@@ -195,7 +195,14 @@ absent — it would be a silent downgrade one member makes for everyone. Blobs a
 content-addressed and the recipient checks the hash, so a host cannot serve
 different bytes under the same reference.
 
-What remains is **reporting under Sealed** (§7.6), **channel administration**,
+Reporting works the way §7.6 describes: a Sealed host cannot read what is
+reported, so it holds the reporter's account for a moderator who can. A report
+without cryptographic attribution is accepted and treated as signal for human
+review — requiring proof would cost the reporter more privacy than the report is
+worth, since a Megolm session exported at one message's index decrypts everything
+from there forward.
+
+What remains is **channel administration**,
 **presence and read state** (§10.3), **search** (§10.4) and **discovery**
 (§11.4–11.6), all designed but unbuilt; **calls** (§9), which need a media stack
 this has not begun; and **bots**, which are not designed. The client split

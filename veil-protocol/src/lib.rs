@@ -340,6 +340,20 @@ pub enum ProtocolMessage {
 		channel: String,
 		sequence: u64,
 	},
+	/// Reports a message to the community's moderators (§7.6).
+	Report(Box<Report>),
+	/// Moderator -> host: what is waiting for review.
+	FetchReports(community::CommunityId),
+	/// Host -> moderator: the queue.
+	///
+	/// Deliberately without the quoted text. A moderator in a Sealed community
+	/// can read the channel and check for themselves, and the queue is a
+	/// worklist rather than a second copy of the content.
+	ReportQueue {
+		community: community::CommunityId,
+		/// Channel, position, reason, and whether attribution was supplied.
+		entries: Vec<(String, u64, String, bool)>,
+	},
 	/// Stores an opaque blob and returns its id (§10.2).
 	///
 	/// The host never learns what a blob is. In a Sealed community the client
@@ -392,6 +406,33 @@ pub struct CommunityView {
 	pub root: String,
 	pub policy_chain: Vec<String>,
 	pub members: Vec<UserId>,
+}
+
+/// A report of something said in a channel (§7.6).
+///
+/// In a Sealed community the host cannot read the message being reported, so the
+/// reporter supplies the plaintext. That alone would let anyone fabricate a
+/// quote, which is why `attribution` exists — and why a report without one is
+/// still accepted.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Report {
+	pub community: community::CommunityId,
+	pub channel: String,
+	/// Where the message sits in the channel's history.
+	pub sequence: u64,
+	/// What the reporter says was said.
+	pub quoted: String,
+	pub reason: String,
+	/// The Megolm session exported at this message's index, if the reporter is
+	/// willing to supply it.
+	///
+	/// **Attribution costs the reporter privacy.** A session exported at index
+	/// *N* decrypts everything from *N* forward in that session, so a verifiable
+	/// report reveals more than the single message. That is why an unattributed
+	/// report is accepted too and treated as signal for human review rather than
+	/// proof — which is what mainstream platforms do with reports regardless.
+	pub attribution: Option<String>,
 }
 
 /// A channel's key material, addressed to one device.

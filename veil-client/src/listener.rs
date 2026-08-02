@@ -110,6 +110,21 @@ pub async fn listener(
 					ProtocolMessage::ChannelKey(key) => {
 						accept_channel_key(state.clone(), opened.sender, key).await;
 					}
+					ProtocolMessage::ReportQueue { community, entries } => {
+						if entries.is_empty() {
+							println!("[{community}] no reports waiting.");
+						}
+						for (channel, sequence, reason, attributed) in entries {
+							println!(
+								"[{community}#{channel} {sequence}] reported: {reason}{}",
+								if attributed {
+									" (with attribution)"
+								} else {
+									" (unattributed — signal, not proof)"
+								}
+							);
+						}
+					}
 					ProtocolMessage::CommunityResult {
 						community,
 						ok,
@@ -523,6 +538,9 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
+		ProtocolMessage::Report(_) => "report",
+		ProtocolMessage::FetchReports(_) => "report fetch",
+		ProtocolMessage::ReportQueue { .. } => "report queue",
 		ProtocolMessage::UploadBlob(_) => "blob upload",
 		ProtocolMessage::BlobStored { .. } => "blob stored",
 		ProtocolMessage::FetchBlob(_) => "blob fetch",

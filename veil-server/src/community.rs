@@ -33,7 +33,7 @@
 use crate::{CLIENTS, ServerState, route_to};
 use anyhow::{Result, bail};
 use veil_protocol::{
-	ChannelDelivery, ChannelPost, CommunityView, Envelope, ProtocolMessage,
+	ChannelDelivery, ChannelPost, CommunityView, Envelope, ProtocolMessage, Report,
 	community::{CommunityId, CommunityRoot, CommunityState, SignedPolicy},
 	identity::{DeviceAddress, UserId},
 };
@@ -273,6 +273,69 @@ async fn fan_out(state: &ServerState, delivery: &ChannelDelivery, members: &[Use
 	for address in addresses {
 		let _ = route_to(&address, framed.clone()).await;
 	}
+}
+
+/// Files a report for the community's moderators (§7.6).
+///
+/// **The host does not judge it, and in a Sealed community could not.** It
+/// cannot read the message being reported, so what it stores is the reporter's
+/// account of it — held for a moderator, who can read the channel and check.
+///
+/// A report without attribution is accepted. §7.6 is explicit that this should
+/// be treated as *signal for human review* rather than proof, because the
+/// alternative — requiring proof — costs the reporter more privacy than the
+/// report is worth: a Megolm session exported at one message's index decrypts
+/// everything from there forward.
+pub async fn report(state: &ServerState, sender: &DeviceAddress, report: Report) -> Response {
+	let id = report.community;
+
+	// Only a member can report, for the same reason only a member can post: it
+	// is the one thing the host can check, and it bounds who can fill a
+	// moderation queue.
+	match state.store.lock().await.is_member(&id, &sender.user) {
+		Ok(true) => {}
+		Ok(false) => return Response::refused(id, "you are not a member of that community"),
+		Err(e) => return Response::refused(id, &format!("membership: {e}")),
+	}
+
+	if report.quoted.len() > 8192 || report.reason.len() > 2048 {
+		return Response::refused(id, "report is too long");
+	}
+
+	let now = state.clock.read().await.now_ms();
+	match state.store.lock().await.file_report(
+		&id,
+		&report.channel,
+		report.sequence,
+		&sender.user,
+		&report.quoted,
+		&report.reason,
+		report.attribution.is_some(),
+		now,
+	) {
+		Ok(()) => Response::ok(
+			id,
+			if report.attribution.is_some() {
+				"report filed with attribution"
+			} else {
+				"report filed; a moderator will review it"
+			},
+		),
+		Err(e) => Response::refused(id, &format!("could not file: {e}")),
+	}
+}
+
+/// The reports a moderator has waiting.
+pub async fn reports(
+	state: &ServerState,
+	sender: &DeviceAddress,
+	id: CommunityId,
+) -> Result<Vec<(String, u64, String, bool)>> {
+	if !policy(state, &id).await?.may_moderate(&sender.user) {
+		bail!("only a moderator may read reports");
+	}
+
+	state.store.lock().await.reports(&id)
 }
 
 /// Discards a message's content, keeping its place in the chain (§10.5).

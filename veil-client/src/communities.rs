@@ -284,6 +284,48 @@ async fn deliver_key(
 	.await
 }
 
+/// Reports a message to the community's moderators (§7.6).
+///
+/// The host cannot read a Sealed community's content, so what it receives is
+/// this account of it — held for a moderator, who can read the channel and
+/// check. Attribution is offered but not required: a Megolm session exported at
+/// one message's index decrypts everything from there forward, so proving
+/// authorship discloses more than the message being reported. §7.6 accepts
+/// unattributed reports for exactly that reason and treats them as signal.
+pub async fn report(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let channel = ask("Channel: ")?;
+	let sequence: u64 = ask("Message number: ")?.parse()?;
+	let quoted = ask("What was said: ")?;
+	let reason = ask("Why you are reporting it: ")?;
+
+	println!(
+		"Filing without cryptographic attribution. Proving who wrote it would also \
+		 reveal everything sent after it in the same session, so it is not done by \
+		 default."
+	);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::Report(Box::new(veil_protocol::Report {
+			community: id,
+			channel,
+			sequence,
+			quoted,
+			reason,
+			attribution: None,
+		})),
+	)
+	.await
+}
+
+/// Reads the moderation queue (§7.6).
+pub async fn queue(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	send(write, state, ProtocolMessage::FetchReports(id)).await
+}
+
 /// Posts a file to a channel (§10.2).
 ///
 /// **Encryption follows the community's tier and is not offered as a choice.**

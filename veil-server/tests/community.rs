@@ -679,6 +679,146 @@ async fn a_moderator_can_delete_anyone_s_message() {
 	server.stop().await;
 }
 
+/// §7.6: a Sealed host cannot read what is reported, so it holds the reporter's
+/// account for a moderator rather than judging it.
+#[tokio::test]
+async fn a_report_is_held_for_a_moderator() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Sealed).await;
+
+	let mut bob = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	bob.upload_keys(5).await.unwrap();
+	bob.send(&ProtocolMessage::JoinCommunity(id)).await.unwrap();
+	assert!(expect_result(&mut bob).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	// A report with no attribution is still accepted — §7.6 treats it as signal
+	// for review, because requiring proof costs the reporter more privacy than
+	// the report is worth.
+	bob.send(&ProtocolMessage::Report(Box::new(veil_protocol::Report {
+		community: id,
+		channel: "general".into(),
+		sequence: 1,
+		quoted: "something worth reporting".into(),
+		reason: "abuse".into(),
+		attribution: None,
+	})))
+	.await
+	.unwrap();
+
+	let (_, ok, detail) = expect_result(&mut bob).await;
+	assert!(
+		ok,
+		"an unattributed report must still be accepted: {detail}"
+	);
+	assert!(detail.contains("moderator will review"), "got: {detail}");
+
+	server.stop().await;
+}
+
+/// Only members may report, which is the one thing a host can check — and what
+/// stops anyone at all filling a moderation queue.
+#[tokio::test]
+async fn a_stranger_cannot_report() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Sealed).await;
+
+	let mut mallory = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	mallory.upload_keys(5).await.unwrap();
+
+	let report = veil_protocol::Report {
+		community: id,
+		channel: "general".into(),
+		sequence: 1,
+		quoted: "fabricated".into(),
+		reason: "noise".into(),
+		attribution: None,
+	};
+	mallory
+		.send(&ProtocolMessage::Report(Box::new(report.clone())))
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut mallory).await;
+	assert!(!ok, "a stranger must not be able to report: {detail}");
+
+	// The control: the identical report from a member is accepted, so the
+	// refusal above is about membership and not about the report itself.
+	mallory
+		.send(&ProtocolMessage::JoinCommunity(id))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut mallory).await.1);
+	mallory
+		.send(&ProtocolMessage::Report(Box::new(report)))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut mallory).await.1, "a member may report");
+
+	server.stop().await;
+}
+
+/// The queue is a moderator's, and nobody else's.
+#[tokio::test]
+async fn only_a_moderator_can_read_the_report_queue() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Sealed).await;
+
+	let mut bob = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	bob.upload_keys(5).await.unwrap();
+	bob.send(&ProtocolMessage::JoinCommunity(id)).await.unwrap();
+	assert!(expect_result(&mut bob).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	bob.send(&ProtocolMessage::Report(Box::new(veil_protocol::Report {
+		community: id,
+		channel: "general".into(),
+		sequence: 1,
+		quoted: "something worth reporting".into(),
+		reason: "abuse".into(),
+		attribution: None,
+	})))
+	.await
+	.unwrap();
+	assert!(expect_result(&mut bob).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	// Bob reported it, and still may not read the queue.
+	bob.send(&ProtocolMessage::FetchReports(id)).await.unwrap();
+	let (_, ok, detail) = expect_result(&mut bob).await;
+	assert!(!ok, "an ordinary member must not read the queue: {detail}");
+
+	// Alice founded it, so she moderates by construction.
+	alice
+		.send(&ProtocolMessage::FetchReports(id))
+		.await
+		.unwrap();
+	let entries = loop {
+		match alice.recv(BEAT).await {
+			Some(ProtocolMessage::ReportQueue { entries, .. }) => break entries,
+			Some(_) => continue,
+			None => panic!("a moderator should have been given the queue"),
+		}
+	};
+
+	assert_eq!(entries.len(), 1);
+	assert_eq!(entries[0].2, "abuse");
+	assert!(!entries[0].3, "this one was filed without attribution");
+
+	server.stop().await;
+}
+
 /// Everything in a channel, oldest first.
 ///
 /// Drains first: posting fans the message straight back to the sender, so those
