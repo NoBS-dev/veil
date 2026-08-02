@@ -52,6 +52,16 @@ The server prompts for a database path and keeps its key directory and
 mailboxes there (§12.1) — it survives restarts, and mail for an offline device
 waits rather than being dropped.
 
+Backing up a running server (§12.3) — take a consistent copy rather than `cp`,
+which can capture a torn WAL:
+
+```sh
+sqlite3 veil-server.db "VACUUM INTO 'backup.db'"
+```
+
+The server verifies integrity and prints a row summary on every start, so a
+restore that did not land is visible immediately.
+
 Diagnosing a clock problem (§13.4) — the server syncs to SNTP at startup and
 every 30 minutes, and this shows what it sees:
 

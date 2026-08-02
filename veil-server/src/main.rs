@@ -182,7 +182,22 @@ async fn main() -> Result<()> {
 		"" => String::from("veil-server.db"),
 		entered => entered.to_owned(),
 	};
-	println!("Store at {db_path}");
+
+	// Checked on every start, not only after a restore: a store that has
+	// silently corrupted should be found now rather than when someone needs it.
+	{
+		let store = store::Store::open(&db_path)?;
+		store.verify_integrity()?;
+		let summary = store.summary()?;
+		println!(
+			"Store at {db_path} — {}",
+			summary
+				.iter()
+				.map(|(t, n)| format!("{n} {t}"))
+				.collect::<Vec<_>>()
+				.join(", ")
+		);
+	}
 
 	// Keys must be generated because clients won't accept anything that isn't signed.
 	let state = ServerState {

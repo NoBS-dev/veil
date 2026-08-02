@@ -1632,6 +1632,12 @@ Two separate settings, easily conflated:
 timing correlation: nobody learns when each individual message arrived, only that
 the device checked in on a schedule. It also doubles as the escape hatch below.
 
+> **Polling is built; contentless push is not.** Push needs APNs and FCM
+> credentials, a signed application, and a device to receive on — none of which
+> exist yet, and none of which can be exercised from a desktop. Polling is the
+> half that works today, and it is deliberately the half that matters for §1.3:
+> it is what stops the push gateway becoming a dependency.
+
 #### Push is a §1.3 exception, and should be named as one
 
 Push tokens are bound to a signed application, so APNs and FCM credentials belong
@@ -1661,6 +1667,13 @@ whether recovery ever actually happens.
 
 Who may hold a backup differs by tier, because the tiers differ in what a backup
 *is*.
+
+> **The server-side half is built; the community-level half is not.** A store
+> can be backed up consistently, verified, and restored — `VACUUM INTO` rather
+> than copying a live WAL file, since a torn copy is the kind of backup that
+> looks fine until the day it is needed. What is *not* built is the filtered
+> per-member export below, because it filters on channel readership and channels
+> have no transport yet.
 
 **Sealed — any member, on request.** The database is ciphertext. Handing a
 complete copy to a member leaks nothing they could not already read; in fact it
@@ -1879,6 +1892,15 @@ handover in the first place.
 ## 13. Server architecture and scaling
 
 ### 13.1 Target shape
+
+> **Not built, deliberately.** This is horizontal scaling for load that does not
+> exist, and it cannot be validated without that load. Building a gateway split
+> and a pub/sub bus now would be guesswork dressed as progress — the same
+> reasoning that kept the community message store unbuilt until channels have a
+> transport. The routing path was reshaped to make it *possible* (§13.3: the
+> outbox change removed the socket-bound global lock that would have blocked it),
+> which is the part that was cheap to do early.
+
 
 ```
 clients ──► gateway nodes (stateless, hold WebSockets and relay tunnels)

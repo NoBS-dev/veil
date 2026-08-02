@@ -396,6 +396,63 @@ impl Store {
 		Ok(dropped)
 	}
 
+	// ---- backup and restore (§12.3, §12.4) --------------------------------
+
+	// Exposed for operators and tested; not called by the running server, which
+	// takes backups out of band.
+	#[allow(dead_code)]
+	/// Writes a consistent copy of the store to `path`, safe to take while the
+	/// server is running.
+	///
+	/// SQLite's own backup API rather than copying the file: a plain `cp` of a
+	/// live WAL database can capture a torn state, which is exactly the sort of
+	/// backup that looks fine until the day it is needed.
+	pub fn back_up_to(&self, path: &str) -> Result<()> {
+		self.db.execute("VACUUM INTO ?1", params![path])?;
+		Ok(())
+	}
+
+	/// Checks a store is intact and readable.
+	///
+	/// A backup nobody has verified is a guess (§12.3), so this is what the
+	/// restore path runs before an operator relies on it.
+	pub fn verify_integrity(&self) -> Result<()> {
+		let result: String = self
+			.db
+			.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+		if result != "ok" {
+			anyhow::bail!("integrity check failed: {result}");
+		}
+
+		// Structural check as well as physical: the tables the server needs
+		// must actually be present, so a restored file that is merely valid
+		// SQLite is not mistaken for a working store.
+		for table in ["users", "devices", "prekeys", "one_time_keys", "mailbox"] {
+			let found: i64 = self.db.query_row(
+				"SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+				params![table],
+				|r| r.get(0),
+			)?;
+			if found == 0 {
+				anyhow::bail!("restored store has no {table} table");
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Rows held, for an operator checking a restore landed.
+	pub fn summary(&self) -> Result<Vec<(String, i64)>> {
+		let mut out = Vec::new();
+		for table in ["users", "devices", "one_time_keys", "mailbox"] {
+			let n: i64 = self
+				.db
+				.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))?;
+			out.push((table.to_owned(), n));
+		}
+		Ok(out)
+	}
+
 	#[cfg(test)]
 	pub fn pending_count(&self, recipient: &DeviceAddress) -> Result<i64> {
 		Ok(self.db.query_row(
@@ -577,6 +634,41 @@ mod tests {
 
 		assert_eq!(store.acknowledge_for(&mine, &[id]).unwrap(), 1);
 		assert_eq!(store.pending_count(&mine).unwrap(), 0);
+	}
+
+	/// §12.3: a backup that has not been verified is a guess. This is the check
+	/// the restore path runs.
+	#[test]
+	fn a_backup_restores_and_verifies() {
+		let (store, user, keys, device) = fixture();
+		store.upsert_device(&user, &keys, &device).unwrap();
+		store
+			.enqueue(&DeviceAddress::new(user, device.device_id), b"waiting", 1)
+			.unwrap();
+
+		let path = std::env::temp_dir().join(format!("veil-backup-{}.db", std::process::id()));
+		let path = path.to_str().unwrap();
+		let _ = std::fs::remove_file(path);
+		store.back_up_to(path).unwrap();
+
+		// Reopened cold, as an operator would after a restore.
+		let restored = Store::open(path).unwrap();
+		restored.verify_integrity().unwrap();
+
+		let (_, devices) = restored.device_list(&user).unwrap().unwrap();
+		assert_eq!(devices.len(), 1, "devices survive the round trip");
+		assert_eq!(
+			restored
+				.pending_count(&DeviceAddress::new(user, device.device_id))
+				.unwrap(),
+			1,
+			"queued mail survives too"
+		);
+
+		let summary = restored.summary().unwrap();
+		assert!(summary.iter().any(|(t, n)| t == "users" && *n == 1));
+
+		let _ = std::fs::remove_file(path);
 	}
 
 	#[test]
