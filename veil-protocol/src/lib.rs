@@ -329,6 +329,12 @@ pub enum ProtocolMessage {
 	},
 	/// Adds a signed policy record to the chain (§7.4).
 	SubmitPolicy(Box<community::SignedPolicy>),
+	/// Asks for a community's current root and policy chain.
+	///
+	/// A sender needs this before encrypting to a Sealed channel: readership
+	/// comes from the chain (§8.5), and a stale chain means encrypting to
+	/// somebody a controller has since removed.
+	FetchCommunity(community::CommunityId),
 	/// Hands a channel's key material to one device (§8.4).
 	///
 	/// Routed by the host exactly like a DM and just as opaque to it: the

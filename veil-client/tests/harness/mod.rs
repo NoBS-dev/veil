@@ -104,6 +104,32 @@ impl Fixture {
 		.expect("client should not hang")
 	}
 
+	/// Runs a client, feeding it input in stages with a pause between each.
+	///
+	/// Needed for anything that must happen *while a client is connected* —
+	/// a policy change reaching a member who never reconnects, for instance.
+	/// Writing the whole script at once cannot test that, because the client
+	/// consumes it as fast as it can and the session is over before anything
+	/// else has moved.
+	pub async fn run_client_staged(&self, stages: &[(String, Duration)]) -> String {
+		let stages = stages.to_vec();
+
+		tokio::time::timeout(
+			Duration::from_secs(90),
+			Command::new(binary("veil-client"))
+				.env("VEIL_STATE_DIR", self.dir.join("profiles"))
+				.stdin(Stdio::piped())
+				.stdout(Stdio::piped())
+				.stderr(Stdio::piped())
+				.kill_on_drop(true)
+				.spawn()
+				.unwrap()
+				.wait_with_staged_input(stages),
+		)
+		.await
+		.expect("client should not hang")
+	}
+
 	/// Note the `find`, not a line prefix: the client's prompts are `print!`
 	/// without a newline, so the address shares a line with whatever preceded it.
 	pub fn address_from(output: &str) -> String {
@@ -330,6 +356,7 @@ async fn await_port(port: u16) {
 /// Small helper: feed stdin, wait, collect stdout and stderr together.
 trait RunWithInput {
 	async fn wait_with_output_from(self, input: String, linger: Duration) -> String;
+	async fn wait_with_staged_input(self, stages: Vec<(String, Duration)>) -> String;
 }
 
 impl RunWithInput for Child {
@@ -340,6 +367,25 @@ impl RunWithInput for Child {
 			let _ = stdin.flush().await;
 			tokio::time::sleep(linger).await;
 			drop(stdin); // EOF, which the client takes as a quit
+		});
+
+		let output = self.wait_with_output().await.unwrap();
+		format!(
+			"{}{}",
+			String::from_utf8_lossy(&output.stdout),
+			String::from_utf8_lossy(&output.stderr)
+		)
+	}
+
+	async fn wait_with_staged_input(mut self, stages: Vec<(String, Duration)>) -> String {
+		let mut stdin = self.stdin.take().unwrap();
+		tokio::spawn(async move {
+			for (input, pause) in stages {
+				let _ = stdin.write_all(input.as_bytes()).await;
+				let _ = stdin.flush().await;
+				tokio::time::sleep(pause).await;
+			}
+			drop(stdin);
 		});
 
 		let output = self.wait_with_output().await.unwrap();

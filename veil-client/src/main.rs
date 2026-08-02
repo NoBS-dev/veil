@@ -152,6 +152,18 @@ async fn main() -> anyhow::Result<()> {
 	state.account.mark_keys_as_published();
 	state.save_to_keyring()?;
 
+	// Refresh every community we know about before anything can be sent to one.
+	// Readership comes from the policy chain (§8.5), so a chain that has not
+	// caught up means encrypting to whoever it still lists — including someone a
+	// controller removed while this device was away.
+	let pending_refreshes = state.known_communities.len() as u64;
+	for id in state.known_communities.keys().copied().collect::<Vec<_>>() {
+		let framed = Envelope::seal(&ProtocolMessage::FetchCommunity(id), &state.account)?;
+		write
+			.send(Message::Binary(Bytes::copy_from_slice(&framed)))
+			.await?;
+	}
+
 	let state = Arc::new(Mutex::new(state));
 	// Shared so the listener can acknowledge mail without waiting on the CLI.
 	let write = Arc::new(Mutex::new(write));
@@ -161,6 +173,33 @@ async fn main() -> anyhow::Result<()> {
 		state.clone(),
 		server_identity,
 	));
+	// Wait for those refreshes before accepting a command. Sending to a Sealed
+	// channel derives readership from the chain, so entering the prompt first
+	// meant the first `say` of a session could encrypt against whatever was on
+	// disk — including a reader a controller had removed in the meantime.
+	//
+	// Bounded, and proceeding anyway on timeout: a host that never answers must
+	// not make the client unusable, and a stale chain still cannot admit a
+	// reader nobody signed for.
+	if pending_refreshes > 0 {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+		loop {
+			if state.lock().await.applied_states >= pending_refreshes {
+				break;
+			}
+			if std::time::Instant::now() >= deadline {
+				eprintln!(
+					"warning: this host has not answered for {} community/ies. Policy may be \
+					 out of date, so a Sealed send could reach a reader who has since been \
+					 removed.",
+					pending_refreshes - state.lock().await.applied_states
+				);
+				break;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+		}
+	}
+
 	cli(&prompt, &url, write, state).await?;
 
 	Ok(())

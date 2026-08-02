@@ -248,7 +248,13 @@ explicitly — each one closes a specific attack.
     breaking the chain is detectable — not tamper-proofing, because one host
     could always serve two clients different histories. Do not describe it as
     more than that.
-20. **Never send plaintext under a Sealed id.** The mode is inside the community
+20. **A removal must bind every sender, not just the remover.** Rotation only
+    helps if other senders have the new chain, so the host pushes policy to all
+    connected members and clients refresh on connect before encrypting. A host
+    can still *withhold* the newest record — sequences stop a rewind, so hiding
+    the tip is its only move — and that is a known, unclosed gap (§8.5), not
+    something to describe as solved.
+21. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.
@@ -290,10 +296,18 @@ stranger cannot post or backfill, the host assigns position, policy needs k
 distinct controllers, and a Sealed channel leaves nothing readable in the host's
 database — checked by grepping the database file, WAL included).
 
-`veil-client/tests/sealed.rs` drives a Sealed community with two real clients:
+`veil-client/tests/sealed.rs` drives a Sealed community with real clients:
 signed readers, a Megolm session delivered per device, a recipient who was
-offline when the key was issued, and a check that the host's database holds no
-plaintext.
+offline when the key was issued, removal locking a reader out of what follows,
+and a check that the host's database holds no plaintext. `run_client_staged`
+feeds a client input in stages, which is what lets a test change policy *while*
+another member is connected — the only way to exercise the push, since a client
+that reconnects would refresh anyway.
+
+**Rebuild the workspace before running client tests after touching the server.**
+`cargo test -p veil-client` does not rebuild `veil-server`, and the tests drive
+the binary on disk. A mutation check silently passed against a stale server
+binary during this work.
 
 `veil-protocol` has 84 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the

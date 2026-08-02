@@ -493,6 +493,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::Delivery(_) => "channel delivery",
 		ProtocolMessage::Backfill { .. } => "backfill request",
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
+		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::ChannelKey(_) => "channel key",
 		ProtocolMessage::CommunityResult { .. } => "community result",
 	}

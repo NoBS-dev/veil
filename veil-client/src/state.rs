@@ -165,6 +165,13 @@ pub struct State {
 	/// that can read what was sent under it.
 	#[serde(default = "empty_provider")]
 	pub megolm: ProviderState,
+	/// How many community states have been verified and applied this run.
+	///
+	/// Not persisted: it exists so startup can tell whether the chain it is
+	/// about to encrypt against has caught up, and that question is only
+	/// meaningful within one connection.
+	#[serde(skip)]
+	pub applied_states: u64,
 	/// People we have verified. Keyed by user, never by device (§5.4).
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
@@ -215,6 +222,7 @@ impl State {
 			community_roots: HashMap::new(),
 			community_chains: HashMap::new(),
 			megolm: empty_provider(),
+			applied_states: 0,
 			verified_users: HashMap::new(),
 			ip_and_port,
 			relay: None,
@@ -335,6 +343,7 @@ impl State {
 		self.known_communities.insert(id, root.mode);
 		self.community_roots.insert(id, root_json.to_owned());
 		self.community_chains.insert(id, chain.to_vec());
+		self.applied_states += 1;
 		Ok(())
 	}
 

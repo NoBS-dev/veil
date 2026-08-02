@@ -222,6 +222,48 @@ async fn fan_out(state: &ServerState, delivery: &ChannelDelivery, members: &[Use
 	}
 }
 
+/// Sends every connected member the community's current state.
+///
+/// Called when policy changes. Without it, only the controller who submitted a
+/// record would know about it — so every other sender would keep deriving
+/// readership from a stale chain and keep encrypting to a device that had just
+/// been removed, which makes removal cosmetic for anyone but the remover.
+///
+/// This narrows the window; it does not close it. A host can still *withhold*
+/// the newest record from a member, and that member cannot tell. Sequence
+/// numbers stop the chain being rewound, so the host's only move is to hide the
+/// tip — see §8.5.
+pub async fn broadcast_state(state: &ServerState, id: CommunityId) {
+	let Ok(view) = view(state, id).await else {
+		return;
+	};
+
+	let framed = {
+		let account = state.server_account.lock().await;
+		match Envelope::seal(&ProtocolMessage::CommunityState(Box::new(view)), &account) {
+			Ok(framed) => framed.to_vec(),
+			Err(e) => {
+				eprintln!("Could not seal a community state: {e:#}");
+				return;
+			}
+		}
+	};
+
+	let members = state.store.lock().await.members(&id).unwrap_or_default();
+	let addresses: Vec<DeviceAddress> = {
+		let clients = CLIENTS.read().await;
+		clients
+			.keys()
+			.filter(|address| members.contains(&address.user))
+			.copied()
+			.collect()
+	};
+
+	for address in addresses {
+		let _ = route_to(&address, framed.clone()).await;
+	}
+}
+
 /// Answers a request for missed history.
 pub async fn backfill(
 	state: &ServerState,

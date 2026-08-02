@@ -21,6 +21,7 @@ const LINGER: Duration = Duration::from_secs(5);
 /// Drives the whole setup: two users, a Sealed community, a signed reader list.
 struct Sealed {
 	fixture: Fixture,
+	server: String,
 	community: String,
 	alice_user: String,
 	bob_user: String,
@@ -52,6 +53,7 @@ impl Sealed {
 
 		Self {
 			fixture,
+			server,
 			community,
 			alice_user,
 			bob_user,
@@ -71,10 +73,45 @@ impl Sealed {
 			.await
 	}
 
+	/// Signs a new reader list, replacing the previous one.
+	async fn set_readers_to(&self, readers: &[String]) -> String {
+		let mut input = format!("alice\nreaders\n{}\ngeneral\n", self.community);
+		for reader in readers {
+			input.push_str(reader);
+			input.push('\n');
+		}
+		input.push('\n');
+
+		self.fixture.run_client_lingering(&input, LINGER).await
+	}
+
 	async fn alice_says(&self, text: &str) -> String {
 		self.fixture
 			.run_client_lingering(
 				&format!("alice\nsay\n{}\ngeneral\n{text}\n", self.community),
+				LINGER,
+			)
+			.await
+	}
+
+	/// Registers another user and joins them to the community.
+	async fn add_member(&self, profile: &str) -> String {
+		let output = self
+			.fixture
+			.run_client(&format!("{profile}\n{}\n\n", self.server))
+			.await;
+		let user = user_of(&output);
+
+		self.fixture
+			.run_client_lingering(&format!("{profile}\njoin\n{}\n", self.community), LINGER)
+			.await;
+		user
+	}
+
+	async fn read_as(&self, profile: &str) -> String {
+		self.fixture
+			.run_client_lingering(
+				&format!("{profile}\nhistory\n{}\ngeneral\n", self.community),
 				LINGER,
 			)
 			.await
@@ -210,6 +247,197 @@ async fn a_sealed_channel_without_a_signed_reader_list_refuses_to_send() {
 		!raw.windows(b"should never be sent".len())
 			.any(|w| w == b"should never be sent"),
 		"the plaintext must not have reached the host either"
+	);
+
+	sealed.fixture.stop().await;
+}
+
+/// §8.3: removing a reader must rotate the key, and the removed reader keeps
+/// what they could already read but nothing after.
+///
+/// Rotation is mandatory on removal — without it the removed device keeps
+/// decrypting everything sent afterwards, which makes removal cosmetic. The
+/// converse matters too: they do *not* lose history they legitimately held, and
+/// pretending otherwise would be a promise the design cannot keep, since they
+/// may have kept a copy.
+#[tokio::test]
+async fn removing_a_reader_locks_them_out_of_what_follows() {
+	let sealed = Sealed::arrange().await;
+	sealed.grant_readers().await;
+
+	sealed.alice_says("before the removal").await;
+	let before = sealed.bob_reads().await;
+	assert!(
+		before.contains("before the removal"),
+		"bob should read what he was a reader for: {before}"
+	);
+
+	// Alice signs a new reader list without Bob.
+	sealed
+		.set_readers_to(std::slice::from_ref(&sealed.alice_user))
+		.await;
+	sealed.alice_says("after the removal").await;
+
+	let after = sealed.bob_reads().await;
+	assert!(
+		after.contains("before the removal"),
+		"removal is not retroactive; bob keeps what he already had: {after}"
+	);
+	assert!(
+		!after.contains("after the removal"),
+		"a removed reader must not decrypt what follows: {after}"
+	);
+
+	// The control. Without it this test would pass just as happily if the
+	// second message had never been sent, or had been sent to nobody — which
+	// would prove nothing about rotation.
+	let alice = sealed
+		.fixture
+		.run_client_lingering(
+			&format!("alice\nhistory\n{}\ngeneral\n", sealed.community),
+			LINGER,
+		)
+		.await;
+	assert!(
+		alice.contains("after the removal"),
+		"the message was sent and is readable by a current reader: {alice}"
+	);
+
+	sealed.fixture.stop().await;
+}
+
+/// The case the broadcast exists for: removal must bind senders *other* than
+/// the controller who signed it.
+///
+/// Alice removes Carol; Bob then sends. Bob derives readership from his own copy
+/// of the chain (§8.5), so if that copy never caught up he would keep encrypting
+/// to Carol and the removal would be cosmetic for everyone except Alice.
+#[tokio::test]
+async fn a_removal_binds_other_senders_too() {
+	let sealed = Sealed::arrange().await;
+	let carol = sealed.add_member("carol").await;
+
+	// All three can read.
+	sealed
+		.set_readers_to(&[
+			sealed.alice_user.clone(),
+			sealed.bob_user.clone(),
+			carol.clone(),
+		])
+		.await;
+	sealed.alice_says("everyone can see this").await;
+
+	let before = sealed.read_as("carol").await;
+	assert!(
+		before.contains("everyone can see this"),
+		"carol should start as a reader: {before}"
+	);
+
+	// Alice removes Carol. Bob is the one who sends next.
+	sealed
+		.set_readers_to(&[sealed.alice_user.clone(), sealed.bob_user.clone()])
+		.await;
+	let bob = sealed
+		.fixture
+		.run_client_lingering(
+			&format!(
+				"bob\nsay\n{}\ngeneral\nbob speaks after the removal\n",
+				sealed.community
+			),
+			LINGER,
+		)
+		.await;
+	assert!(
+		bob.contains("Distributing"),
+		"bob should have established his own session for the new readership: {bob}"
+	);
+
+	let after = sealed.read_as("carol").await;
+	assert!(
+		!after.contains("bob speaks after the removal"),
+		"a removal must bind every sender, not only the controller who signed it: {after}"
+	);
+
+	// Control: Bob's message did get sent, and a current reader can read it.
+	let alice = sealed
+		.fixture
+		.run_client_lingering(
+			&format!("alice\nhistory\n{}\ngeneral\n", sealed.community),
+			LINGER,
+		)
+		.await;
+	assert!(
+		alice.contains("bob speaks after the removal"),
+		"the message was sent and is readable by a current reader: {alice}"
+	);
+
+	sealed.fixture.stop().await;
+}
+
+/// The broadcast, tested where it is the only thing that can help: a member who
+/// stays connected across a policy change.
+///
+/// Bob connects and waits. Alice removes Carol. Bob then sends *without ever
+/// reconnecting*, so his connect-time refresh cannot save him — the only way he
+/// learns Carol is gone is the host pushing the new chain to every member.
+#[tokio::test]
+async fn a_connected_member_learns_of_a_removal_without_reconnecting() {
+	let sealed = Sealed::arrange().await;
+	let carol = sealed.add_member("carol").await;
+	sealed
+		.set_readers_to(&[
+			sealed.alice_user.clone(),
+			sealed.bob_user.clone(),
+			carol.clone(),
+		])
+		.await;
+
+	// Bob connects and idles while Alice changes policy underneath him, then
+	// sends on the same connection.
+	let community = sealed.community.clone();
+	let script = [
+		("bob\n".to_owned(), Duration::from_secs(12)),
+		(
+			format!("say\n{community}\ngeneral\nsent while connected\n"),
+			Duration::from_secs(6),
+		),
+	];
+	let bob_session = sealed.fixture.run_client_staged(&script);
+
+	let alice_removal = async {
+		tokio::time::sleep(Duration::from_secs(5)).await;
+		sealed
+			.set_readers_to(&[sealed.alice_user.clone(), sealed.bob_user.clone()])
+			.await
+	};
+
+	let (bob, _) = tokio::join!(bob_session, alice_removal);
+	// Two records, not just "verified" — bob's *connect-time* refresh already
+	// prints that, so it would pass whether or not the broadcast ever arrived.
+	// The second record is the removal, and only the broadcast can have carried
+	// it to a session that never reconnected.
+	assert!(
+		bob.contains("2 policy record(s)"),
+		"bob should have been pushed the new chain while connected: {bob}"
+	);
+
+	let carol_view = sealed.read_as("carol").await;
+	assert!(
+		!carol_view.contains("sent while connected"),
+		"a member who never reconnected must still honour the removal.\n\
+		 carol saw:\n{carol_view}\nbob's session was:\n{bob}"
+	);
+
+	let alice = sealed
+		.fixture
+		.run_client_lingering(
+			&format!("alice\nhistory\n{}\ngeneral\n", sealed.community),
+			LINGER,
+		)
+		.await;
+	assert!(
+		alice.contains("sent while connected"),
+		"the message was sent and a current reader can read it: {alice}"
 	);
 
 	sealed.fixture.stop().await;

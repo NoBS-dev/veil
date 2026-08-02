@@ -682,6 +682,28 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::FetchCommunity(id) => match community::view(&state, id).await {
+				Ok(view) => {
+					reply(
+						&state,
+						&address,
+						ProtocolMessage::CommunityState(Box::new(view)),
+					)
+					.await
+				}
+				Err(e) => {
+					reply(
+						&state,
+						&address,
+						ProtocolMessage::CommunityResult {
+							community: id,
+							ok: false,
+							detail: format!("{e:#}"),
+						},
+					)
+					.await
+				}
+			},
 			ProtocolMessage::Backfill {
 				community: id,
 				channel,
@@ -717,18 +739,13 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let accepted = response.ok;
 				reply(&state, &address, response.into_message()).await;
 
-				// The chain the submitter holds is now stale — including their
-				// own record, which they signed but have not seen applied. A
-				// client whose chain lags cannot derive readership (§8.5), so
-				// it would be unable to send to the very channel it just
-				// configured.
-				if accepted && let Ok(view) = community::view(&state, id).await {
-					reply(
-						&state,
-						&address,
-						ProtocolMessage::CommunityState(Box::new(view)),
-					)
-					.await;
+				// Every member's chain is now stale, not just the submitter's.
+				// A client whose chain lags derives readership from it anyway
+				// (§8.5), so it would keep encrypting to a device a controller
+				// has just removed — which makes removal cosmetic for everyone
+				// except the person who did it.
+				if accepted {
+					community::broadcast_state(&state, id).await;
 				}
 			}
 			ProtocolMessage::ChannelKey(key) => {

@@ -138,7 +138,7 @@ Communities exist on a host: they can be founded, joined and posted to, and the
 host assigns every message a position in a hash chain (§10.1) so no member can
 claim one. Membership gates both writing and reading history.
 
-Sealed channels work end to end. A sender derives its readers from the
+Sealed channels work end to end, including removal. A sender derives its readers from the
 community's *signed policy chain* — never from the host, since read access is
 key possession and a host that supplied the reader set could add itself — then
 delivers a Megolm session to each reader device over Olm and encrypts with it.
@@ -146,10 +146,24 @@ A channel with no signed `ChannelReaders` record is refused rather than defaulte
 to the host's membership list, and a client that cannot encrypt refuses to post
 rather than falling back to plaintext.
 
+Removing a reader rotates the key, so the removed device reads nothing sent
+afterwards while keeping what it already held — removal is not retroactive, and
+pretending otherwise would be a promise the design cannot keep, since they may
+have kept a copy. That binds *every* sender, not only the controller who signed
+the removal: the host pushes the new chain to all connected members, and a
+client refreshes on connect before it will encrypt anything.
+
+**A host can still withhold the newest policy record**, and a member cannot tell.
+Sequence numbers stop the chain being rewound, so hiding the tip is the host's
+only move — but a host that does it can keep a sender encrypting to a device
+that has since been removed. This is the residual cost of host-served policy and
+is not closed; detecting it needs members to compare chains out of band. Worth
+weighing against the alternative, which is replicating policy between servers and
+bringing back everything §3.3 exists to avoid.
+
 What remains is **roles and moderation** (§8.5, §7.6) and **channel
 administration**, which are designed but unbuilt, and **bots**, which are not
-designed. Key rotation on member removal works in the provider and is tested,
-but nothing yet drives it from a membership change.
+designed.
 
 ---
 
