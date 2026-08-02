@@ -48,6 +48,10 @@ any stored state.
 
 ## Commands
 
+The server prompts for a database path and keeps its key directory and
+mailboxes there (§12.1) — it survives restarts, and mail for an offline device
+waits rather than being dropped.
+
 ```sh
 cargo build --workspace
 cargo test --workspace                  # unit tests live in veil-protocol
@@ -80,8 +84,8 @@ secret-tool clear service veil-client username <profile>
 Both binaries prompt interactively on stdin.
 
 ```sh
-# server: address, then TLS cert path (blank = plaintext)
-printf '127.0.0.1:9876\n\n' | ./target/debug/veil-server
+# server: address, TLS cert path (blank = plaintext), database path
+printf '127.0.0.1:9876\n\n\n' | ./target/debug/veil-server
 
 # client: profile name, then server address on first run
 printf 'alice\n127.0.0.1:9876\n' | ./target/debug/veil-client

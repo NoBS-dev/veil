@@ -1,3 +1,5 @@
+mod store;
+
 use anyhow::Result;
 use axum::{
 	Router,
@@ -25,7 +27,6 @@ use tokio::{
 	sync::{Mutex, RwLock},
 };
 use veil_protocol::{
-	crosssign::CrossSigningPublic,
 	identity::{Device, DeviceAddress, DeviceId, UserId},
 	version::VersionRange,
 	*,
@@ -46,46 +47,18 @@ const TUNNELS_PER_USER_PER_WINDOW: u32 = 20;
 /// using the tunnel as an amplifier.
 const MAX_TUNNEL_FRAME: usize = 1 << 20;
 
-type KeyMap = Arc<RwLock<HashMap<DeviceAddress, ClientStore>>>;
-
-/// A user's published identity: their cross-signing keys plus the devices they
-/// have enrolled.
-///
-/// The server stores and serves this but is **not trusted for it** — every
-/// entry carries the owner's own signature, so a client checks the whole set
-/// against the keys rather than taking the server's word (§4.3).
-struct UserRecord {
-	keys: CrossSigningPublic,
-	devices: HashMap<DeviceId, Device>,
-}
-
-type UserMap = Arc<RwLock<HashMap<UserId, UserRecord>>>;
+type SharedStore = Arc<Mutex<store::Store>>;
 
 #[derive(Clone)]
 struct ServerState {
-	key_map: KeyMap,
-	users: UserMap,
+	/// Key directory and mailboxes (§12.1). Was two in-memory maps, which lost
+	/// every key on restart and dropped mail for anyone offline.
+	store: SharedStore,
 	server_account: Arc<Mutex<Account>>,
 	replay_guard: Arc<Mutex<ReplayGuard>>,
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
 	otk_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
 	tunnel_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
-}
-
-struct ClientStore {
-	/// This device's signing key. Handed out with the prekey bundle so a peer
-	/// can pin it (§5.2) rather than trusting whatever signs their first
-	/// inbound message.
-	signing_key: [u8; 32],
-	encryption_key: [u8; 32],
-	fallback_key: [u8; 32],
-
-	one_time_keys: HashMap<String, [u8; 32]>, // Key ID | Public key
-
-	/// Timestamp of the newest key upload accepted for this device. Uploads
-	/// must move forward in time, so a captured upload cannot be re-sent later
-	/// to resurrect keys that have since been handed out.
-	last_upload_ms: u64,
 }
 
 /// Frames queued for one connection.
@@ -182,10 +155,15 @@ async fn main() -> Result<()> {
 		)
 	};
 
+	let db_path = match prompt("Enter database path (empty for veil-server.db): ")?.as_str() {
+		"" => String::from("veil-server.db"),
+		entered => entered.to_owned(),
+	};
+	println!("Store at {db_path}");
+
 	// Keys must be generated because clients won't accept anything that isn't signed.
 	let state = ServerState {
-		key_map: Arc::new(RwLock::new(HashMap::new())),
-		users: Arc::new(RwLock::new(HashMap::new())),
+		store: Arc::new(Mutex::new(store::Store::open(&db_path)?)),
 		server_account: Arc::new(Mutex::new(Account::new())),
 		replay_guard: Arc::new(Mutex::new(ReplayGuard::default())),
 		ip_limiter: Arc::new(Mutex::new(RateLimiter::new(
@@ -317,54 +295,26 @@ async fn authenticate(
 
 	// Everything needed for a device-list entry has just been verified, so
 	// record it here rather than trusting a later self-report.
-	state.users.write().await.insert_device(
-		claim.user,
-		claim.keys.clone(),
-		Device {
+	let now = now_ms().unwrap_or_default();
+	state.store.lock().await.upsert_device(
+		&claim.user,
+		&claim.keys,
+		&Device {
 			device_id: claim.device,
 			ed25519: opened.sender,
 			curve25519: [0; 32], // filled in by the key upload
 			ssk_signature: claim.binding,
 			display_name: String::new(),
-			created_at: now_ms().unwrap_or_default(),
-			last_seen: now_ms().unwrap_or_default(),
+			created_at: now,
+			last_seen: now,
 		},
-	);
+	)?;
 
 	Ok((
 		DeviceAddress::new(claim.user, claim.device),
 		opened.sender,
 		agreed,
 	))
-}
-
-/// Small helper so the insert-or-update dance is written once.
-trait UserRecords {
-	fn insert_device(&mut self, user: UserId, keys: CrossSigningPublic, device: Device);
-}
-
-impl UserRecords for HashMap<UserId, UserRecord> {
-	fn insert_device(&mut self, user: UserId, keys: CrossSigningPublic, device: Device) {
-		match self.get_mut(&user) {
-			Some(record) => {
-				// Refresh rather than keep the first set ever seen. A user who
-				// rotates a subkey (§5.5) would otherwise have the stale keys
-				// served forever, and every device enrolled under the new key
-				// would fail verification for anyone fetching the list.
-				//
-				// Safe to take: these keys were verified during the handshake
-				// that produced this call, so they derive `user` and the master
-				// key signed both subkeys.
-				record.keys = keys;
-				record.devices.insert(device.device_id, device);
-			}
-			None => {
-				let mut devices = HashMap::new();
-				devices.insert(device.device_id, device);
-				self.insert(user, UserRecord { keys, devices });
-			}
-		}
-	}
 }
 
 async fn handle_socket(socket: WebSocket, state: ServerState) {
@@ -396,6 +346,12 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 		}
 	});
 	CLIENTS.write().await.insert(address, outbox);
+
+	// Anything that arrived while this device was away. Delivered before the
+	// read loop starts, so it lands in order relative to live traffic.
+	if let Err(e) = flush_mailbox(&state, &address).await {
+		eprintln!("Could not flush mail for {address}: {e:#}");
+	}
 
 	while let Some(Ok(Message::Binary(bytes))) = receiver.next().await {
 		let opened = match open_envelope(&bytes) {
@@ -441,47 +397,47 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 
 				match route_to(&msg.recipient, bytes.to_vec()).await {
 					Ok(()) => eprintln!("Message routed from {address} to {}", msg.recipient),
-					Err(e) => eprintln!("Could not route to {}: {e}", msg.recipient),
+					Err(e) => {
+						// Undelivered is not lost. The recipient gets it when
+						// they next connect (§12.2) — before this, anything for
+						// an offline device was dropped on the floor.
+						let queued = state.store.lock().await.enqueue(
+							&msg.recipient,
+							&bytes,
+							opened.timestamp_ms,
+						);
+						match queued {
+							Ok(()) => eprintln!(
+								"{} is {e}; mail queued for their next connection",
+								msg.recipient
+							),
+							Err(err) => {
+								eprintln!("Could not queue mail for {}: {err:#}", msg.recipient)
+							}
+						}
+					}
 				}
 			}
 			ProtocolMessage::UploadKeys(upload) => {
-				eprintln!("Received a key upload request.");
+				let mut store = state.store.lock().await;
 
-				let mut key_map = state.key_map.write().await;
+				let accepted =
+					match store_upload(&mut store, &address, &upload, opened.timestamp_ms) {
+						Ok(accepted) => accepted,
+						Err(e) => {
+							eprintln!("Key upload from {address} failed: {e:#}");
+							continue;
+						}
+					};
 
-				if let Some(existing) = key_map.get(&address)
-					&& opened.timestamp_ms <= existing.last_upload_ms
-				{
+				if !accepted {
 					eprintln!("Discarding a key upload that does not advance the clock.");
 					continue;
 				}
 
-				let mut store = ClientStore {
-					signing_key,
-					encryption_key: upload.encryption_key,
-					fallback_key: upload.fallback_key,
-					one_time_keys: HashMap::new(),
-					last_upload_ms: opened.timestamp_ms,
-				};
-
-				for (i, otk) in upload.one_time_keys.iter().enumerate() {
-					let key_id = format!("otk_{}", i);
-					store.one_time_keys.insert(key_id, *otk);
-				}
-
-				key_map.insert(address, store);
-				drop(key_map);
-
-				if let Some(record) = state.users.write().await.get_mut(&address.user)
-					&& let Some(device) = record.devices.get_mut(&address.device)
-				{
-					device.curve25519 = upload.encryption_key;
-					device.display_name = upload.display_name.clone();
-					device.last_seen = opened.timestamp_ms;
-				}
-
-				eprintln!("Key upload request handled properly.");
+				eprintln!("Key upload from {address} handled properly.");
 			}
+
 			ProtocolMessage::Challenge(_) | ProtocolMessage::Authenticate(_) => {
 				eprintln!("Received a handshake message outside the handshake. Ignoring.")
 			}
@@ -499,6 +455,35 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 // TODO: this hands the full roster to anyone who asks, which is a metadata leak
 // no amount of rate limiting fixes. It wants replacing with per-user contact
 // lists before this faces an untrusted network.
+/// Delivers whatever was waiting for a device, then forgets it.
+///
+/// Acknowledgement is delivery to the outbox rather than a client-side receipt.
+/// That is weaker than §12.2's "retained until every device has acked" and is
+/// noted as such — a client that dies between queue and read loses the frame.
+/// Closing that needs an explicit ack from the client, which is the next step.
+async fn flush_mailbox(state: &ServerState, address: &DeviceAddress) -> Result<()> {
+	let pending = state.store.lock().await.pending(address)?;
+	if pending.is_empty() {
+		return Ok(());
+	}
+
+	eprintln!(
+		"Delivering {} queued message(s) to {address}",
+		pending.len()
+	);
+
+	let mut delivered = Vec::with_capacity(pending.len());
+	for (id, frame) in pending {
+		if route_to(address, frame).await.is_err() {
+			break; // it went away again; the rest stays queued
+		}
+		delivered.push(id);
+	}
+
+	state.store.lock().await.acknowledge(&delivered)?;
+	Ok(())
+}
+
 async fn list_clients(
 	State(state): State<ServerState>,
 	ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -516,31 +501,32 @@ async fn list_clients(
 	Ok(itertools::Itertools::intersperse(iter, String::from("\n")).collect::<String>())
 }
 
-async fn pop_otk(
-	key_map: &KeyMap,
+/// Applies a key upload, completing the device entry the handshake started.
+fn store_upload(
+	store: &mut store::Store,
 	address: &DeviceAddress,
-	consume: bool,
-) -> Option<([u8; 32], [u8; 32], [u8; 32], u16)> {
-	let mut map_guard = key_map.write().await;
+	upload: &UploadKeys,
+	uploaded_at: u64,
+) -> Result<bool> {
+	// The store refuses an upload that does not advance the clock, so a captured
+	// one cannot be replayed to resurrect keys already handed out.
+	if !store.store_prekeys(
+		address,
+		&upload.encryption_key,
+		&upload.fallback_key,
+		&upload.one_time_keys,
+		uploaded_at,
+	)? {
+		return Ok(false);
+	}
 
-	let store = map_guard.get_mut(address)?;
-
-	let otk = if !consume {
-		None
-	} else if let Some(id) = store.one_time_keys.keys().next().cloned() {
-		store.one_time_keys.remove(&id)
-	} else {
-		None
-	};
-
-	let key = otk.unwrap_or(store.fallback_key);
-
-	Some((
-		store.signing_key,
-		store.encryption_key,
-		key,
-		store.one_time_keys.len() as u16,
-	))
+	store.complete_device(
+		address,
+		&upload.encryption_key,
+		&upload.display_name,
+		uploaded_at,
+	)?;
+	Ok(true)
 }
 
 /// Prekey bundle for one device (§5.2). Addressed by `user/device` rather than
@@ -571,8 +557,21 @@ async fn get_prekey_bundle(
 		);
 	}
 
-	match pop_otk(&state.key_map, &address, consume).await {
-		Some((signing_key, encryption_key, otk, remaining_otks)) => {
+	let bundle = state
+		.store
+		.lock()
+		.await
+		.take_prekey_bundle(&address, consume)
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+	match bundle {
+		Some(bundle) => {
+			let (signing_key, encryption_key, otk, remaining_otks) = (
+				bundle.signing_key,
+				bundle.encryption_key,
+				bundle.one_time_key,
+				bundle.remaining,
+			);
 			// Signing key first: a peer pins it so that whatever signs their
 			// first inbound message has to match (§5.2).
 			let body = format!(
@@ -638,24 +637,21 @@ async fn get_device_list(
 	let user = UserId::parse(&user)
 		.map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid user id: {e}")))?;
 
-	let users = state.users.read().await;
-	let record = users
-		.get(&user)
-		.ok_or((StatusCode::NOT_FOUND, "No such user".to_owned()))?;
+	// Incomplete devices are withheld by the store itself: an entry recorded at
+	// handshake has no Olm identity key until the upload lands, and serving it
+	// would make a peer's device-list check disagree with the prekey bundle.
+	let listing = state
+		.store
+		.lock()
+		.await
+		.device_list(&user)
+		.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-	// A device is recorded at handshake but its Olm identity key only arrives
-	// with the key upload that follows. Serving the half-built entry would make
-	// a peer's device-list check disagree with the prekey bundle and refuse a
-	// perfectly good device, so incomplete entries are withheld until complete.
-	let devices: Vec<_> = record
-		.devices
-		.values()
-		.filter(|d| d.curve25519 != [0; 32])
-		.collect();
+	let (keys, devices) = listing.ok_or((StatusCode::NOT_FOUND, "No such user".to_owned()))?;
 
 	Ok(axum::Json(serde_json::json!({
 		"user": user.to_string(),
-		"keys": record.keys,
+		"keys": keys,
 		"devices": devices,
 	})))
 }

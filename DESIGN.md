@@ -109,7 +109,8 @@ to.
 | Deletion, tombstoning, erasure | designed, §10.5 |
 | Attestations and verification | designed, §11.2–11.2.1 |
 | Reputation, discovery, finding people | designed, §11.4–11.6 |
-| Persistence, delivery, push | designed, §12.1–12.2 |
+| Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
+| Message store, push | designed, §12.1–12.2 |
 | Backups, succession, migration | designed, §12.3–12.4 |
 | Key backup and device enrolment | designed, §12.5 |
 | Horizontal scaling | designed, §13.1–13.3 |
@@ -1581,9 +1582,14 @@ Unbuilt. Today all state is in memory and offline messages are dropped.
 - **Mailbox** (home server) — per-device queues for DMs (§3.4) and notifications.
 - **Message store** (community host) — per-channel append-only log keyed by
   `(channel_id, seq)`. Sealed rows hold ciphertext; Open rows hold content
-  encrypted at rest.
+  encrypted at rest. **Not built**: channels have no transport yet, and a store
+  for traffic that cannot arrive would be guesswork.
 
-Postgres is the default for all three.
+**SQLite by default, Postgres as the scale path.** §12.1 originally named
+Postgres for all three, but requiring a database server to run a home server is
+friction §1.3 cannot afford — the invariant is that one person on a domestic
+connection can run one. The schema is deliberately plain so moving a large host
+to Postgres is a port rather than a redesign.
 
 ### 12.2 Delivery
 

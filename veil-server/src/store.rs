@@ -1,0 +1,562 @@
+//! Server persistence — `DESIGN.md` §12.1.
+//!
+//! Two stores live here. The **key directory** holds users, their cross-signing
+//! keys, their devices and prekey bundles; the **mailbox** holds frames for
+//! devices that were not connected when something arrived. Before this, a
+//! restart lost every key and a message to anyone offline was dropped on the
+//! floor.
+//!
+//! **SQLite rather than Postgres**, which §12.1 originally named. Requiring a
+//! database server to run a home server is friction §1.3 cannot afford — the
+//! invariant is that one person on a domestic connection can run one. Postgres
+//! remains the path for large hosts, and the schema here is deliberately plain
+//! so moving is a port rather than a redesign.
+//!
+//! Calls run inline rather than on a blocking pool: local SQLite writes in WAL
+//! mode are tens of microseconds, and routing no longer waits on sockets
+//! (§13.3). A pool and `spawn_blocking` is the answer if that stops being true.
+
+use anyhow::Result;
+use rusqlite::{Connection, OptionalExtension, params};
+use veil_protocol::{
+	crosssign::CrossSigningPublic,
+	identity::{Device, DeviceAddress, DeviceId, UserId},
+};
+
+pub struct Store {
+	db: Connection,
+}
+
+/// A device's published prekey material.
+pub struct PrekeyBundle {
+	pub signing_key: [u8; 32],
+	pub encryption_key: [u8; 32],
+	pub one_time_key: [u8; 32],
+	pub remaining: u16,
+}
+
+impl Store {
+	pub fn open(path: &str) -> Result<Self> {
+		let db = Connection::open(path)?;
+		db.execute_batch(
+			"PRAGMA journal_mode = WAL;
+			 PRAGMA foreign_keys = ON;
+
+			 CREATE TABLE IF NOT EXISTS users (
+			     user_id BLOB PRIMARY KEY,
+			     keys    TEXT NOT NULL          -- CrossSigningPublic, as JSON
+			 );
+
+			 CREATE TABLE IF NOT EXISTS devices (
+			     user_id       BLOB    NOT NULL,
+			     device_id     BLOB    NOT NULL,
+			     ed25519       BLOB    NOT NULL,
+			     curve25519    BLOB    NOT NULL,
+			     ssk_signature BLOB    NOT NULL,
+			     display_name  TEXT    NOT NULL,
+			     created_at    INTEGER NOT NULL,
+			     last_seen     INTEGER NOT NULL,
+			     PRIMARY KEY (user_id, device_id)
+			 );
+
+			 CREATE TABLE IF NOT EXISTS prekeys (
+			     user_id        BLOB    NOT NULL,
+			     device_id      BLOB    NOT NULL,
+			     encryption_key BLOB    NOT NULL,
+			     fallback_key   BLOB    NOT NULL,
+			     last_upload_ms INTEGER NOT NULL,
+			     PRIMARY KEY (user_id, device_id)
+			 );
+
+			 CREATE TABLE IF NOT EXISTS one_time_keys (
+			     user_id   BLOB NOT NULL,
+			     device_id BLOB NOT NULL,
+			     key_id    TEXT NOT NULL,
+			     key       BLOB NOT NULL,
+			     PRIMARY KEY (user_id, device_id, key_id)
+			 );
+
+			 -- Frames for devices that were not connected. Retained until the
+			 -- recipient acknowledges (§12.2), which is why DMs need no
+			 -- sequencing: a mailbox is an unordered set.
+			 CREATE TABLE IF NOT EXISTS mailbox (
+			     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			     user_id     BLOB    NOT NULL,
+			     device_id   BLOB    NOT NULL,
+			     frame       BLOB    NOT NULL,
+			     received_at INTEGER NOT NULL
+			 );
+			 CREATE INDEX IF NOT EXISTS mailbox_recipient
+			     ON mailbox (user_id, device_id, id);",
+		)?;
+
+		Ok(Self { db })
+	}
+
+	// ---- key directory ----------------------------------------------------
+
+	/// Records a device and refreshes its owner's cross-signing keys.
+	///
+	/// The keys are replaced rather than kept from first sight: a user who
+	/// rotates a subkey (§5.5) would otherwise have stale keys served forever,
+	/// and every device enrolled under the new one would fail verification.
+	/// Safe because the caller has just verified them against the user id.
+	pub fn upsert_device(
+		&self,
+		user: &UserId,
+		keys: &CrossSigningPublic,
+		device: &Device,
+	) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO users (user_id, keys) VALUES (?1, ?2)
+			 ON CONFLICT(user_id) DO UPDATE SET keys = excluded.keys",
+			params![user.as_bytes().as_slice(), serde_json::to_string(keys)?],
+		)?;
+
+		self.db.execute(
+			"INSERT INTO devices
+			   (user_id, device_id, ed25519, curve25519, ssk_signature,
+			    display_name, created_at, last_seen)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+			 ON CONFLICT(user_id, device_id) DO UPDATE SET
+			   ed25519       = excluded.ed25519,
+			   curve25519    = excluded.curve25519,
+			   ssk_signature = excluded.ssk_signature,
+			   display_name  = excluded.display_name,
+			   last_seen     = excluded.last_seen",
+			params![
+				user.as_bytes().as_slice(),
+				device.device_id.as_bytes().as_slice(),
+				device.ed25519.as_slice(),
+				device.curve25519.as_slice(),
+				device.ssk_signature.as_slice(),
+				device.display_name,
+				device.created_at,
+				device.last_seen,
+			],
+		)?;
+
+		Ok(())
+	}
+
+	/// Fills in what only the key upload knows.
+	pub fn complete_device(
+		&self,
+		address: &DeviceAddress,
+		curve25519: &[u8; 32],
+		display_name: &str,
+		last_seen: u64,
+	) -> Result<()> {
+		self.db.execute(
+			"UPDATE devices SET curve25519 = ?3, display_name = ?4, last_seen = ?5
+			 WHERE user_id = ?1 AND device_id = ?2",
+			params![
+				address.user.as_bytes().as_slice(),
+				address.device.as_bytes().as_slice(),
+				curve25519.as_slice(),
+				display_name,
+				last_seen,
+			],
+		)?;
+		Ok(())
+	}
+
+	/// A user's keys and the devices that are complete enough to serve.
+	///
+	/// A device is recorded at handshake but its Olm identity key only arrives
+	/// with the upload that follows; serving the half-built entry would make a
+	/// peer's device-list check disagree with the prekey bundle.
+	pub fn device_list(&self, user: &UserId) -> Result<Option<(CrossSigningPublic, Vec<Device>)>> {
+		let keys: Option<String> = self
+			.db
+			.query_row(
+				"SELECT keys FROM users WHERE user_id = ?1",
+				params![user.as_bytes().as_slice()],
+				|r| r.get(0),
+			)
+			.optional()?;
+
+		let Some(keys) = keys else {
+			return Ok(None);
+		};
+
+		let mut stmt = self.db.prepare(
+			"SELECT device_id, ed25519, curve25519, ssk_signature, display_name,
+			        created_at, last_seen
+			 FROM devices
+			 WHERE user_id = ?1 AND curve25519 != zeroblob(32)",
+		)?;
+
+		let devices = stmt
+			.query_map(params![user.as_bytes().as_slice()], |r| {
+				Ok(Device {
+					device_id: DeviceId::from_bytes(blob16(r.get::<_, Vec<u8>>(0)?)),
+					ed25519: blob32(r.get::<_, Vec<u8>>(1)?),
+					curve25519: blob32(r.get::<_, Vec<u8>>(2)?),
+					ssk_signature: blob64(r.get::<_, Vec<u8>>(3)?),
+					display_name: r.get(4)?,
+					created_at: r.get(5)?,
+					last_seen: r.get(6)?,
+				})
+			})?
+			.collect::<Result<Vec<_>, _>>()?;
+
+		Ok(Some((serde_json::from_str(&keys)?, devices)))
+	}
+
+	// ---- prekeys ----------------------------------------------------------
+
+	/// Replaces a device's prekey material.
+	///
+	/// Refuses an upload that does not advance the clock, so a captured upload
+	/// cannot be replayed to resurrect one-time keys already handed out.
+	pub fn store_prekeys(
+		&mut self,
+		address: &DeviceAddress,
+		encryption_key: &[u8; 32],
+		fallback_key: &[u8; 32],
+		one_time_keys: &[[u8; 32]],
+		uploaded_at: u64,
+	) -> Result<bool> {
+		let previous: Option<u64> = self
+			.db
+			.query_row(
+				"SELECT last_upload_ms FROM prekeys WHERE user_id = ?1 AND device_id = ?2",
+				params![
+					address.user.as_bytes().as_slice(),
+					address.device.as_bytes().as_slice()
+				],
+				|r| r.get(0),
+			)
+			.optional()?;
+
+		if previous.is_some_and(|last| uploaded_at <= last) {
+			return Ok(false);
+		}
+
+		let tx = self.db.transaction()?;
+		tx.execute(
+			"INSERT INTO prekeys
+			   (user_id, device_id, encryption_key, fallback_key, last_upload_ms)
+			 VALUES (?1, ?2, ?3, ?4, ?5)
+			 ON CONFLICT(user_id, device_id) DO UPDATE SET
+			   encryption_key = excluded.encryption_key,
+			   fallback_key   = excluded.fallback_key,
+			   last_upload_ms = excluded.last_upload_ms",
+			params![
+				address.user.as_bytes().as_slice(),
+				address.device.as_bytes().as_slice(),
+				encryption_key.as_slice(),
+				fallback_key.as_slice(),
+				uploaded_at,
+			],
+		)?;
+
+		tx.execute(
+			"DELETE FROM one_time_keys WHERE user_id = ?1 AND device_id = ?2",
+			params![
+				address.user.as_bytes().as_slice(),
+				address.device.as_bytes().as_slice()
+			],
+		)?;
+
+		for (i, key) in one_time_keys.iter().enumerate() {
+			tx.execute(
+				"INSERT INTO one_time_keys (user_id, device_id, key_id, key)
+				 VALUES (?1, ?2, ?3, ?4)",
+				params![
+					address.user.as_bytes().as_slice(),
+					address.device.as_bytes().as_slice(),
+					format!("otk_{i}"),
+					key.as_slice(),
+				],
+			)?;
+		}
+
+		tx.commit()?;
+		Ok(true)
+	}
+
+	/// Hands out a prekey bundle, consuming a one-time key if asked to.
+	///
+	/// Past the caller's budget it serves the fallback key instead, so
+	/// exhaustion degrades rather than failing (§7 built invariant).
+	pub fn take_prekey_bundle(
+		&mut self,
+		address: &DeviceAddress,
+		consume: bool,
+	) -> Result<Option<PrekeyBundle>> {
+		let user = address.user.as_bytes().to_vec();
+		let device = address.device.as_bytes().to_vec();
+
+		let row: Option<(Vec<u8>, Vec<u8>, Vec<u8>)> = self
+			.db
+			.query_row(
+				"SELECT d.ed25519, p.encryption_key, p.fallback_key
+				 FROM prekeys p JOIN devices d
+				   ON d.user_id = p.user_id AND d.device_id = p.device_id
+				 WHERE p.user_id = ?1 AND p.device_id = ?2",
+				params![user, device],
+				|r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+			)
+			.optional()?;
+
+		let Some((signing_key, encryption_key, fallback_key)) = row else {
+			return Ok(None);
+		};
+
+		let mut one_time_key = blob32(fallback_key);
+		if consume {
+			let claimed: Option<(String, Vec<u8>)> = self
+				.db
+				.query_row(
+					"SELECT key_id, key FROM one_time_keys
+					 WHERE user_id = ?1 AND device_id = ?2 LIMIT 1",
+					params![user, device],
+					|r| Ok((r.get(0)?, r.get(1)?)),
+				)
+				.optional()?;
+
+			if let Some((key_id, key)) = claimed {
+				self.db.execute(
+					"DELETE FROM one_time_keys
+					 WHERE user_id = ?1 AND device_id = ?2 AND key_id = ?3",
+					params![user, device, key_id],
+				)?;
+				one_time_key = blob32(key);
+			}
+		}
+
+		let remaining: i64 = self.db.query_row(
+			"SELECT COUNT(*) FROM one_time_keys WHERE user_id = ?1 AND device_id = ?2",
+			params![user, device],
+			|r| r.get(0),
+		)?;
+
+		Ok(Some(PrekeyBundle {
+			signing_key: blob32(signing_key),
+			encryption_key: blob32(encryption_key),
+			one_time_key,
+			remaining: remaining.try_into().unwrap_or(u16::MAX),
+		}))
+	}
+
+	// ---- mailbox ----------------------------------------------------------
+
+	/// Queues a frame for a device that was not connected.
+	pub fn enqueue(&self, recipient: &DeviceAddress, frame: &[u8], received_at: u64) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO mailbox (user_id, device_id, frame, received_at)
+			 VALUES (?1, ?2, ?3, ?4)",
+			params![
+				recipient.user.as_bytes().as_slice(),
+				recipient.device.as_bytes().as_slice(),
+				frame,
+				received_at,
+			],
+		)?;
+		Ok(())
+	}
+
+	/// Everything waiting for a device, oldest first.
+	pub fn pending(&self, recipient: &DeviceAddress) -> Result<Vec<(i64, Vec<u8>)>> {
+		let mut stmt = self.db.prepare(
+			"SELECT id, frame FROM mailbox
+			 WHERE user_id = ?1 AND device_id = ?2 ORDER BY id",
+		)?;
+
+		Ok(stmt
+			.query_map(
+				params![
+					recipient.user.as_bytes().as_slice(),
+					recipient.device.as_bytes().as_slice()
+				],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)?
+			.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	/// Drops delivered frames. Called only once the recipient has them, so an
+	/// interrupted delivery is retried rather than lost.
+	pub fn acknowledge(&self, ids: &[i64]) -> Result<()> {
+		for id in ids {
+			self.db
+				.execute("DELETE FROM mailbox WHERE id = ?1", params![id])?;
+		}
+		Ok(())
+	}
+
+	#[cfg(test)]
+	pub fn pending_count(&self, recipient: &DeviceAddress) -> Result<i64> {
+		Ok(self.db.query_row(
+			"SELECT COUNT(*) FROM mailbox WHERE user_id = ?1 AND device_id = ?2",
+			params![
+				recipient.user.as_bytes().as_slice(),
+				recipient.device.as_bytes().as_slice()
+			],
+			|r| r.get(0),
+		)?)
+	}
+}
+
+fn blob16(v: Vec<u8>) -> [u8; 16] {
+	let mut out = [0u8; 16];
+	out.copy_from_slice(&v[..16.min(v.len())]);
+	out
+}
+fn blob32(v: Vec<u8>) -> [u8; 32] {
+	let mut out = [0u8; 32];
+	out[..32.min(v.len())].copy_from_slice(&v[..32.min(v.len())]);
+	out
+}
+fn blob64(v: Vec<u8>) -> [u8; 64] {
+	let mut out = [0u8; 64];
+	out[..64.min(v.len())].copy_from_slice(&v[..64.min(v.len())]);
+	out
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use veil_protocol::crosssign::CrossSigningSecrets;
+
+	fn fixture() -> (Store, UserId, CrossSigningPublic, Device) {
+		let store = Store::open(":memory:").unwrap();
+		let secrets = CrossSigningSecrets::new();
+		let user = secrets.user_id();
+		let device_id = DeviceId::generate();
+		let ed25519 = [3u8; 32];
+
+		let device = Device {
+			device_id,
+			ed25519,
+			curve25519: [4u8; 32],
+			ssk_signature: secrets.sign_device(&device_id, &ed25519),
+			display_name: "laptop".into(),
+			created_at: 1,
+			last_seen: 1,
+		};
+
+		(store, user, secrets.public(), device)
+	}
+
+	#[test]
+	fn a_device_list_survives_and_verifies() {
+		let (store, user, keys, device) = fixture();
+		store.upsert_device(&user, &keys, &device).unwrap();
+
+		let (stored_keys, devices) = store.device_list(&user).unwrap().unwrap();
+		assert_eq!(devices.len(), 1);
+
+		// The point of persisting it: what comes back still chains to the user.
+		assert!(
+			stored_keys
+				.verify_device_list(&user, &devices)
+				.unwrap()
+				.len() == 1
+		);
+	}
+
+	/// A device is recorded at handshake with no Olm key; serving it then would
+	/// make a peer's checks disagree with the prekey bundle.
+	#[test]
+	fn incomplete_devices_are_withheld_until_completed() {
+		let (store, user, keys, mut device) = fixture();
+		device.curve25519 = [0; 32];
+		store.upsert_device(&user, &keys, &device).unwrap();
+
+		assert!(store.device_list(&user).unwrap().unwrap().1.is_empty());
+
+		store
+			.complete_device(
+				&DeviceAddress::new(user, device.device_id),
+				&[9; 32],
+				"laptop",
+				2,
+			)
+			.unwrap();
+		assert_eq!(store.device_list(&user).unwrap().unwrap().1.len(), 1);
+	}
+
+	#[test]
+	fn one_time_keys_are_consumed_then_degrade_to_the_fallback() {
+		let (mut store, user, keys, device) = fixture();
+		store.upsert_device(&user, &keys, &device).unwrap();
+		let address = DeviceAddress::new(user, device.device_id);
+
+		store
+			.store_prekeys(&address, &[4; 32], &[99; 32], &[[1; 32], [2; 32]], 10)
+			.unwrap();
+
+		let first = store.take_prekey_bundle(&address, true).unwrap().unwrap();
+		assert_eq!(first.remaining, 1);
+		let second = store.take_prekey_bundle(&address, true).unwrap().unwrap();
+		assert_eq!(second.remaining, 0);
+		assert_ne!(first.one_time_key, second.one_time_key);
+
+		// Exhausted: serve the fallback rather than failing.
+		let third = store.take_prekey_bundle(&address, true).unwrap().unwrap();
+		assert_eq!(third.one_time_key, [99; 32]);
+
+		// Over budget: fallback without consuming.
+		let fourth = store.take_prekey_bundle(&address, false).unwrap().unwrap();
+		assert_eq!(fourth.one_time_key, [99; 32]);
+	}
+
+	/// A captured upload replayed later must not resurrect consumed keys.
+	#[test]
+	fn a_stale_prekey_upload_is_refused() {
+		let (mut store, user, keys, device) = fixture();
+		store.upsert_device(&user, &keys, &device).unwrap();
+		let address = DeviceAddress::new(user, device.device_id);
+
+		assert!(
+			store
+				.store_prekeys(&address, &[4; 32], &[9; 32], &[[1; 32]], 100)
+				.unwrap()
+		);
+		assert!(
+			!store
+				.store_prekeys(&address, &[4; 32], &[9; 32], &[[1; 32], [2; 32]], 50)
+				.unwrap(),
+			"an older upload must not be accepted"
+		);
+		assert!(
+			!store
+				.store_prekeys(&address, &[4; 32], &[9; 32], &[[1; 32]], 100)
+				.unwrap(),
+			"the same upload replayed must not be accepted"
+		);
+	}
+
+	/// The gap this store exists to close: a message for someone offline used
+	/// to be dropped.
+	#[test]
+	fn mail_waits_for_a_device_that_was_not_connected() {
+		let (store, user, _, device) = fixture();
+		let address = DeviceAddress::new(user, device.device_id);
+
+		store.enqueue(&address, b"first", 1).unwrap();
+		store.enqueue(&address, b"second", 2).unwrap();
+		assert_eq!(store.pending_count(&address).unwrap(), 2);
+
+		let waiting = store.pending(&address).unwrap();
+		assert_eq!(waiting.len(), 2);
+		assert_eq!(waiting[0].1, b"first", "oldest first");
+
+		// Acknowledged only after delivery, so an interrupted flush retries.
+		store.acknowledge(&[waiting[0].0]).unwrap();
+		assert_eq!(store.pending_count(&address).unwrap(), 1);
+		assert_eq!(store.pending(&address).unwrap()[0].1, b"second");
+	}
+
+	#[test]
+	fn mailboxes_do_not_leak_between_devices() {
+		let (store, user, _, device) = fixture();
+		let mine = DeviceAddress::new(user, device.device_id);
+		let other = DeviceAddress::new(user, DeviceId::generate());
+
+		store.enqueue(&mine, b"for me", 1).unwrap();
+		assert_eq!(store.pending_count(&other).unwrap(), 0);
+	}
+}

@@ -18,7 +18,13 @@ pub async fn cli(
 		print!("{prompt}");
 		io::stdout().flush()?;
 		let mut input = String::new();
-		io::stdin().read_line(&mut input)?;
+		// Ok(0) is EOF, not an error, so `?` does not catch it. Without this the
+		// loop spins at full tilt printing the command list forever — which is
+		// what a client does the moment its stdin closes.
+		if io::stdin().read_line(&mut input)? == 0 {
+			println!("\nInput closed. Quitting...");
+			return Ok(());
+		}
 
 		let mut state = state.lock().await;
 		match input.to_lowercase().trim() {
