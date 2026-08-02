@@ -286,6 +286,60 @@ pub enum ProtocolMessage {
 	/// that dies mid-flush gets the same mail again rather than losing it.
 	Acknowledge(Vec<u64>),
 	RemainingOneTimeKeys(u16),
+	/// Server -> server, echoing the challenge to open a delivery connection
+	/// (§3.3).
+	///
+	/// Deliberately thinner than [`Authenticate`]: a server has no user, no
+	/// device and no cross-signing chain, and its identity is simply the key
+	/// that signed the envelope. There is nothing to assert, so there is nothing
+	/// extra to verify.
+	ServerAuthenticate(ServerAuthenticate),
+	/// Server -> server: a message for one of your users (§3.4).
+	Deposit(Deposit),
+	/// Receiver -> sender: what became of a deposit.
+	///
+	/// Needed because the sending server has to know whether to stop retrying.
+	/// Silence cannot distinguish "delivered" from "dropped on the floor", and a
+	/// sender that guesses either way is wrong half the time — it drops mail it
+	/// should have retried, or retries mail the recipient already has.
+	DepositResult(DepositResult),
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
+pub struct ServerAuthenticate {
+	pub challenge: [u8; 32],
+	pub versions: VersionRange,
+	/// The peer's range as this server received it — the same transcript
+	/// binding as the client handshake (§3.6).
+	pub server_versions_seen: VersionRange,
+}
+
+/// One message handed to the recipient's home server.
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Deposit {
+	/// The **sender's own envelope, byte for byte**.
+	///
+	/// Not re-serialised, and not re-signed by the forwarding server: the
+	/// recipient verifies Alice's signature over exactly the bytes Alice signed
+	/// (invariant 2). The forwarding server is trusted to carry it and nothing
+	/// else — it cannot alter the message without invalidating a signature it
+	/// cannot produce.
+	pub envelope: Vec<u8>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(attr(derive(Debug)))]
+pub enum DepositResult {
+	/// In the recipient's mailbox. The sender may stop.
+	Accepted,
+	/// Permanently refused — the recipient is not a user of this server, the
+	/// envelope did not verify, or it was a replay. Retrying cannot help, so
+	/// the sender must drop it rather than looping forever.
+	Refused(String),
+	/// Temporary: over a limit, or the store is unavailable. Retry later.
+	TryAgain(String),
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone)]
@@ -348,6 +402,22 @@ pub struct EncryptedMessage {
 	pub sender: DeviceAddress,
 	pub recipient: DeviceAddress,
 	pub sender_x25519: [u8; 32],
+
+	/// Where the sender believes the recipient's mail should go (§3.4).
+	///
+	/// Empty means "this server" — the common case, and the only one before
+	/// server-to-server delivery existed. Otherwise the sending server hands the
+	/// envelope to this host.
+	///
+	/// **Inside the signed envelope on purpose.** A home server that could edit
+	/// this could divert Alice's mail to a host of its choosing; here it can only
+	/// deliver it or fail to. It cannot be a blind trust of the client either —
+	/// the sending server still has to complete a Veil handshake with whatever is
+	/// named, which is what stops it becoming an open proxy (invariant 15).
+	///
+	/// Identity carries no hostname (§5.3), so this is a routing hint and never
+	/// an identity claim: the recipient is `recipient`, whichever host holds it.
+	pub recipient_host: String,
 
 	/// Distinguishes two otherwise identical messages, and is reused on retry so
 	/// a resend lands on the same id and dedups (§10).

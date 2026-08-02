@@ -377,6 +377,7 @@ async fn a_message_is_not_delivered_to_the_wrong_device() {
 		.send(&ProtocolMessage::EncryptedMessage(EncryptedMessage {
 			sender: alice.address(),
 			recipient: phantom,
+			recipient_host: String::new(),
 			sender_x25519: [0; 32],
 			nonce: random_nonce(),
 			origin_ts: 0,

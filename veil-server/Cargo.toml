@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 veil-protocol = { path = "../veil-protocol" }
 rkyv = { version = "0.8", features = ["bytecheck", "alloc"] }
 rkyv_derive = "0.8"
@@ -22,4 +23,3 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 vodozemac = "0.9"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }

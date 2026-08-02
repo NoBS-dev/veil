@@ -22,6 +22,7 @@ use veil_protocol::{
 	crosssign::CrossSigningPublic,
 	identity::{Device, DeviceAddress, DeviceId, UserId},
 };
+use vodozemac::olm::Account;
 
 pub struct Store {
 	db: Connection,
@@ -87,7 +88,33 @@ impl Store {
 			     received_at INTEGER NOT NULL
 			 );
 			 CREATE INDEX IF NOT EXISTS mailbox_recipient
-			     ON mailbox (user_id, device_id, id);",
+			     ON mailbox (user_id, device_id, id);
+
+			 -- Envelopes bound for another server (§3.4 step 2). The sending
+			 -- server owns delivery, so this has to outlive the sender's
+			 -- connection *and* the process: 'her server forwards it, queueing
+			 -- and retrying if that server is down' is a promise the client
+			 -- cannot keep on its own, since it may never come back online.
+			 CREATE TABLE IF NOT EXISTS outbound (
+			     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+			     host         TEXT    NOT NULL,
+			     frame        BLOB    NOT NULL,
+			     queued_at    INTEGER NOT NULL,
+			     attempts     INTEGER NOT NULL DEFAULT 0,
+			     next_try_at  INTEGER NOT NULL
+			 );
+			 CREATE INDEX IF NOT EXISTS outbound_due ON outbound (next_try_at);
+
+			 -- The server's own Olm account, so its identity key survives a
+			 -- restart. Clients pin that key on first connect and refuse a
+			 -- changed one (invariant 6), so regenerating it at every start —
+			 -- which is what happened before this table — locked out every
+			 -- client the server had ever spoken to. Another server recognises
+			 -- us by the same key (§3.4), so it has to be stable there too.
+			 CREATE TABLE IF NOT EXISTS server_identity (
+			     id      INTEGER PRIMARY KEY CHECK (id = 1),
+			     pickle  TEXT NOT NULL
+			 );",
 		)?;
 
 		Ok(Self { db })
@@ -394,6 +421,107 @@ impl Store {
 			)?;
 		}
 		Ok(dropped)
+	}
+
+	// ---- the server's own identity ----------------------------------------
+
+	/// Loads the server's account, generating one on first run.
+	///
+	/// Stored unencrypted alongside the rest of the database, which is the
+	/// honest position: the mailbox next to it holds ciphertext the key cannot
+	/// open, and there is nowhere better to put it on a box the operator
+	/// already controls. Protect the database file.
+	pub fn load_or_create_account(&self) -> Result<Account> {
+		let existing: Option<String> = self
+			.db
+			.query_row("SELECT pickle FROM server_identity WHERE id = 1", [], |r| {
+				r.get(0)
+			})
+			.optional()?;
+
+		if let Some(pickle) = existing {
+			return Ok(Account::from_pickle(serde_json::from_str(&pickle)?));
+		}
+
+		let account = Account::new();
+		self.db.execute(
+			"INSERT INTO server_identity (id, pickle) VALUES (1, ?1)",
+			params![serde_json::to_string(&account.pickle())?],
+		)?;
+		Ok(account)
+	}
+
+	// ---- outbound to other servers (§3.4) ---------------------------------
+
+	/// Is this user one of ours?
+	///
+	/// The question S2S turns on, in both directions: whether to deliver locally
+	/// or forward, and whether an incoming deposit is ours to accept. A user is
+	/// local once they have published a device here, which happens during their
+	/// first handshake.
+	///
+	/// This is why remote device lists must never be cached in `devices` — doing
+	/// so would silently make every cached stranger look like a local user, and
+	/// deposits for them would be accepted into mailboxes nobody reads.
+	pub fn is_local_user(&self, user: &UserId) -> Result<bool> {
+		Ok(self.db.query_row(
+			"SELECT EXISTS(SELECT 1 FROM devices WHERE user_id = ?1)",
+			params![user.as_bytes().as_slice()],
+			|r| r.get::<_, i64>(0),
+		)? == 1)
+	}
+
+	/// Queues an envelope for delivery to another server.
+	pub fn enqueue_outbound(&self, host: &str, frame: &[u8], now: u64) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO outbound (host, frame, queued_at, next_try_at)
+			 VALUES (?1, ?2, ?3, ?3)",
+			params![host, frame, now],
+		)?;
+		Ok(())
+	}
+
+	/// Everything due for a retry, oldest first.
+	pub fn outbound_due(&self, now: u64, limit: usize) -> Result<Vec<(i64, String, Vec<u8>, i64)>> {
+		let mut stmt = self.db.prepare(
+			"SELECT id, host, frame, attempts FROM outbound
+			 WHERE next_try_at <= ?1 ORDER BY id LIMIT ?2",
+		)?;
+
+		Ok(stmt
+			.query_map(params![now, limit as i64], |r| {
+				Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+			})?
+			.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	pub fn drop_outbound(&self, id: i64) -> Result<()> {
+		self.db
+			.execute("DELETE FROM outbound WHERE id = ?1", params![id])?;
+		Ok(())
+	}
+
+	/// Backs an entry off after a failed attempt.
+	///
+	/// Exponential, capped. Uncapped backoff would eventually schedule a retry
+	/// past any plausible outage and strand the mail; a fixed short interval
+	/// would hammer a server that is down for a day.
+	pub fn defer_outbound(&self, id: i64, attempts: i64, now: u64) -> Result<()> {
+		const CAP_MS: u64 = 60 * 60 * 1000;
+		let delay = (1000u64 << attempts.min(12)).min(CAP_MS);
+
+		self.db.execute(
+			"UPDATE outbound SET attempts = ?2, next_try_at = ?3 WHERE id = ?1",
+			params![id, attempts + 1, now + delay],
+		)?;
+		Ok(())
+	}
+
+	#[allow(dead_code)] // exposed for operators and tests, not the running server
+	pub fn outbound_count(&self) -> Result<i64> {
+		Ok(self
+			.db
+			.query_row("SELECT COUNT(*) FROM outbound", [], |r| r.get(0))?)
 	}
 
 	// ---- backup and restore (§12.3, §12.4) --------------------------------

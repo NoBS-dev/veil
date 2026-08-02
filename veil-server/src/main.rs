@@ -1,3 +1,4 @@
+mod delivery;
 mod store;
 
 use anyhow::Result;
@@ -44,6 +45,9 @@ const REQUESTS_PER_IP_PER_WINDOW: u32 = 30;
 const RATE_WINDOW_MS: u64 = 60_000;
 /// Tunnels one user may open per window (§3.2).
 const TUNNELS_PER_USER_PER_WINDOW: u32 = 20;
+/// Deposits one server may make per window (§3.4). Generous — a busy server
+/// legitimately carries mail for many users — but bounded.
+const DEPOSITS_PER_SERVER_PER_WINDOW: u32 = 600;
 /// Largest frame the relay will forward. Bounds memory and stops a client
 /// using the tunnel as an amplifier.
 const MAX_TUNNEL_FRAME: usize = 1 << 20;
@@ -63,6 +67,16 @@ struct ServerState {
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
 	otk_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
 	tunnel_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
+	/// Deposits one *server* may make per window (§3.4).
+	///
+	/// Keyed on the peer's identity key rather than its IP: an operator running
+	/// several addresses is one sender, and this is the limit that makes
+	/// server-to-server deposits spam-resistant where client-to-mailbox
+	/// deposits would not be.
+	deposit_limiter: Arc<Mutex<RateLimiter<[u8; 32]>>>,
+	/// Hosts that have proved they speak Veil, so the proof is not repeated on
+	/// every directory lookup (§3.4).
+	verified_hosts: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 /// Frames queued for one connection.
@@ -199,11 +213,16 @@ async fn main() -> Result<()> {
 		);
 	}
 
-	// Keys must be generated because clients won't accept anything that isn't signed.
+	let store = store::Store::open(&db_path)?;
+	// Loaded, not generated. Clients pin this key and refuse a changed one
+	// (invariant 6), so a fresh account at every start locked out everyone who
+	// had ever connected — and another server recognises us by it too (§3.4).
+	let server_account = store.load_or_create_account()?;
+
 	let state = ServerState {
-		store: Arc::new(Mutex::new(store::Store::open(&db_path)?)),
+		store: Arc::new(Mutex::new(store)),
 		clock: Arc::new(RwLock::new(clock)),
-		server_account: Arc::new(Mutex::new(Account::new())),
+		server_account: Arc::new(Mutex::new(server_account)),
 		replay_guard: Arc::new(Mutex::new(ReplayGuard::default())),
 		ip_limiter: Arc::new(Mutex::new(RateLimiter::new(
 			REQUESTS_PER_IP_PER_WINDOW,
@@ -217,7 +236,14 @@ async fn main() -> Result<()> {
 			TUNNELS_PER_USER_PER_WINDOW,
 			RATE_WINDOW_MS,
 		))),
+		deposit_limiter: Arc::new(Mutex::new(RateLimiter::new(
+			DEPOSITS_PER_SERVER_PER_WINDOW,
+			RATE_WINDOW_MS,
+		))),
+		verified_hosts: Arc::new(RwLock::new(std::collections::HashSet::new())),
 	};
+
+	delivery::spawn_retry_loop(state.clone());
 
 	println!(
 		"My public key: {}",
@@ -256,6 +282,15 @@ async fn main() -> Result<()> {
 		)
 		.route("/users/{user}/devices", routing::get(get_device_list))
 		.route("/relay", routing::any(relay))
+		.route("/s2s", routing::any(deposit_socket))
+		.route(
+			"/remote/{host}/users/{user}/devices",
+			routing::get(remote_device_list),
+		)
+		.route(
+			"/remote/{host}/devices/{user}/{device}/otk",
+			routing::get(remote_prekey_bundle),
+		)
 		.with_state(state);
 
 	let listener = TcpListener::bind(address).await?;
@@ -276,6 +311,42 @@ async fn main() -> Result<()> {
 
 async fn socket(socket: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
 	socket.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+/// Looks a stranger up on their own home server, so the client does not have to
+/// (§3.4). The client still verifies what comes back against cross-signing, so
+/// neither server is trusted for the contents.
+async fn remote_device_list(
+	State(state): State<ServerState>,
+	Path((host, user)): Path<(String, String)>,
+) -> Response {
+	proxy(&state, &host, &format!("/users/{user}/devices")).await
+}
+
+async fn remote_prekey_bundle(
+	State(state): State<ServerState>,
+	Path((host, user, device)): Path<(String, String, String)>,
+) -> Response {
+	proxy(&state, &host, &format!("/devices/{user}/{device}/otk")).await
+}
+
+async fn proxy(state: &ServerState, host: &str, path: &str) -> Response {
+	match delivery::fetch_remote(state, host, path).await {
+		Ok((status, body)) => (
+			StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+			body,
+		)
+			.into_response(),
+		Err(e) => {
+			eprintln!("Remote lookup of {host}{path} failed: {e:#}");
+			(StatusCode::BAD_GATEWAY, format!("{e:#}")).into_response()
+		}
+	}
+}
+
+/// Where another server hands us mail for one of our users (§3.4).
+async fn deposit_socket(socket: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
+	socket.on_upgrade(|socket| delivery::handle_deposit_socket(socket, state))
 }
 
 /// Makes the peer prove it holds the private key for the identity it claims,
@@ -460,6 +531,33 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					continue;
 				}
 
+				// Not ours to deliver: hand it to the server that holds the
+				// recipient's mailbox (§3.4 step 2). The frame forwarded is the
+				// client's own envelope, so the receiving server verifies the
+				// sender's signature rather than ours.
+				//
+				// The named host is checked, not obeyed — `deliver` completes a
+				// Veil handshake before sending anything, so a client naming an
+				// arbitrary address cannot use its home server as a proxy
+				// (invariant 15).
+				if !msg.recipient_host.is_empty() {
+					let local = state
+						.store
+						.lock()
+						.await
+						.is_local_user(&msg.recipient.user)
+						.unwrap_or(false);
+
+					if !local {
+						eprintln!(
+							"Forwarding mail for {} to {}",
+							msg.recipient, msg.recipient_host
+						);
+						delivery::send_onward(&state, &msg.recipient_host, &bytes).await;
+						continue;
+					}
+				}
+
 				match route_to(&msg.recipient, bytes.to_vec()).await {
 					Ok(()) => eprintln!("Message routed from {address} to {}", msg.recipient),
 					Err(e) => {
@@ -517,6 +615,15 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			}
 			ProtocolMessage::Challenge(_) | ProtocolMessage::Authenticate(_) => {
 				eprintln!("Received a handshake message outside the handshake. Ignoring.")
+			}
+			// Server-to-server frames never arrive on a client connection: they
+			// have their own endpoint with its own handshake (§3.4). A client
+			// reaching this is trying to deposit into a mailbox directly, which
+			// is the unrate-limitable spam vector §3.4 exists to close.
+			ProtocolMessage::ServerAuthenticate(_)
+			| ProtocolMessage::Deposit(_)
+			| ProtocolMessage::DepositResult(_) => {
+				eprintln!("Discarding a server-to-server frame from client {address}")
 			}
 			ProtocolMessage::RemainingOneTimeKeys(notification) => eprintln!(
 				"Received a remaining OTKs notification. Should be impossible. Client is either broken or malicious.\nNotification: {notification:?}"

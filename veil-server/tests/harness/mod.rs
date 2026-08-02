@@ -48,7 +48,25 @@ impl Server {
 	/// Starts on a fresh port, optionally reusing an existing database so a
 	/// test can prove state survived a restart.
 	pub async fn start_with_db(existing: Option<String>) -> Self {
-		let port = free_port().await;
+		Self::start_inner(None, existing).await
+	}
+
+	/// Starts on a *named* address, so a server can come back where another
+	/// server has already queued mail for it (§3.4).
+	pub async fn start_at(address: &str, existing: Option<String>) -> Self {
+		let port = address
+			.rsplit(':')
+			.next()
+			.and_then(|p| p.parse().ok())
+			.expect("an address of the form host:port");
+		Self::start_inner(Some(port), existing).await
+	}
+
+	async fn start_inner(fixed_port: Option<u16>, existing: Option<String>) -> Self {
+		let port = match fixed_port {
+			Some(port) => port,
+			None => free_port().await,
+		};
 		let dir = std::env::temp_dir().join(format!("veil-test-{}-{port}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let db = existing.unwrap_or_else(|| dir.join("store.db").to_string_lossy().into_owned());
@@ -94,6 +112,11 @@ impl Server {
 
 	pub fn ws_url(&self) -> String {
 		format!("ws://127.0.0.1:{}", self.port)
+	}
+
+	/// Bare `host:port`, which is how another server is named (§3.4).
+	pub fn address(&self) -> String {
+		format!("127.0.0.1:{}", self.port)
 	}
 
 	pub fn http_url(&self) -> String {
@@ -227,7 +250,7 @@ impl TestClient {
 		Ok(())
 	}
 
-	/// Opens a session to a peer and sends one message.
+	/// Opens a session to a peer on this server and sends one message.
 	pub async fn send_to(
 		&mut self,
 		recipient: DeviceAddress,
@@ -235,24 +258,21 @@ impl TestClient {
 		otk: [u8; 32],
 		text: &str,
 	) -> anyhow::Result<()> {
-		let mut session = self.account.create_outbound_session(
-			SessionConfig::version_2(),
-			peer_x25519.into(),
-			otk.into(),
-		);
-		let (message_type, ciphertext) = session.encrypt(text).to_parts();
+		self.send_to_host(recipient, "", peer_x25519, otk, text)
+			.await
+	}
 
-		self.send(&ProtocolMessage::EncryptedMessage(EncryptedMessage {
-			sender: self.address(),
-			recipient,
-			sender_x25519: self.account.curve25519_key().to_bytes(),
-			nonce: random_nonce(),
-			origin_ts: now_ms(),
-			seen_head: MessageId::ROOT,
-			message_type,
-			message: ciphertext,
-		}))
-		.await
+	/// As above, but for a recipient whose mailbox is on another server (§3.4).
+	pub async fn send_to_host(
+		&mut self,
+		recipient: DeviceAddress,
+		host: &str,
+		peer_x25519: [u8; 32],
+		otk: [u8; 32],
+		text: &str,
+	) -> anyhow::Result<()> {
+		let message = self.compose_for(recipient, host, peer_x25519, otk, text)?;
+		self.send(&message).await
 	}
 
 	/// Decrypts an inbound prekey message.
@@ -295,6 +315,17 @@ impl TestClient {
 		otk: [u8; 32],
 		text: &str,
 	) -> anyhow::Result<ProtocolMessage> {
+		self.compose_for(recipient, "", peer_x25519, otk, text)
+	}
+
+	pub fn compose_for(
+		&mut self,
+		recipient: DeviceAddress,
+		host: &str,
+		peer_x25519: [u8; 32],
+		otk: [u8; 32],
+		text: &str,
+	) -> anyhow::Result<ProtocolMessage> {
 		let mut session = self.account.create_outbound_session(
 			SessionConfig::version_2(),
 			peer_x25519.into(),
@@ -305,6 +336,7 @@ impl TestClient {
 		Ok(ProtocolMessage::EncryptedMessage(EncryptedMessage {
 			sender: self.address(),
 			recipient,
+			recipient_host: host.to_owned(),
 			sender_x25519: self.account.curve25519_key().to_bytes(),
 			nonce: random_nonce(),
 			origin_ts: now_ms(),
@@ -563,4 +595,31 @@ pub async fn prekey_bundle(
 		)
 	};
 	Ok((next()?, next()?, next()?))
+}
+
+/// A signed envelope from a sender who is not connected to anything.
+///
+/// Enough to exercise the deposit path, which never looks inside the
+/// ciphertext — only the recipient can, and that is the point. Store-and-forward
+/// means the sender need not be online anywhere for this to be delivered.
+pub fn compose_offline(recipient: DeviceAddress, text: &str) -> Vec<u8> {
+	let sender = CrossSigningSecrets::new();
+	let account = Account::new();
+
+	Envelope::seal(
+		&ProtocolMessage::EncryptedMessage(EncryptedMessage {
+			sender: DeviceAddress::new(sender.user_id(), DeviceId::generate()),
+			recipient,
+			recipient_host: String::new(),
+			sender_x25519: account.curve25519_key().to_bytes(),
+			nonce: random_nonce(),
+			origin_ts: now_ms(),
+			seen_head: MessageId::ROOT,
+			message_type: 0,
+			message: text.as_bytes().to_vec(),
+		}),
+		&account,
+	)
+	.unwrap()
+	.to_vec()
 }

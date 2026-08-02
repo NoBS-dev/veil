@@ -20,33 +20,74 @@ use vodozemac::olm::SessionConfig;
 /// device-to-device (§5.2). Sending to a *user* means fanning out over their
 /// device list, which needs cross-signing (§5.4) before it can be trusted, so
 /// for now the target is named explicitly.
-fn parse_address(input: &str) -> Result<DeviceAddress> {
-	let (user, device) = input
-		.trim()
-		.split_once('/')
-		.ok_or_else(|| anyhow::anyhow!("expected an address of the form <user-id>/<device-id>"))?;
+/// An address, and optionally the host that holds the recipient's mailbox.
+///
+/// Written `<user-id>/<device-id>` for someone on our own server, or
+/// `<user-id>/<device-id>@host:port` for someone elsewhere (§3.4). The host is
+/// **not** part of the identity — identity is self-certifying and carries no
+/// hostname (§5.3), which is what makes people portable between home servers.
+/// It is a routing hint, and the wrong one costs a failed delivery rather than
+/// a misdirected trust decision.
+struct Target {
+	address: DeviceAddress,
+	/// Empty for our own server.
+	host: String,
+}
 
-	Ok(DeviceAddress::new(
-		UserId::parse(user)?,
-		DeviceId::from_bytes(
-			data_encoding::BASE32_NOPAD
-				.decode(device.trim().to_ascii_uppercase().as_bytes())?
-				.as_slice()
-				.try_into()
-				.map_err(|_| anyhow::anyhow!("device id must be 16 bytes"))?,
+fn parse_address(input: &str) -> Result<Target> {
+	let input = input.trim();
+	let (address, host) = match input.split_once('@') {
+		Some((address, host)) => (address, host.trim().to_owned()),
+		None => (input, String::new()),
+	};
+
+	let (user, device) = address.trim().split_once('/').ok_or_else(|| {
+		anyhow::anyhow!("expected an address of the form <user-id>/<device-id>[@host]")
+	})?;
+
+	Ok(Target {
+		address: DeviceAddress::new(
+			UserId::parse(user)?,
+			DeviceId::from_bytes(
+				data_encoding::BASE32_NOPAD
+					.decode(device.trim().to_ascii_uppercase().as_bytes())?
+					.as_slice()
+					.try_into()
+					.map_err(|_| anyhow::anyhow!("device id must be 16 bytes"))?,
+			),
 		),
-	))
+		host,
+	})
+}
+
+/// Where to look a device up.
+///
+/// For a stranger this goes through **our own** server's `/remote` proxy rather
+/// than straight to theirs (§3.4). Their host would otherwise learn our IP the
+/// moment we looked them up, which is the leak the relay exists to prevent —
+/// and it buys nothing, since what comes back is verified against their
+/// cross-signing keys either way.
+fn directory_base(url: &str, host: &str) -> String {
+	if host.is_empty() {
+		url.to_owned()
+	} else {
+		format!("{url}/remote/{host}")
+	}
 }
 
 pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
-	print!("Enter target device (<user-id>/<device-id>): ");
+	print!("Enter target device (<user-id>/<device-id>[@host]): ");
 	io::stdout().flush()?;
 
-	let target = {
+	let Target {
+		address: target,
+		host: recipient_host,
+	} = {
 		let mut input = String::new();
 		io::stdin().read_line(&mut input)?;
 		parse_address(&input)?
 	};
+	let directory = directory_base(url, &recipient_host);
 
 	if !state.peers.contains_key(&target) {
 		// The prekey bundle comes from the host, which is untrusted for identity
@@ -54,7 +95,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 		// its *own* keys and sit in the middle of the session — so the device is
 		// checked against the peer's cross-signing chain first, and the bundle
 		// must then match what that chain vouches for.
-		let (_, devices) = fetch_device_list(&target.user, url).await?;
+		let (_, devices) = fetch_device_list(&target.user, &directory).await?;
 
 		let device = devices
 			.iter()
@@ -67,7 +108,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 				)
 			})?;
 
-		let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, url).await?;
+		let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, &directory).await?;
 
 		if their_ed25519 != device.ed25519 {
 			anyhow::bail!(
@@ -141,6 +182,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 			sender: state.address(),
 			recipient: target,
 			sender_x25519: state.account.curve25519_key().to_bytes(),
+			recipient_host: recipient_host.clone(),
 			nonce: random_nonce(),
 			origin_ts: veil_protocol::now_ms()?,
 			// Tells the peer where we were in the conversation. They can spot a

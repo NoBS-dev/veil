@@ -323,3 +323,46 @@ async fn one_time_keys_are_consumed_and_then_degrade() {
 
 	server.stop().await;
 }
+
+/// Invariant 6 from the other side: clients pin the server's identity key and
+/// refuse a changed one, so that key has to survive a restart.
+///
+/// It did not. The server called `Account::new()` at every start, which meant a
+/// restart silently locked out every client that had ever connected — and the
+/// failure would have surfaced as "your server may have been replaced", which
+/// is precisely the warning you do not want to cry wolf with. Another server
+/// recognises us by the same key (§3.4), so it has to be stable there too.
+#[tokio::test]
+async fn the_server_keeps_its_identity_across_a_restart() {
+	let server = Server::start().await;
+	let db = server.db.clone();
+	let address = server.address();
+
+	let before = server_identity(&server.ws_url()).await;
+	server.stop_keeping_data().await;
+	tokio::time::sleep(BEAT).await;
+
+	let restarted = Server::start_at(&address, Some(db.clone())).await;
+	let after = server_identity(&restarted.ws_url()).await;
+
+	assert_eq!(
+		before, after,
+		"a restarted server must present the same identity key, or every client \
+		 that pinned it is locked out"
+	);
+
+	restarted.stop_keeping_data().await;
+	harness::Server::discard(&db);
+}
+
+/// The key that signs the opening challenge — which is what a client pins.
+async fn server_identity(ws_url: &str) -> [u8; 32] {
+	use futures::StreamExt;
+
+	let (mut socket, _) = tokio_tungstenite::connect_async(ws_url).await.unwrap();
+	let first = socket.next().await.expect("an opening frame").unwrap();
+	let tokio_tungstenite::tungstenite::Message::Binary(bytes) = first else {
+		panic!("server did not open with a binary frame");
+	};
+	veil_protocol::open_envelope(&bytes).unwrap().sender
+}
