@@ -71,7 +71,7 @@ cargo run -p veil-protocol --example ntp_check
 
 ```sh
 cargo build --workspace
-cargo test --workspace                  # unit tests live in veil-protocol
+cargo test --workspace                  # unit + integration
 cargo clippy --workspace --all-targets
 cargo fmt --all
 ```
@@ -205,6 +205,22 @@ explicitly — each one closes a specific attack.
 16. **Policy needs k *distinct* controllers.** One controller signing twice must
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
+
+### Tests
+
+`veil-server/tests/` drives a **real server process** over a real socket with an
+independent client built only on `veil-protocol` — deliberately not
+`veil-client`, so a failure points at the server and a bug the two happen to
+share cannot hide behind itself. Those cover handshake refusal, routing, the
+offline mailbox, acknowledgement, restart persistence, prekey exhaustion, and
+the relay's anti-open-proxy checks.
+
+**Check a new test by breaking the thing it defends and confirming it fails.**
+Three tests written for this suite passed against deliberately sabotaged code
+before being fixed — asserting silence where silence was ambiguous, counting a
+roster that stays the same size during a takeover, and refusing a destination
+for the wrong reason. A test that has never failed has not been shown to test
+anything.
 
 `veil-protocol` has 80 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the

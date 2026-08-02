@@ -20,3 +20,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 vodozemac = "0.9"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }

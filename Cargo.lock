@@ -3417,6 +3417,7 @@ dependencies = [
  "futures",
  "itertools",
  "rand 0.8.5",
+ "reqwest",
  "rkyv",
  "rkyv_derive",
  "rusqlite",
