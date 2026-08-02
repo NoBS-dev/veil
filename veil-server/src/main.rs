@@ -27,6 +27,7 @@ use tokio::{
 	sync::{Mutex, RwLock},
 };
 use veil_protocol::{
+	clock::{self, Clock, Sync},
 	identity::{Device, DeviceAddress, DeviceId, UserId},
 	version::VersionRange,
 	*,
@@ -55,6 +56,9 @@ struct ServerState {
 	/// every key on restart and dropped mail for anyone offline.
 	store: SharedStore,
 	server_account: Arc<Mutex<Account>>,
+	/// Network time, not the host's (§13.4). A container inherits whatever its
+	/// host's clock says, and a drifting one makes every peer unreachable.
+	clock: Arc<RwLock<Clock>>,
 	replay_guard: Arc<Mutex<ReplayGuard>>,
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
 	otk_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
@@ -155,6 +159,25 @@ async fn main() -> Result<()> {
 		)
 	};
 
+	// Ask the network what time it is before doing anything that stamps or
+	// checks a timestamp.
+	let clock = tokio::task::spawn_blocking(|| {
+		clock::synchronise(&clock::DEFAULT_SOURCES, std::time::Duration::from_secs(3))
+	})
+	.await?;
+
+	match clock {
+		Sync::Network { offset_ms, sources } => {
+			println!("Clock synchronised: {offset_ms:+}ms from {sources} source(s)")
+		}
+		Sync::SystemClockOnly => eprintln!(
+			"WARNING: no time source answered. Falling back to the system clock.\n\
+			 If it has drifted more than a minute, peers will be unable to talk to\n\
+			 this server and the failures will look like rejected signatures."
+		),
+	}
+	let clock = Clock::from_sync(clock);
+
 	let db_path = match prompt("Enter database path (empty for veil-server.db): ")?.as_str() {
 		"" => String::from("veil-server.db"),
 		entered => entered.to_owned(),
@@ -164,6 +187,7 @@ async fn main() -> Result<()> {
 	// Keys must be generated because clients won't accept anything that isn't signed.
 	let state = ServerState {
 		store: Arc::new(Mutex::new(store::Store::open(&db_path)?)),
+		clock: Arc::new(RwLock::new(clock)),
 		server_account: Arc::new(Mutex::new(Account::new())),
 		replay_guard: Arc::new(Mutex::new(ReplayGuard::default())),
 		ip_limiter: Arc::new(Mutex::new(RateLimiter::new(
@@ -184,6 +208,29 @@ async fn main() -> Result<()> {
 		"My public key: {}",
 		display_key(state.server_account.lock().await.ed25519_key().as_bytes())
 	);
+
+	// Drift accumulates, so re-check periodically rather than trusting a
+	// startup reading for the life of the process.
+	{
+		let clock = state.clock.clone();
+		tokio::spawn(async move {
+			loop {
+				tokio::time::sleep(std::time::Duration::from_secs(30 * 60)).await;
+				let sync = tokio::task::spawn_blocking(|| {
+					clock::synchronise(&clock::DEFAULT_SOURCES, std::time::Duration::from_secs(3))
+				})
+				.await;
+
+				if let Ok(Sync::Network { offset_ms, .. }) = sync {
+					let previous = clock.read().await.offset_ms();
+					if (offset_ms - previous).abs() > 1_000 {
+						eprintln!("clock: offset moved {previous:+}ms -> {offset_ms:+}ms");
+					}
+					*clock.write().await = Clock::with_offset(offset_ms);
+				}
+			}
+		});
+	}
 
 	let router = Router::new()
 		.route("/", routing::any(socket))
@@ -251,11 +298,12 @@ async fn authenticate(
 	};
 
 	let opened = open_envelope(&bytes)?;
+	let now = state.clock.read().await.now_ms();
 	state
 		.replay_guard
 		.lock()
 		.await
-		.check(opened.timestamp_ms, opened.nonce)?;
+		.check_at(now, opened.timestamp_ms, opened.nonce)?;
 
 	let claim = match opened.message {
 		ProtocolMessage::Authenticate(claim) => claim,
@@ -295,7 +343,7 @@ async fn authenticate(
 
 	// Everything needed for a device-list entry has just been verified, so
 	// record it here rather than trusting a later self-report.
-	let now = now_ms().unwrap_or_default();
+	let now = state.clock.read().await.now_ms();
 	state.store.lock().await.upsert_device(
 		&claim.user,
 		&claim.keys,
@@ -373,11 +421,13 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			continue;
 		}
 
-		if let Err(e) = state
-			.replay_guard
-			.lock()
-			.await
-			.check(opened.timestamp_ms, opened.nonce)
+		let now = state.clock.read().await.now_ms();
+		if let Err(e) =
+			state
+				.replay_guard
+				.lock()
+				.await
+				.check_at(now, opened.timestamp_ms, opened.nonce)
 		{
 			eprintln!("Discarding a replayed envelope: {e:#}");
 			continue;
@@ -505,7 +555,7 @@ async fn list_clients(
 	State(state): State<ServerState>,
 	ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-	let now = now_ms().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+	let now = state.clock.read().await.now_ms();
 
 	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
 		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests".into()));
@@ -554,7 +604,7 @@ async fn get_prekey_bundle(
 	ConnectInfo(peer): ConnectInfo<SocketAddr>,
 	Path((user, device)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-	let now = now_ms().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+	let now = state.clock.read().await.now_ms();
 
 	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
 		return Err((
@@ -645,7 +695,7 @@ async fn get_device_list(
 	ConnectInfo(peer): ConnectInfo<SocketAddr>,
 	Path(user): Path<String>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-	let now = now_ms().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+	let now = state.clock.read().await.now_ms();
 
 	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
 		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests".into()));
@@ -714,7 +764,7 @@ async fn handle_relay(socket: WebSocket, state: ServerState) {
 	};
 	let target = target.trim().to_owned();
 
-	let now = now_ms().unwrap_or_default();
+	let now = state.clock.read().await.now_ms();
 	if !state.tunnel_limiter.lock().await.allow(address, now) {
 		eprintln!("Relay: {address} is over its tunnel budget");
 		let _ = sender

@@ -1,3 +1,4 @@
+pub mod clock;
 pub mod community;
 pub mod crosssign;
 pub mod groupkeys;
@@ -171,10 +172,17 @@ impl ReplayGuard {
 	/// guard that reads the clock itself cannot be told about it — nor driven
 	/// by a test.
 	pub fn check_at(&mut self, now: u64, timestamp_ms: u64, nonce: [u8; 16]) -> anyhow::Result<()> {
-		if timestamp_ms.abs_diff(now) > self.window_ms {
+		let drift = timestamp_ms.abs_diff(now);
+		if drift > self.window_ms {
+			// Named as clock skew rather than reported as a bad envelope. This
+			// is almost always a drifting clock, and §13.4 exists because the
+			// alternative — failing as a signature rejection — is close to
+			// undiagnosable for whoever is running the box.
 			anyhow::bail!(
-				"envelope timestamp is outside the {}ms replay window",
-				self.window_ms
+				"clock skew: peer timestamp differs by {:.1}s, outside the {:.0}s window. \
+				 Check the clock on both ends.",
+				drift as f64 / 1000.0,
+				self.window_ms as f64 / 1000.0,
 			);
 		}
 

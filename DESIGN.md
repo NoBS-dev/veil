@@ -114,7 +114,7 @@ to.
 | Backups, succession, migration | designed, §12.3–12.4 |
 | Key backup and device enrolment | designed, §12.5 |
 | Horizontal scaling | designed, §13.1–13.3 |
-| Time synchronisation | designed, §13.4 |
+| Time synchronisation | **[built]** `clock.rs`, server-side |
 | Client architecture (seam, Qt, mobile) | designed, §17 |
 | Client split: Rust daemon + C++/Qt over a socket | **validated by spike**, §17.3 |
 | Communities, channels, bots | **not designed** |
@@ -1954,6 +1954,11 @@ Three requirements:
 - **Report skew as skew.** When the replay guard rejects for timestamp drift, say
   *"peer clock differs by N seconds"* rather than failing as a bad signature. This
   is the difference between a one-line fix and an unanswerable bug report.
+
+**Built server-side only.** The client still stamps from its own system clock,
+which is usually fine — desktops run NTP — but a client in a container has the
+same exposure as a server in one. The skew message names both ends for that
+reason.
 
 ---
 

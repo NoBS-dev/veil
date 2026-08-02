@@ -52,6 +52,13 @@ The server prompts for a database path and keeps its key directory and
 mailboxes there (§12.1) — it survives restarts, and mail for an offline device
 waits rather than being dropped.
 
+Diagnosing a clock problem (§13.4) — the server syncs to SNTP at startup and
+every 30 minutes, and this shows what it sees:
+
+```sh
+cargo run -p veil-protocol --example ntp_check
+```
+
 ```sh
 cargo build --workspace
 cargo test --workspace                  # unit tests live in veil-protocol
@@ -188,7 +195,7 @@ explicitly — each one closes a specific attack.
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
 
-`veil-protocol` has 63 tests covering envelope forgery, re-attribution, replay,
+`veil-protocol` has 67 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.
