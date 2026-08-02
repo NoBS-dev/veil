@@ -1904,13 +1904,17 @@ its own mechanism.
 Verified issues in today's code. None have protocol implications — all are Tier 2
 (§15).
 
-- **Routing lock held across an await** — `veil-server/src/main.rs:241` holds the
-  `CLIENTS` write guard across `sender.send().await`. One slow recipient socket
-  stalls *all* routing server-wide. Most serious, cheapest to fix.
+- ~~Routing lock held across an await~~ — **fixed.** `CLIENTS` now maps to
+  bounded per-connection outboxes drained by their own task, so routing never
+  waits on a socket. A peer that fills its outbox is disconnected rather than
+  blocking everyone behind it or having messages silently dropped.
 - **Keyring write per message** — the client serialises its entire state to JSON
   and writes it to the OS keyring after every message, twice per send.
-- **`ReplayGuard` prunes O(n) per check** — wants a ring buffer or time buckets.
-- **`RateLimiter` never evicts idle keys** — grows unbounded, keyed by IP.
+- ~~`ReplayGuard` prunes O(n) per check~~ — **fixed.** Sweeps periodically
+  rather than per message. Sweeping late cannot reopen the replay window: the
+  timestamp check rejects old messages regardless of what is remembered.
+- ~~`RateLimiter` never evicts idle keys~~ — **fixed.** Windows that have fully
+  elapsed carry no information and are swept.
 - **`CLIENTS` is a process-global** — blocks horizontal scaling by construction.
 - **`/clients` enumerates every connected user** — rate-limited, but the real fix
   is per-user contact lists rather than a global roster.

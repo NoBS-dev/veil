@@ -142,6 +142,8 @@ pub fn open_envelope(bytes: &[u8]) -> anyhow::Result<OpenedEnvelope> {
 pub struct ReplayGuard {
 	window_ms: u64,
 	seen: HashMap<[u8; 16], u64>,
+	/// When the expired entries were last swept out.
+	last_prune_ms: u64,
 }
 
 impl ReplayGuard {
@@ -149,12 +151,26 @@ impl ReplayGuard {
 		Self {
 			window_ms,
 			seen: HashMap::new(),
+			last_prune_ms: 0,
 		}
 	}
 
-	pub fn check(&mut self, timestamp_ms: u64, nonce: [u8; 16]) -> anyhow::Result<()> {
-		let now = now_ms()?;
+	/// Entries seen but not yet swept. Exposed for tests and diagnostics.
+	pub fn tracked(&self) -> usize {
+		self.seen.len()
+	}
 
+	pub fn check(&mut self, timestamp_ms: u64, nonce: [u8; 16]) -> anyhow::Result<()> {
+		self.check_at(now_ms()?, timestamp_ms, nonce)
+	}
+
+	/// As [`Self::check`], with the current time supplied.
+	///
+	/// Exists because "now" is not always the system clock: §13.4 has servers
+	/// keep an SNTP offset rather than trusting a container's wall clock, and a
+	/// guard that reads the clock itself cannot be told about it — nor driven
+	/// by a test.
+	pub fn check_at(&mut self, now: u64, timestamp_ms: u64, nonce: [u8; 16]) -> anyhow::Result<()> {
 		if timestamp_ms.abs_diff(now) > self.window_ms {
 			anyhow::bail!(
 				"envelope timestamp is outside the {}ms replay window",
@@ -162,10 +178,15 @@ impl ReplayGuard {
 			);
 		}
 
-		// Anything older than the window is rejected above, so forgetting it
-		// here cannot let a replay back in.
-		self.seen
-			.retain(|_, seen_at| seen_at.abs_diff(now) <= self.window_ms);
+		// Sweeping on every call is O(n) per message, which is fine at a
+		// hundred messages a second and not at ten thousand (§13.3). Anything
+		// older than the window is rejected above, so sweeping late cannot let
+		// a replay back in — it only costs memory until the sweep happens.
+		if now.saturating_sub(self.last_prune_ms) >= self.window_ms {
+			self.seen
+				.retain(|_, seen_at| seen_at.abs_diff(now) <= self.window_ms);
+			self.last_prune_ms = now;
+		}
 
 		if self.seen.insert(nonce, timestamp_ms).is_some() {
 			anyhow::bail!("envelope nonce was already used; this is a replay");
@@ -186,6 +207,7 @@ pub struct RateLimiter<K> {
 	limit: u32,
 	window_ms: u64,
 	windows: HashMap<K, (u64, u32)>,
+	last_prune_ms: u64,
 }
 
 impl<K: Eq + Hash> RateLimiter<K> {
@@ -194,11 +216,27 @@ impl<K: Eq + Hash> RateLimiter<K> {
 			limit,
 			window_ms,
 			windows: HashMap::new(),
+			last_prune_ms: 0,
 		}
+	}
+
+	/// Keys currently tracked. Exposed for tests and diagnostics.
+	pub fn tracked(&self) -> usize {
+		self.windows.len()
 	}
 
 	/// Records a hit and reports whether the caller is still within budget.
 	pub fn allow(&mut self, key: K, now_ms: u64) -> bool {
+		// Without this the map grows for the life of the process — one entry per
+		// IP ever seen, which is a slow memory leak on a public server (§13.3).
+		// A key whose window has fully elapsed carries no information.
+		if now_ms.saturating_sub(self.last_prune_ms) >= self.window_ms {
+			let window_ms = self.window_ms;
+			self.windows
+				.retain(|_, (started, _)| now_ms.saturating_sub(*started) < window_ms);
+			self.last_prune_ms = now_ms;
+		}
+
 		let window = self.windows.entry(key).or_insert((now_ms, 0));
 
 		if now_ms.saturating_sub(window.0) >= self.window_ms {
@@ -432,6 +470,64 @@ mod tests {
 
 		assert!(guard.check(now - REPLAY_WINDOW_MS - 1, [1; 16]).is_err());
 		assert!(guard.check(now + REPLAY_WINDOW_MS + 1, [2; 16]).is_err());
+	}
+
+	/// §13.3: the limiter must not accumulate an entry per key ever seen.
+	#[test]
+	fn the_rate_limiter_forgets_keys_whose_window_elapsed() {
+		let mut limiter = RateLimiter::new(5, 1_000);
+
+		for n in 0..100u64 {
+			limiter.allow(format!("ip-{n}"), 0);
+		}
+		assert_eq!(limiter.tracked(), 100);
+
+		// Well past the window, those keys carry no information.
+		limiter.allow("ip-fresh".to_owned(), 10_000);
+		assert_eq!(limiter.tracked(), 1, "stale windows should have been swept");
+	}
+
+	/// The sweep is periodic rather than per-call, so it must still bound growth
+	/// over a long run.
+	#[test]
+	fn the_replay_guard_does_not_grow_without_bound() {
+		let mut guard = ReplayGuard::new(1_000);
+		let start = 1_000_000u64;
+
+		for n in 0..500u64 {
+			let mut nonce = [0u8; 16];
+			nonce[..8].copy_from_slice(&n.to_le_bytes());
+			guard.check_at(start, start, nonce).unwrap();
+		}
+		assert_eq!(guard.tracked(), 500);
+
+		// A later message, still inside its own window, triggers the sweep.
+		let mut nonce = [0u8; 16];
+		nonce[0] = 0xff;
+		guard.check_at(start + 5_000, start + 5_000, nonce).unwrap();
+
+		assert_eq!(
+			guard.tracked(),
+			1,
+			"only the fresh nonce should remain, tracking {}",
+			guard.tracked()
+		);
+	}
+
+	/// Sweeping late must not let a replay back in — the timestamp window is
+	/// what rejects old messages, not the presence of a remembered nonce.
+	#[test]
+	fn a_late_sweep_does_not_reopen_the_replay_window() {
+		let mut guard = ReplayGuard::new(1_000);
+		let start = 1_000_000u64;
+		let nonce = [7u8; 16];
+
+		guard.check_at(start, start, nonce).unwrap();
+		// Same nonce, same timestamp, before any sweep: caught by memory.
+		assert!(guard.check_at(start + 100, start, nonce).is_err());
+		// Same nonce long after: caught by the timestamp window even though the
+		// sweep has since forgotten it.
+		assert!(guard.check_at(start + 60_000, start, nonce).is_err());
 	}
 
 	#[test]

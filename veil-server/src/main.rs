@@ -88,10 +88,64 @@ struct ClientStore {
 	last_upload_ms: u64,
 }
 
+/// Frames queued for one connection.
+///
+/// Routing hands a frame over and returns immediately; a per-connection task
+/// does the writing. Holding the routing map's lock across a socket write —
+/// which is what a map of sinks forces — means one slow recipient stalls *every*
+/// message on the server (§13.3).
+type Outbox = tokio::sync::mpsc::Sender<Vec<u8>>;
+
+/// How many frames may be queued for a connection before it is considered
+/// unable to keep up.
+const OUTBOX_DEPTH: usize = 256;
+
 /// Routing map, keyed by device address rather than raw key material (§5.3).
 /// A user with three devices holds three entries.
-static CLIENTS: LazyLock<RwLock<HashMap<DeviceAddress, SplitSink<WebSocket, Message>>>> =
+static CLIENTS: LazyLock<RwLock<HashMap<DeviceAddress, Outbox>>> =
 	LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Queues a frame for a device, if it is connected.
+///
+/// Never awaits while holding the map lock: the lookup clones a channel handle,
+/// releases, and only then queues.
+async fn route_to(recipient: &DeviceAddress, frame: Vec<u8>) -> Result<(), RouteError> {
+	let outbox = {
+		let clients = CLIENTS.read().await;
+		clients.get(recipient).cloned()
+	};
+
+	let Some(outbox) = outbox else {
+		return Err(RouteError::NotConnected);
+	};
+
+	match outbox.try_send(frame) {
+		Ok(()) => Ok(()),
+		Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(RouteError::NotConnected),
+		Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+			// The peer has stopped reading. Dropping the connection makes that
+			// visible and forces a reconnect, rather than silently discarding
+			// messages or blocking everyone else behind it.
+			CLIENTS.write().await.remove(recipient);
+			Err(RouteError::TooSlow)
+		}
+	}
+}
+
+#[derive(Debug)]
+enum RouteError {
+	NotConnected,
+	TooSlow,
+}
+
+impl std::fmt::Display for RouteError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::NotConnected => f.write_str("not connected"),
+			Self::TooSlow => f.write_str("not keeping up; connection dropped"),
+		}
+	}
+}
 
 fn prompt(question: &str) -> Result<String> {
 	print!("{question}");
@@ -326,7 +380,22 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 		};
 
 	println!("{address} connected, speaking protocol v{version}");
-	CLIENTS.write().await.insert(address, sender);
+
+	// One task owns the socket's write half. Everything else queues frames, so
+	// no routing path ever waits on a socket.
+	let (outbox, mut outbound) = tokio::sync::mpsc::channel::<Vec<u8>>(OUTBOX_DEPTH);
+	let writer = tokio::spawn(async move {
+		while let Some(frame) = outbound.recv().await {
+			if sender
+				.send(Message::Binary(Bytes::copy_from_slice(&frame)))
+				.await
+				.is_err()
+			{
+				break;
+			}
+		}
+	});
+	CLIENTS.write().await.insert(address, outbox);
 
 	while let Some(Ok(Message::Binary(bytes))) = receiver.next().await {
 		let opened = match open_envelope(&bytes) {
@@ -370,17 +439,9 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					continue;
 				}
 
-				if let Some(sender) = CLIENTS.write().await.get_mut(&msg.recipient) {
-					if let Err(e) = sender
-						.send(Message::Binary(Bytes::copy_from_slice(&bytes)))
-						.await
-					{
-						eprintln!("{e:?}");
-					} else {
-						eprintln!("Message routed from {address} to {}", msg.recipient);
-					}
-				} else {
-					eprintln!("Device {} not connected", msg.recipient);
+				match route_to(&msg.recipient, bytes.to_vec()).await {
+					Ok(()) => eprintln!("Message routed from {address} to {}", msg.recipient),
+					Err(e) => eprintln!("Could not route to {}: {e}", msg.recipient),
 				}
 			}
 			ProtocolMessage::UploadKeys(upload) => {
@@ -431,6 +492,7 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 	}
 
 	CLIENTS.write().await.remove(&address);
+	writer.abort();
 	println!("{address} disconnected");
 }
 
@@ -520,20 +582,19 @@ async fn get_prekey_bundle(
 				display_key(&otk)
 			);
 
-			if consume && let Some(client) = CLIENTS.write().await.get_mut(&address) {
-				let account = state.server_account.lock().await;
+			if consume {
+				let framed = {
+					let account = state.server_account.lock().await;
+					Envelope::seal(
+						&ProtocolMessage::RemainingOneTimeKeys(remaining_otks),
+						&account,
+					)
+				};
 
-				match Envelope::seal(
-					&ProtocolMessage::RemainingOneTimeKeys(remaining_otks),
-					&account,
-				) {
+				match framed {
 					Ok(framed) => {
-						if let Err(e) = client
-							.send(Message::Binary(Bytes::copy_from_slice(&framed)))
-							.await
-						{
-							eprintln!("Could not notify {address}: {e:?}");
-						}
+						// Best effort: the peer not being connected is ordinary.
+						let _ = route_to(&address, framed.to_vec()).await;
 					}
 					Err(e) => eprintln!("Could not seal an OTK notification: {e:#}"),
 				}
