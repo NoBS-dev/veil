@@ -107,12 +107,12 @@ to.
 | Presence, typing, read state | designed, §10.3 |
 | Search (client-side index) | designed, §10.4 |
 | Deletion, tombstoning, erasure | designed, §10.5 |
-| Attestations and verification | designed, §11.2–11.2.1 |
+| Attestations, standing | **[built]** `attestation.rs` |
 | Reputation, discovery, finding people | designed, §11.4–11.6 |
 | Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
 | Message store, push | designed, §12.1–12.2 |
 | Backups, succession, migration | designed, §12.3–12.4 |
-| Key backup and device enrolment | designed, §12.5 |
+| Key backup, recovery key, enrolment bundles | **[built]** `keybackup.rs` |
 | Horizontal scaling | designed, §13.1–13.3 |
 | Time synchronisation | **[built]** `clock.rs`, server-side |
 | Client architecture (seam, Qt, mobile) | designed, §17 |

@@ -12,7 +12,7 @@ use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
 /// Bumped whenever `State` changes shape. Profiles from an older version are
 /// refused rather than migrated — see `load_from_keyring`.
-const STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 6;
 
 fn serialize_session<S: Serializer>(session: &Session, serializer: S) -> Result<S::Ok, S::Error> {
 	session.pickle().serialize(serializer)
@@ -138,6 +138,15 @@ pub struct State {
 	/// and a poor one for a stranger's.
 	#[serde(default)]
 	pub relay: Option<Box<str>>,
+	/// Check for mail on an interval instead of staying connected (§12.2).
+	///
+	/// Costs latency and battery; buys resistance to timing correlation, since
+	/// nobody learns when each message arrived — only that the device checked in
+	/// on a schedule. It is also the escape hatch that keeps push from being a
+	/// §1.3 dependency: a user who will not route through a push gateway can
+	/// poll instead and lose nothing but immediacy.
+	#[serde(default)]
+	pub poll_interval_secs: Option<u64>,
 	pub profile: Box<str>,
 	/// Pinned on first connect. A server that later signs with a different key
 	/// is refused rather than trusted afresh.
@@ -164,6 +173,7 @@ impl State {
 			verified_users: HashMap::new(),
 			ip_and_port,
 			relay: None,
+			poll_interval_secs: None,
 			profile: normalized_profile(profile).into(),
 			server_identity: None,
 			use_tls,

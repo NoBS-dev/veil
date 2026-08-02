@@ -63,6 +63,27 @@ pub async fn cli(
 					eprintln!("Device list error: {e:#}");
 				}
 			}
+			"poll" => {
+				match state.poll_interval_secs {
+					Some(secs) => {
+						state.poll_interval_secs = None;
+						println!(
+							"Polling off (was every {secs}s). Staying connected; messages \
+							 arrive as they are sent."
+						);
+					}
+					None => {
+						state.poll_interval_secs = Some(3600);
+						println!(
+							"Polling on, hourly. Slower, and nobody learns when each \
+							 message arrived — only that this device checked in."
+						);
+					}
+				}
+				if let Err(e) = state.save_to_keyring() {
+					eprintln!("Save state failed: {e:#}");
+				}
+			}
 			"safety" => {
 				if let Err(e) = show_safety_number(&mut state) {
 					eprintln!("Safety number error: {e:#}");

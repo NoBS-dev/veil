@@ -1,8 +1,10 @@
+pub mod attestation;
 pub mod clock;
 pub mod community;
 pub mod crosssign;
 pub mod groupkeys;
 pub mod identity;
+pub mod keybackup;
 pub mod message;
 pub mod version;
 

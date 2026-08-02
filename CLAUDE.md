@@ -112,7 +112,8 @@ printf 'bob\n127.0.0.1:9876\n'   > b.in
 printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
-Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `remove`, `quit`.
+Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
+`remove`, `quit`.
 
 A profile may carry a relay (§3.2). With one set the client tunnels through it,
 so the destination sees the relay's address rather than the client's. Test it by
@@ -195,7 +196,7 @@ explicitly — each one closes a specific attack.
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
 
-`veil-protocol` has 67 tests covering envelope forgery, re-attribution, replay,
+`veil-protocol` has 80 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.
