@@ -395,6 +395,120 @@ async fn policy_below_the_threshold_is_refused() {
 	server.stop().await;
 }
 
+/// §8.5: posting is a host-enforced permission, read from the signed chain.
+///
+/// The whole point of the split is that only *reading* needs cryptography —
+/// everything else is an action the host can refuse. This is that refusal.
+#[tokio::test]
+async fn a_banned_member_cannot_post_or_backfill() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+
+	let mut mallory = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	mallory.upload_keys(5).await.unwrap();
+	mallory
+		.send(&ProtocolMessage::JoinCommunity(id))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut mallory).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	// The control comes first: while an ordinary member, she can post.
+	mallory
+		.send(&post(id, "general", b"before the ban"))
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut mallory).await;
+	assert!(ok, "an ordinary member should be able to post: {detail}");
+
+	ban(&mut alice, id, mallory.user()).await;
+
+	mallory
+		.send(&post(id, "general", b"after the ban"))
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut mallory).await;
+	assert!(!ok, "a banned member must not post");
+	assert!(detail.contains("banned"), "got: {detail}");
+
+	mallory
+		.send(&ProtocolMessage::Backfill {
+			community: id,
+			channel: "general".into(),
+			after: 0,
+		})
+		.await
+		.unwrap();
+	let (_, ok, _) = expect_result(&mut mallory).await;
+	assert!(!ok, "a banned member must not be handed more history");
+
+	server.stop().await;
+}
+
+/// A ban is a role in the chain rather than a deletion from the member list,
+/// which is what makes it survive the member leaving and coming back.
+#[tokio::test]
+async fn a_ban_survives_rejoining() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+
+	let mut mallory = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	mallory.upload_keys(5).await.unwrap();
+	mallory
+		.send(&ProtocolMessage::JoinCommunity(id))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut mallory).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	ban(&mut alice, id, mallory.user()).await;
+
+	// Rejoining is the obvious way to try to shed a ban.
+	mallory
+		.send(&ProtocolMessage::JoinCommunity(id))
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut mallory).await;
+	assert!(!ok, "rejoining must not clear a ban: {detail}");
+
+	server.stop().await;
+}
+
+/// Signs a ban as the founding controller.
+async fn ban(
+	controller: &mut TestClient,
+	id: CommunityId,
+	subject: veil_protocol::identity::UserId,
+) {
+	let record = PolicyRecord::MemberRole {
+		user: subject,
+		role: veil_protocol::community::Role::Banned,
+	};
+	controller
+		.send(&ProtocolMessage::SubmitPolicy(Box::new(
+			SignedPolicy::sign(
+				id,
+				1,
+				record,
+				&[(0, controller.cross_signing.master_secret())],
+			),
+		)))
+		.await
+		.unwrap();
+
+	let (_, ok, detail) = expect_result(controller).await;
+	assert!(ok, "the ban should be accepted: {detail}");
+	tokio::time::sleep(BEAT).await;
+}
+
 /// Communities are the host's authoritative state (§3.3), so they must survive
 /// a restart like anything else.
 #[tokio::test]

@@ -105,6 +105,11 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"role" => {
+				if let Err(e) = communities::role(&write, &state).await {
+					eprintln!("Could not set a role: {e:#}");
+				}
+			}
 			"history" => {
 				if let Err(e) = communities::history(&write, &state).await {
 					eprintln!("Could not ask for history: {e:#}");

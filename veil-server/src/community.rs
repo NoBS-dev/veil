@@ -15,6 +15,16 @@
 //! different histories from the start — detection, not prevention, is the
 //! honest guarantee (§10.1).
 //!
+//! **The host enforces every permission except reading** (§8.5). Posting,
+//! joining and backfill are actions it can simply refuse, and a host that
+//! ignores its own ACL is misbehaving in a way members can observe. Reading is
+//! the one permission it cannot claw back after the fact, so that one is key
+//! possession and lives entirely in the client.
+//!
+//! What the host enforces it reads from the *signed chain*, not from a table of
+//! its own. One source of truth, and a host with its own role table could grant
+//! itself moderation.
+//!
 //! **The mode is inside the community id** (invariant 13), so a host cannot
 //! serve Sealed content under an Open id or the reverse. The host treats the
 //! body as opaque bytes either way; what differs is whether the *client*
@@ -96,6 +106,16 @@ pub async fn join(state: &ServerState, sender: &DeviceAddress, id: CommunityId) 
 		Ok(Some(_)) => {}
 	}
 
+	// A ban outlives leaving, which is the point of it being a role in the chain
+	// rather than a deletion from the member list: rejoining must not clear it.
+	drop(store);
+	match policy(state, &id).await {
+		Ok(community) if community.may_post(&sender.user) => {}
+		Ok(_) => return Response::refused(id, "you are banned from that community"),
+		Err(e) => return Response::refused(id, &format!("policy: {e}")),
+	}
+	let store = state.store.lock().await;
+
 	match store.add_member(&id, &sender.user, now) {
 		Ok(()) => Response::ok(id, "joined"),
 		Err(e) => Response::refused(id, &format!("could not record membership: {e}")),
@@ -121,12 +141,43 @@ pub async fn view(state: &ServerState, id: CommunityId) -> Result<CommunityView>
 	})
 }
 
+/// The community's policy, replayed from what this host stores.
+///
+/// Replayed rather than cached: the check that matters is that the whole chain
+/// still validates, and a cached answer is one a future bug can widen.
+async fn policy(state: &ServerState, id: &CommunityId) -> Result<CommunityState> {
+	let store = state.store.lock().await;
+
+	let Some(root_json) = store.community_root(id)? else {
+		bail!("this host does not serve that community");
+	};
+
+	// The founder's signature was checked when the community was registered and
+	// the root cannot have changed since — its hash is the id.
+	let mut community = CommunityState::without_founder_check(serde_json::from_str(&root_json)?)?;
+
+	for entry in store.policy_chain(id)? {
+		community.apply(&serde_json::from_str::<SignedPolicy>(&entry)?)?;
+	}
+
+	Ok(community)
+}
+
 /// Files a message and fans it out.
 ///
 /// The sender is the device that authenticated on this connection, not a field
 /// in the message — the same rule as a DM (invariant 1). Position is assigned
 /// here.
 pub async fn post(state: &ServerState, sender: &DeviceAddress, post: ChannelPost) -> Response {
+	// Posting is a host-enforced permission (§8.5) — it is an action this host
+	// can refuse, so it does not need cryptographic backing. Read access does,
+	// and is nowhere near here: it is whether the sender encrypted to you.
+	match policy(state, &post.community).await {
+		Ok(community) if community.may_post(&sender.user) => {}
+		Ok(_) => return Response::refused(post.community, "you are banned from that community"),
+		Err(e) => return Response::refused(post.community, &format!("policy: {e}")),
+	}
+
 	if post.body.len() > MAX_BODY {
 		return Response::refused(post.community, "message is too large");
 	}
@@ -277,8 +328,20 @@ pub async fn backfill(
 	if !store.is_member(&id, &sender.user)? {
 		bail!("you are not a member of that community");
 	}
+	drop(store);
 
-	store.channel_since(&id, channel, after, BACKFILL_LIMIT)
+	// A banned member keeps whatever Megolm keys they already hold — that
+	// cannot be taken back — but the host still declines to keep handing them
+	// history. Refusing what it can refuse is the whole of a host's role here.
+	if !policy(state, &id).await?.may_post(&sender.user) {
+		bail!("you are banned from that community");
+	}
+
+	state
+		.store
+		.lock()
+		.await
+		.channel_since(&id, channel, after, BACKFILL_LIMIT)
 }
 
 /// Adds a policy record to the chain (§7.4).

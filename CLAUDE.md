@@ -130,7 +130,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
-`remove`, `quit`, and for communities `found`, `join`, `readers`, `say`,
+`remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
 `history`.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
@@ -254,7 +254,18 @@ explicitly — each one closes a specific attack.
     can still *withhold* the newest record — sequences stop a rewind, so hiding
     the tip is its only move — and that is a known, unclosed gap (§8.5), not
     something to describe as solved.
-21. **Never send plaintext under a Sealed id.** The mode is inside the community
+21. **Only *read* is enforced cryptographically** (§8.5). Posting, joining,
+    backfill and moderation are actions a host can refuse, so they are ordinary
+    ACLs — but they read from the *signed chain*, never a host-side table, or a
+    host could grant itself moderation. Reading is key possession and lives
+    entirely in the client. Do not add a second, host-authored source of role
+    truth.
+22. **A ban is not a revocation of read access.** A banned member keeps every
+    Megolm key they already hold; that cannot be taken back. Dropping them from
+    a reader list rotates the session and is the expensive operation. Keep the
+    two separate and say which is which — conflating them promises something
+    the design cannot deliver.
+23. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

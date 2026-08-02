@@ -260,6 +260,62 @@ pub enum PolicyRecord {
 		channel: String,
 		readers: Vec<UserId>,
 	},
+	/// What a member may do (§8.5).
+	///
+	/// In the signed chain rather than a host-side table, so there is one source
+	/// of truth for both halves of the split: the host enforces the permissions
+	/// it can enforce, and clients read the same record when deciding who
+	/// receives keys. A host with its own role table could grant itself
+	/// moderation, and — worse — a role that carried read access would let it
+	/// add itself to a reader set every sender then encrypts to.
+	MemberRole { user: UserId, role: Role },
+}
+
+/// What a member may do, in increasing order of authority.
+///
+/// **Only reading is enforced cryptographically** (§8.5). Everything else —
+/// posting, kicking, banning, renaming — is an action the host can simply
+/// refuse, and a host that ignores its own ACL is misbehaving in a way members
+/// can observe. Reading is the one permission that cannot be clawed back after
+/// the fact, so it is the only one that has to be key possession.
+///
+/// That collapses a Discord-sized permission matrix into one cryptographic
+/// question — who holds the key for this channel — and leaves the rest as
+/// ordinary bookkeeping.
+#[derive(
+	Archive,
+	Deserialize,
+	Serialize,
+	Debug,
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	PartialOrd,
+	Ord,
+	Ser,
+	De,
+	Default,
+)]
+#[rkyv(attr(derive(Debug)))]
+pub enum Role {
+	/// Cannot post or read. Kept as a role rather than removed from the member
+	/// list so the ban survives them being re-added by someone who did not know.
+	Banned,
+	#[default]
+	Member,
+	/// May ban and unban.
+	Moderator,
+}
+
+impl std::fmt::Display for Role {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(match self {
+			Role::Banned => "banned",
+			Role::Member => "member",
+			Role::Moderator => "moderator",
+		})
+	}
 }
 
 /// One controller's signature, tagged with which controller made it.
@@ -308,6 +364,15 @@ fn policy_input(community: &CommunityId, sequence: u64, record: &PolicyRecord) -
 			buffer.extend_from_slice(&(new_host.len() as u32).to_le_bytes());
 			buffer.extend_from_slice(new_host.as_bytes());
 		}
+		PolicyRecord::MemberRole { user, role } => {
+			buffer.push(4);
+			buffer.extend_from_slice(user.as_bytes());
+			buffer.push(match role {
+				Role::Banned => 0,
+				Role::Member => 1,
+				Role::Moderator => 2,
+			});
+		}
 		PolicyRecord::ChannelReaders { channel, readers } => {
 			buffer.push(3);
 			buffer.extend_from_slice(&(channel.len() as u32).to_le_bytes());
@@ -354,6 +419,8 @@ pub struct CommunityState {
 	pub min_version: u16,
 	pub host: Option<String>,
 	pub channel_readers: std::collections::HashMap<String, Vec<UserId>>,
+	/// Roles, as the chain has assigned them. Absent means [`Role::Member`].
+	pub roles: std::collections::HashMap<UserId, Role>,
 	/// Highest sequence applied. Records at or below this are refused.
 	pub sequence: u64,
 	root: CommunityRoot,
@@ -370,6 +437,7 @@ impl CommunityState {
 			min_version: 1,
 			host: None,
 			channel_readers: std::collections::HashMap::new(),
+			roles: std::collections::HashMap::new(),
 			sequence: 0,
 			root,
 		})
@@ -391,6 +459,7 @@ impl CommunityState {
 			min_version: 1,
 			host: None,
 			channel_readers: std::collections::HashMap::new(),
+			roles: std::collections::HashMap::new(),
 			sequence: 0,
 			root,
 		})
@@ -436,6 +505,9 @@ impl CommunityState {
 			}
 			PolicyRecord::Migration { new_host } => {
 				self.host = Some(new_host.clone());
+			}
+			PolicyRecord::MemberRole { user, role } => {
+				self.roles.insert(*user, *role);
 			}
 			PolicyRecord::ChannelReaders { channel, readers } => {
 				self.channel_readers
@@ -495,6 +567,27 @@ impl CommunityState {
 			self.apply(policy)?;
 		}
 		Ok(())
+	}
+
+	/// A member's role. Anyone unmentioned is an ordinary member.
+	pub fn role(&self, user: &UserId) -> Role {
+		// The founder is a moderator by construction. A community whose founder
+		// could be banned out of their own community by a moderator they
+		// appointed would have no recoverable state.
+		if *user == self.root.founder {
+			return Role::Moderator;
+		}
+		self.roles.get(user).copied().unwrap_or_default()
+	}
+
+	/// Whether a member may post. Banned is the only role that cannot.
+	pub fn may_post(&self, user: &UserId) -> bool {
+		self.role(user) > Role::Banned
+	}
+
+	/// Whether a member may change other members' roles.
+	pub fn may_moderate(&self, user: &UserId) -> bool {
+		self.role(user) >= Role::Moderator
 	}
 
 	pub fn root(&self) -> &CommunityRoot {
@@ -829,5 +922,154 @@ mod tests {
 			(b.mode, b.min_version, b.sequence),
 			(a.mode, a.min_version, a.sequence)
 		);
+	}
+
+	/// Roles come from the chain, so the ordinary case is that a record grants
+	/// one and every replayer agrees.
+	#[test]
+	fn a_signed_record_grants_a_role() {
+		let (mut community, controller, _) = community();
+		let subject = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+
+		assert_eq!(community.role(&subject), Role::Member);
+		assert!(!community.may_moderate(&subject));
+
+		community
+			.apply(&SignedPolicy::sign(
+				community.id,
+				1,
+				PolicyRecord::MemberRole {
+					user: subject,
+					role: Role::Moderator,
+				},
+				&[(0, &controller)],
+			))
+			.unwrap();
+
+		assert_eq!(community.role(&subject), Role::Moderator);
+		assert!(community.may_moderate(&subject));
+	}
+
+	/// A ban is a role, not a deletion, so it survives the member being re-added
+	/// by somebody who did not know.
+	#[test]
+	fn a_ban_denies_posting() {
+		let (mut community, controller, _) = community();
+		let subject = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+
+		community
+			.apply(&SignedPolicy::sign(
+				community.id,
+				1,
+				PolicyRecord::MemberRole {
+					user: subject,
+					role: Role::Banned,
+				},
+				&[(0, &controller)],
+			))
+			.unwrap();
+
+		assert!(!community.may_post(&subject));
+		assert!(!community.may_moderate(&subject));
+	}
+
+	/// The founder cannot be demoted out of their own community.
+	///
+	/// Otherwise a moderator they appointed could ban them, and the community
+	/// would have no one able to recover it — the succession problem §12.4
+	/// exists to avoid, arriving through the back door.
+	#[test]
+	fn the_founder_keeps_authority() {
+		let (mut community, controller, founder) = community();
+
+		community
+			.apply(&SignedPolicy::sign(
+				community.id,
+				1,
+				PolicyRecord::MemberRole {
+					user: founder,
+					role: Role::Banned,
+				},
+				&[(0, &controller)],
+			))
+			.unwrap();
+
+		assert_eq!(community.role(&founder), Role::Moderator);
+		assert!(community.may_post(&founder));
+	}
+
+	/// A role record is signed like anything else, so one controller short of
+	/// the threshold cannot grant itself moderation (invariant 16).
+	#[test]
+	fn a_role_record_below_the_threshold_is_refused() {
+		let first = Ed25519SecretKey::new();
+		let second = Ed25519SecretKey::new();
+		let founder = Ed25519SecretKey::new();
+
+		let root = CommunityRoot::found(
+			Mode::Sealed,
+			vec![
+				first.public_key().as_bytes().to_owned(),
+				second.public_key().as_bytes().to_owned(),
+			],
+			2,
+			&founder,
+			1_000,
+		)
+		.unwrap();
+		let mut community =
+			CommunityState::from_root(root, founder.public_key().as_bytes()).unwrap();
+
+		let subject = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+		let record = PolicyRecord::MemberRole {
+			user: subject,
+			role: Role::Moderator,
+		};
+
+		assert!(
+			community
+				.apply(&SignedPolicy::sign(
+					community.id,
+					1,
+					record.clone(),
+					&[(0, &first)]
+				))
+				.is_err(),
+			"one of two controllers must not be enough to grant a role"
+		);
+		assert_eq!(community.role(&subject), Role::Member);
+
+		assert!(
+			community
+				.apply(&SignedPolicy::sign(
+					community.id,
+					1,
+					record,
+					&[(0, &first), (1, &second)]
+				))
+				.is_ok(),
+			"and two of two must be"
+		);
+		assert_eq!(community.role(&subject), Role::Moderator);
+	}
+
+	/// A community with one controller, plus that controller's key and the
+	/// founder's user id.
+	fn community() -> (CommunityState, Ed25519SecretKey, UserId) {
+		let founder = Ed25519SecretKey::new();
+		let controller = Ed25519SecretKey::new();
+
+		let root = CommunityRoot::found(
+			Mode::Sealed,
+			vec![controller.public_key().as_bytes().to_owned()],
+			1,
+			&founder,
+			1_000,
+		)
+		.unwrap();
+		let founder_id = root.founder;
+		let community = CommunityState::from_root(root, founder.public_key().as_bytes()).unwrap();
+
+		(community, controller, founder_id)
 	}
 }

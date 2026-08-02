@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
 	ChannelKey, ChannelPost, Envelope, ProtocolMessage,
-	community::{CommunityId, CommunityRoot, Mode, PolicyRecord, SignedPolicy},
+	community::{CommunityId, CommunityRoot, Mode, PolicyRecord, Role, SignedPolicy},
 	groupkeys::{ChannelId, GroupKeyProvider, Readership},
 	identity::DeviceAddress,
 };
@@ -280,6 +280,63 @@ async fn deliver_key(
 			message_type,
 			message,
 		}),
+	)
+	.await
+}
+
+/// Assigns a member's role, as a signed policy record (§8.5).
+///
+/// Only *reading* needs cryptographic enforcement — everything this grants is
+/// something the host can simply refuse. It still lives in the signed chain
+/// rather than a host-side table, so there is one source of truth and a host
+/// cannot grant itself moderation.
+///
+/// **Banning is not the same as revoking read access.** A banned member keeps
+/// every Megolm key they already hold; that cannot be taken back. To stop them
+/// reading what comes next, take them out of the channel's reader list with
+/// `readers`, which rotates the session — an expensive operation in a large
+/// community, and deliberately a separate act so it is not done by accident.
+pub async fn role(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let user = veil_protocol::identity::UserId::parse(&ask("User id: ")?)?;
+
+	let role = match ask("Role — (b)anned, (m)ember, (mod)erator: ")?
+		.to_lowercase()
+		.as_str()
+	{
+		"b" | "banned" => Role::Banned,
+		"m" | "member" => Role::Member,
+		"mod" | "moderator" => Role::Moderator,
+		other => anyhow::bail!("'{other}' is not a role"),
+	};
+
+	if role == Role::Banned
+		&& let Ok(community) = state.community_state(&id)
+		&& community
+			.channel_readers
+			.values()
+			.any(|readers| readers.contains(&user))
+	{
+		println!(
+			"note: {user} still holds keys for channels they can read. A ban stops them \
+			 posting, not reading — run `readers` to drop them and rotate."
+		);
+	}
+
+	let sequence = state
+		.community_state(&id)
+		.map(|community| community.sequence + 1)
+		.unwrap_or(1);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::SubmitPolicy(Box::new(SignedPolicy::sign(
+			id,
+			sequence,
+			PolicyRecord::MemberRole { user, role },
+			&[(0, state.cross_signing().master_secret())],
+		))),
 	)
 	.await
 }

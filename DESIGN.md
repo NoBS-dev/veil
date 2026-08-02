@@ -102,7 +102,7 @@ to.
 | Communities and channels on a host | **[built]** `veil-server/src/community.rs` — create, join, post, backfill, host-assigned ordering |
 | Moderation and reporting under Sealed | designed, §7.6 |
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
-| Roles: read-vs-rest split, signed role state | designed, §8.5 |
+| Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | designed, §10.2 |
@@ -161,7 +161,22 @@ is not closed; detecting it needs members to compare chains out of band. Worth
 weighing against the alternative, which is replicating policy between servers and
 bringing back everything §3.3 exists to avoid.
 
-What remains is **roles and moderation** (§8.5, §7.6) and **channel
+Roles are built on the split §8.5 argues for. `Role` lives in the signed policy
+chain — one source of truth, so a host cannot grant itself moderation — and the
+host enforces the permissions it *can* enforce: posting, joining and backfill are
+actions it simply refuses. Reading is not among them, because it is the one
+permission a host cannot claw back, so it stays key possession and lives entirely
+in the client.
+
+A ban is a role rather than a deletion, so it survives the member leaving and
+rejoining. It is deliberately **not** the same as revoking read access: a banned
+member keeps every Megolm key they already hold, and stopping them reading what
+comes next means taking them out of the reader list, which rotates the session.
+The client says so rather than letting the two be confused — §8.5's asymmetry
+between a cheap permission change and an expensive one, surfaced instead of
+hidden.
+
+What remains is **moderation and reporting under Sealed** (§7.6) and **channel
 administration**, which are designed but unbuilt, and **bots**, which are not
 designed.
 
