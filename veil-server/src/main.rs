@@ -1,3 +1,4 @@
+mod community;
 mod delivery;
 mod store;
 mod tlsframe;
@@ -656,6 +657,71 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			ProtocolMessage::Challenge(_) | ProtocolMessage::Authenticate(_) => {
 				eprintln!("Received a handshake message outside the handshake. Ignoring.")
 			}
+			// ---- communities (§7, §8) ------------------------------------
+			ProtocolMessage::CreateCommunity(root) => {
+				let response = community::create(&state, &address, *root).await;
+				reply(&state, &address, response.into_message()).await;
+			}
+			ProtocolMessage::JoinCommunity(id) => {
+				let response = community::join(&state, &address, id).await;
+				reply(&state, &address, response.into_message()).await;
+
+				// Sent unprompted after a join: a client that has just been
+				// admitted needs the root and the policy chain before it can
+				// verify anything the host says afterwards.
+				if let Ok(view) = community::view(&state, id).await {
+					reply(
+						&state,
+						&address,
+						ProtocolMessage::CommunityState(Box::new(view)),
+					)
+					.await;
+				}
+			}
+			ProtocolMessage::Post(post) => {
+				let response = community::post(&state, &address, post).await;
+				reply(&state, &address, response.into_message()).await;
+			}
+			ProtocolMessage::Backfill {
+				community: id,
+				channel,
+				after,
+			} => match community::backfill(&state, &address, id, &channel, after).await {
+				Ok(messages) => {
+					for delivery in messages {
+						reply(
+							&state,
+							&address,
+							ProtocolMessage::Delivery(Box::new(delivery)),
+						)
+						.await;
+					}
+				}
+				Err(e) => {
+					eprintln!("Backfill for {address} refused: {e:#}");
+					reply(
+						&state,
+						&address,
+						ProtocolMessage::CommunityResult {
+							community: id,
+							ok: false,
+							detail: format!("{e:#}"),
+						},
+					)
+					.await;
+				}
+			},
+			ProtocolMessage::SubmitPolicy(policy) => {
+				let response = community::submit_policy(&state, *policy).await;
+				reply(&state, &address, response.into_message()).await;
+			}
+			// Host -> client only; a client sending one is confused or probing.
+			ProtocolMessage::CommunityState(_)
+			| ProtocolMessage::Delivery(_)
+			| ProtocolMessage::CommunityResult { .. } => {
+				eprintln!("Received a host-to-client community frame from {address}. Ignoring.")
+			}
+
 			// Server-to-server frames never arrive on a client connection: they
 			// have their own endpoint with its own handshake (§3.4). A client
 			// reaching this is trying to deposit into a mailbox directly, which
@@ -674,6 +740,24 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 	CLIENTS.write().await.remove(&address);
 	writer.abort();
 	println!("{address} disconnected");
+}
+
+/// Seals a message from this host and sends it to one device.
+async fn reply(state: &ServerState, address: &DeviceAddress, message: ProtocolMessage) {
+	let framed = {
+		let account = state.server_account.lock().await;
+		match Envelope::seal(&message, &account) {
+			Ok(framed) => framed.to_vec(),
+			Err(e) => {
+				eprintln!("Could not seal a reply for {address}: {e:#}");
+				return;
+			}
+		}
+	};
+
+	if let Err(e) = route_to(address, framed).await {
+		eprintln!("Could not reach {address}: {e}");
+	}
 }
 
 /// Offers whatever was waiting for a device.

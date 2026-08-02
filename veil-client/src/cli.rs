@@ -1,5 +1,5 @@
 use crate::state::State;
-use crate::{WriteStream, messaging};
+use crate::{WriteStream, communities, messaging};
 use anyhow::Result;
 use std::{
 	io::{self, Write},
@@ -82,6 +82,27 @@ pub async fn cli(
 				}
 				if let Err(e) = state.save_to_keyring() {
 					eprintln!("Save state failed: {e:#}");
+				}
+			}
+			// ---- communities (§7, §8) ----------------------------------
+			"found" => {
+				if let Err(e) = communities::found(&write, &mut state).await {
+					eprintln!("Could not found a community: {e:#}");
+				}
+			}
+			"join" => {
+				if let Err(e) = communities::join(&write, &state).await {
+					eprintln!("Could not join: {e:#}");
+				}
+			}
+			"say" => {
+				if let Err(e) = communities::say(&write, &state).await {
+					eprintln!("Could not post: {e:#}");
+				}
+			}
+			"history" => {
+				if let Err(e) = communities::history(&write, &state).await {
+					eprintln!("Could not ask for history: {e:#}");
 				}
 			}
 			"safety" => {

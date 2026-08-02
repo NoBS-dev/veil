@@ -19,6 +19,8 @@
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
 use veil_protocol::{
+	ChannelDelivery,
+	community::CommunityId,
 	crosssign::CrossSigningPublic,
 	identity::{Device, DeviceAddress, DeviceId, UserId},
 };
@@ -111,6 +113,49 @@ impl Store {
 			 -- which is what happened before this table — locked out every
 			 -- client the server had ever spoken to. Another server recognises
 			 -- us by the same key (§3.4), so it has to be stable there too.
+			 -- A community lives on exactly one host and never replicates
+			 -- (§3.3), so these tables are authoritative rather than a cached
+			 -- view of somebody else's state. That is the whole reason no
+			 -- state resolution is needed.
+			 CREATE TABLE IF NOT EXISTS communities (
+			     community_id BLOB PRIMARY KEY,
+			     root         TEXT    NOT NULL,   -- CommunityRoot, as JSON
+			     mode         TEXT    NOT NULL,
+			     created_at   INTEGER NOT NULL
+			 );
+
+			 CREATE TABLE IF NOT EXISTS community_policy (
+			     community_id BLOB    NOT NULL,
+			     sequence     INTEGER NOT NULL,
+			     record       TEXT    NOT NULL,   -- SignedPolicy, as JSON
+			     PRIMARY KEY (community_id, sequence)
+			 );
+
+			 CREATE TABLE IF NOT EXISTS community_members (
+			     community_id BLOB    NOT NULL,
+			     user_id      BLOB    NOT NULL,
+			     joined_at    INTEGER NOT NULL,
+			     PRIMARY KEY (community_id, user_id)
+			 );
+
+			 -- Ordering is the host's, not the sender's (§10.1). A member sends
+			 -- one message and the host gives it a position, so nobody can
+			 -- claim one -- which is what removes the need for the state
+			 -- resolution Matrix uses to reconcile competing claims.
+			 CREATE TABLE IF NOT EXISTS channel_messages (
+			     community_id BLOB    NOT NULL,
+			     channel      TEXT    NOT NULL,
+			     sequence     INTEGER NOT NULL,
+			     sender_user  BLOB    NOT NULL,
+			     sender_device BLOB   NOT NULL,
+			     body         BLOB    NOT NULL,
+			     nonce        BLOB    NOT NULL,
+			     origin_ts    INTEGER NOT NULL,
+			     prev_hash    BLOB    NOT NULL,
+			     chain_hash   BLOB    NOT NULL,
+			     PRIMARY KEY (community_id, channel, sequence)
+			 );
+
 			 CREATE TABLE IF NOT EXISTS server_identity (
 			     id      INTEGER PRIMARY KEY CHECK (id = 1),
 			     pickle  TEXT NOT NULL
@@ -421,6 +466,184 @@ impl Store {
 			)?;
 		}
 		Ok(dropped)
+	}
+
+	// ---- communities (§7, §8) ---------------------------------------------
+
+	/// Records a community this host will serve.
+	///
+	/// The caller has already checked that the id is the hash of the root
+	/// (invariant 13) and that the founder signed it. Storing the mode
+	/// alongside is a convenience for queries, not a second source of truth —
+	/// it is inside the id, so it cannot be changed under the same identity.
+	pub fn create_community(
+		&self,
+		id: &CommunityId,
+		root_json: &str,
+		mode: &str,
+		now: u64,
+	) -> Result<bool> {
+		let inserted = self.db.execute(
+			"INSERT OR IGNORE INTO communities (community_id, root, mode, created_at)
+			 VALUES (?1, ?2, ?3, ?4)",
+			params![id.as_bytes().as_slice(), root_json, mode, now],
+		)?;
+		Ok(inserted == 1)
+	}
+
+	pub fn community_root(&self, id: &CommunityId) -> Result<Option<String>> {
+		Ok(self
+			.db
+			.query_row(
+				"SELECT root FROM communities WHERE community_id = ?1",
+				params![id.as_bytes().as_slice()],
+				|r| r.get(0),
+			)
+			.optional()?)
+	}
+
+	pub fn policy_chain(&self, id: &CommunityId) -> Result<Vec<String>> {
+		let mut stmt = self.db.prepare(
+			"SELECT record FROM community_policy WHERE community_id = ?1 ORDER BY sequence",
+		)?;
+		Ok(stmt
+			.query_map(params![id.as_bytes().as_slice()], |r| r.get(0))?
+			.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	/// Appends a policy record. Fails if that sequence is already taken, which
+	/// is what stops a stale record being replayed into the chain.
+	pub fn append_policy(&self, id: &CommunityId, sequence: u64, record: &str) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO community_policy (community_id, sequence, record) VALUES (?1, ?2, ?3)",
+			params![id.as_bytes().as_slice(), sequence, record],
+		)?;
+		Ok(())
+	}
+
+	pub fn add_member(&self, id: &CommunityId, user: &UserId, now: u64) -> Result<()> {
+		self.db.execute(
+			"INSERT OR IGNORE INTO community_members (community_id, user_id, joined_at)
+			 VALUES (?1, ?2, ?3)",
+			params![id.as_bytes().as_slice(), user.as_bytes().as_slice(), now],
+		)?;
+		Ok(())
+	}
+
+	pub fn is_member(&self, id: &CommunityId, user: &UserId) -> Result<bool> {
+		Ok(self.db.query_row(
+			"SELECT EXISTS(SELECT 1 FROM community_members WHERE community_id = ?1 AND user_id = ?2)",
+			params![id.as_bytes().as_slice(), user.as_bytes().as_slice()],
+			|r| r.get::<_, i64>(0),
+		)? == 1)
+	}
+
+	pub fn members(&self, id: &CommunityId) -> Result<Vec<UserId>> {
+		let mut stmt = self
+			.db
+			.prepare("SELECT user_id FROM community_members WHERE community_id = ?1")?;
+		let rows = stmt
+			.query_map(params![id.as_bytes().as_slice()], |r| {
+				r.get::<_, Vec<u8>>(0)
+			})?
+			.collect::<Result<Vec<_>, _>>()?;
+
+		Ok(rows
+			.into_iter()
+			.filter_map(|b| b.as_slice().try_into().ok().map(UserId::from_bytes))
+			.collect())
+	}
+
+	/// Files a message and hands back the position the host gave it.
+	///
+	/// The sequence and the previous hash come from here, never from the
+	/// sender. Two messages racing get two positions; neither can claim one.
+	pub fn append_channel_message(&self, delivery: &ChannelDelivery) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO channel_messages
+			   (community_id, channel, sequence, sender_user, sender_device,
+			    body, nonce, origin_ts, prev_hash, chain_hash)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+			params![
+				delivery.community.as_bytes().as_slice(),
+				delivery.channel,
+				delivery.sequence,
+				delivery.sender.user.as_bytes().as_slice(),
+				delivery.sender.device.as_bytes().as_slice(),
+				delivery.body,
+				delivery.nonce.as_slice(),
+				delivery.origin_ts,
+				delivery.prev_hash.as_slice(),
+				delivery.chain_hash().as_slice(),
+			],
+		)?;
+		Ok(())
+	}
+
+	/// The tail of a channel: the next sequence, and what to chain onto.
+	pub fn channel_head(&self, id: &CommunityId, channel: &str) -> Result<(u64, [u8; 32])> {
+		let row: Option<(i64, Vec<u8>)> = self
+			.db
+			.query_row(
+				"SELECT sequence, chain_hash FROM channel_messages
+				 WHERE community_id = ?1 AND channel = ?2
+				 ORDER BY sequence DESC LIMIT 1",
+				params![id.as_bytes().as_slice(), channel],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)
+			.optional()?;
+
+		Ok(match row {
+			None => (1, [0u8; 32]),
+			Some((sequence, hash)) => (
+				sequence as u64 + 1,
+				hash.as_slice().try_into().unwrap_or([0u8; 32]),
+			),
+		})
+	}
+
+	/// Everything in a channel after `after`, oldest first.
+	pub fn channel_since(
+		&self,
+		id: &CommunityId,
+		channel: &str,
+		after: u64,
+		limit: usize,
+	) -> Result<Vec<ChannelDelivery>> {
+		let mut stmt = self.db.prepare(
+			"SELECT sequence, sender_user, sender_device, body, nonce, origin_ts, prev_hash
+			 FROM channel_messages
+			 WHERE community_id = ?1 AND channel = ?2 AND sequence > ?3
+			 ORDER BY sequence LIMIT ?4",
+		)?;
+
+		let community = *id;
+		let channel_name = channel.to_owned();
+		let rows = stmt.query_map(
+			params![id.as_bytes().as_slice(), channel, after, limit as i64],
+			move |r| {
+				let user: Vec<u8> = r.get(1)?;
+				let device: Vec<u8> = r.get(2)?;
+				let nonce: Vec<u8> = r.get(4)?;
+				let prev: Vec<u8> = r.get(6)?;
+
+				Ok(ChannelDelivery {
+					community,
+					channel: channel_name.clone(),
+					sender: DeviceAddress::new(
+						UserId::from_bytes(user.as_slice().try_into().unwrap_or([0; 16])),
+						DeviceId::from_bytes(device.as_slice().try_into().unwrap_or([0; 16])),
+					),
+					body: r.get(3)?,
+					nonce: nonce.as_slice().try_into().unwrap_or([0; 16]),
+					origin_ts: r.get::<_, i64>(5)? as u64,
+					sequence: r.get::<_, i64>(0)? as u64,
+					prev_hash: prev.as_slice().try_into().unwrap_or([0; 32]),
+				})
+			},
+		)?;
+
+		Ok(rows.collect::<Result<Vec<_>, _>>()?)
 	}
 
 	// ---- the server's own identity ----------------------------------------

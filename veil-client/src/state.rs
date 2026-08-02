@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use std::collections::HashMap;
 use veil_protocol::{
+	community::{CommunityId, CommunityRoot, Mode},
 	crosssign::{CrossSigningPublic, CrossSigningSecrets},
 	identity::{DeviceAddress, DeviceId, DeviceList, UserId},
 	message::{MessageId, SeenWindow},
@@ -124,6 +125,15 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// Communities this device knows the mode of (§7).
+	///
+	/// Kept because the mode cannot be recovered from an id — the id is a hash
+	/// of the root, which is what makes it unforgeable (invariant 13) and also
+	/// what makes it opaque. A client that has verified a root records what it
+	/// found, so it can refuse to send plaintext into a Sealed community later.
+	#[serde_as(as = "Vec<(_, _)>")]
+	#[serde(default)]
+	pub known_communities: HashMap<CommunityId, Mode>,
 	/// People we have verified. Keyed by user, never by device (§5.4).
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
@@ -170,6 +180,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			known_communities: HashMap::new(),
 			verified_users: HashMap::new(),
 			ip_and_port,
 			relay: None,
@@ -226,6 +237,29 @@ impl State {
 
 	pub fn is_verified(&self, user: &UserId) -> bool {
 		self.verified_users.contains_key(user)
+	}
+
+	/// This user's cross-signing secrets.
+	///
+	/// Exposed rather than public so the one caller that needs the master key —
+	/// founding a community, which the founder signs with it (§7.1) — has to ask
+	/// for it explicitly.
+	pub fn cross_signing(&self) -> &CrossSigningSecrets {
+		&self.cross_signing
+	}
+
+	/// What mode a community was founded in, if this device has verified its
+	/// root.
+	///
+	/// `None` means "not known", not "Open". A caller deciding whether it is
+	/// safe to send plaintext must treat the two differently.
+	pub fn community_mode(&self, id: &CommunityId) -> Option<Mode> {
+		self.known_communities.get(id).copied()
+	}
+
+	/// Records a community whose root has been checked against its id.
+	pub fn remember_community(&mut self, root: &CommunityRoot) {
+		self.known_communities.insert(root.id(), root.mode);
 	}
 
 	pub fn schemes(&self) -> (&'static str, &'static str) {

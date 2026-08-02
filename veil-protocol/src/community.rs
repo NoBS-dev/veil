@@ -375,6 +375,27 @@ impl CommunityState {
 		})
 	}
 
+	/// Starts from a root whose founder signature has already been checked.
+	///
+	/// For a host replaying its own stored chain. The root is immutable — its
+	/// hash *is* the id — and it was verified when the community was
+	/// registered, so re-checking it here would only require keeping the
+	/// founder's master key on hand forever to learn nothing new.
+	///
+	/// Not for anything that received a root from elsewhere: there,
+	/// [`Self::from_root`] is the one that makes the founder prove it.
+	pub fn without_founder_check(root: CommunityRoot) -> anyhow::Result<Self> {
+		Ok(Self {
+			id: root.id(),
+			mode: root.mode,
+			min_version: 1,
+			host: None,
+			channel_readers: std::collections::HashMap::new(),
+			sequence: 0,
+			root,
+		})
+	}
+
 	/// Applies one policy record, or explains why it was refused.
 	///
 	/// Four independent checks, and every one is load-bearing:

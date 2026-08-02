@@ -98,9 +98,10 @@ to.
 | Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
-| Community roots, policy chain, mode binding | **[built]** `community.rs`, not yet wired to a transport |
+| Community roots, policy chain, mode binding | **[built]** `community.rs`, served over a transport |
+| Communities and channels on a host | **[built]** `veil-server/src/community.rs` — create, join, post, backfill, host-assigned ordering |
 | Moderation and reporting under Sealed | designed, §7.6 |
-| Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, not yet wired to a transport |
+| Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`; **not yet wired into the client**, so Sealed channels are refused rather than sent in the clear |
 | Roles: read-vs-rest split, signed role state | designed, §8.5 |
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
@@ -118,7 +119,7 @@ to.
 | Time synchronisation | **[built]** `clock.rs`, server-side |
 | Client architecture (seam, Qt, mobile) | designed, §17 |
 | Client split: Rust daemon + C++/Qt over a socket | **validated by spike**, §17.3 |
-| Communities, channels, bots | **not designed** |
+| Channel roles, moderation, bots | **not designed** |
 
 §4 (threat model), §6 (trust establishment), §14 (metadata) and §15 (sequencing)
 are analysis rather than subsystems and carry no build status of their own.
@@ -133,10 +134,16 @@ can reach each other, and the relay is genuinely blind (§3.2) — it carries an
 end-to-end TLS session it cannot read, and validates only that what passes is
 TLS at all.
 
-What remains absent is **communities and channels above the primitives**:
-`community.rs` and `groupkeys.rs` are correct and tested, but nothing carries
-them over a wire and the server has no notion of a channel. That is a design
-gap before it is an implementation one — see the table above.
+Communities exist on a host: they can be founded, joined and posted to, and the
+host assigns every message a position in a hash chain (§10.1) so no member can
+claim one. Membership gates both writing and reading history.
+
+What remains is the part that makes a community *usable*. **Megolm is not wired
+into the client**, so a Sealed channel is refused rather than sent in the clear —
+the primitives are built and tested, but a sender needs the reader set from the
+policy chain and a device list per reader before it can encrypt to them. Beyond
+that, **roles and moderation** (§8.5, §7.6) and **channel administration** are
+designed but unbuilt, and **bots** are not designed at all.
 
 ---
 

@@ -130,7 +130,17 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
-`remove`, `quit`.
+`remove`, `quit`, and for communities `found`, `join`, `say`, `history`.
+
+The client quits as soon as stdin closes, so a command whose answer arrives
+asynchronously — anything to do with a community, or an incoming message — needs
+the input held open afterwards or the reply is never printed. That is not a bug;
+it is what makes the tests deterministic.
+
+A DM to someone on another server takes `<user-id>/<device-id>@host:port` (§3.4).
+The client hands it to its own home server, which delivers it; the lookup goes
+through the same server's `/remote` proxy so the recipient's host never sees the
+sender's IP.
 
 A profile may carry a relay (§3.2). With one set the client tunnels through it,
 so the destination sees the relay's address rather than the client's. Test it by
@@ -243,7 +253,14 @@ been checked this way; the client ones were verified against five separate
 mutations (identity-key check, signing-key check, device-list membership,
 profile persistence, and the stdin-EOF quit), each failing only its own test.
 
-`veil-protocol` has 80 tests covering envelope forgery, re-attribution, replay,
+`veil-server/tests/s2s.rs` and `community.rs` cover the two subsystems where a
+host is the adversary: cross-server mail (deposits are terminal, refused for
+strangers, and never accepted on the client endpoint) and communities (a
+stranger cannot post or backfill, the host assigns position, policy needs k
+distinct controllers, and a Sealed channel leaves nothing readable in the host's
+database — checked by grepping the database file, WAL included).
+
+`veil-protocol` has 82 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.

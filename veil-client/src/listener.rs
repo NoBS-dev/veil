@@ -92,6 +92,36 @@ pub async fn listener(
 
 						// If we have less than half OTKs in our pool, regen some more
 					}
+					ProtocolMessage::Delivery(delivery) => {
+						// Position and chain come from the host (§10.1). Shown
+						// so a discrepancy is visible to a person rather than
+						// silently absorbed.
+						println!(
+							"[{}#{} {}] {}",
+							delivery.community,
+							delivery.channel,
+							delivery.sequence,
+							String::from_utf8_lossy(&delivery.body)
+						);
+					}
+					ProtocolMessage::CommunityResult {
+						community,
+						ok,
+						detail,
+					} => {
+						if ok {
+							println!("[{community}] {detail}");
+						} else {
+							eprintln!("[{community}] refused: {detail}");
+						}
+					}
+					ProtocolMessage::CommunityState(view) => {
+						println!(
+							"[community] {} member(s), {} policy record(s)",
+							view.members.len(),
+							view.policy_chain.len()
+						);
+					}
 					protocol_message => {
 						println!(
 							"Received a protocol message that we don't usually handle: {:?}",

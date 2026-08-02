@@ -303,6 +303,129 @@ pub enum ProtocolMessage {
 	/// sender that guesses either way is wrong half the time — it drops mail it
 	/// should have retried, or retries mail the recipient already has.
 	DepositResult(DepositResult),
+
+	// ---- communities (§7, §8) --------------------------------------------
+	//
+	// All client -> host except where noted. A community lives on exactly one
+	// host and never replicates (§3.3), so none of this crosses a server
+	// boundary and none of it needs convergence.
+	/// Registers a community on this host.
+	CreateCommunity(Box<community::CommunityRoot>),
+	/// Asks to be admitted. Membership is what the host enforces; in Sealed it
+	/// governs fan-out, not readability, which is key possession (§7).
+	JoinCommunity(community::CommunityId),
+	/// Host -> client: the community as this host holds it.
+	CommunityState(Box<CommunityView>),
+	/// Sends to a channel. The host assigns position; see [`ChannelPost`].
+	Post(ChannelPost),
+	/// Host -> members: a message, at the position the host gave it.
+	Delivery(Box<ChannelDelivery>),
+	/// Asks for what was missed.
+	Backfill {
+		community: community::CommunityId,
+		channel: String,
+		/// Exclusive. Zero for the whole channel.
+		after: u64,
+	},
+	/// Adds a signed policy record to the chain (§7.4).
+	SubmitPolicy(Box<community::SignedPolicy>),
+	/// Host -> client: what became of a community request.
+	CommunityResult {
+		community: community::CommunityId,
+		ok: bool,
+		detail: String,
+	},
+}
+
+/// A community as a host holds it.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct CommunityView {
+	/// JSON, because the root and the chain are `serde` types that clients
+	/// verify themselves. The host is not trusted for either — the id is a hash
+	/// of the root (invariant 13) and every policy record carries its
+	/// controllers' signatures, so a host that edits either is caught.
+	pub root: String,
+	pub policy_chain: Vec<String>,
+	pub members: Vec<UserId>,
+}
+
+/// A message sent to a channel.
+///
+/// **Carries no sequence number and no previous hash.** The host assigns both
+/// (§10.1): a member sends one message and the host propagates it, so a member
+/// has no way to claim a position in history — which is what removes the need
+/// for the state resolution Matrix needs to reconcile competing claims.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct ChannelPost {
+	pub community: community::CommunityId,
+	pub channel: String,
+	/// Sealed: Megolm ciphertext the host cannot read. Open: the plaintext the
+	/// host is expected to be able to read, which is what makes search,
+	/// moderation and bots possible (§7.2).
+	///
+	/// The host does not decide which — the mode is inside the community id
+	/// (invariant 13), so it cannot serve one mode under the identity of the
+	/// other.
+	pub body: Vec<u8>,
+	/// Distinguishes two identical messages and survives a resend, so a retry
+	/// lands on the same id (§10).
+	pub nonce: [u8; 16],
+	/// The sender's clock. Untrusted — an input to the id, not an ordering
+	/// authority.
+	pub origin_ts: u64,
+}
+
+/// A message at the position its host gave it.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct ChannelDelivery {
+	pub community: community::CommunityId,
+	pub channel: String,
+	pub sender: DeviceAddress,
+	pub body: Vec<u8>,
+	pub nonce: [u8; 16],
+	pub origin_ts: u64,
+	/// Assigned by the host, monotonic per channel.
+	pub sequence: u64,
+	/// Hash of the previous delivery in this channel, `[0; 32]` at the start.
+	///
+	/// Host-maintained (§10.1). It makes history tamper-evident *after the
+	/// fact*: a host that deletes or reorders a message breaks the chain for
+	/// every client that saw the original, which is detection rather than
+	/// prevention — the honest guarantee, since a single host necessarily
+	/// could serve two clients different histories.
+	pub prev_hash: [u8; 32],
+}
+
+impl ChannelDelivery {
+	/// The content-addressed id (§10). Recomputed, never read off the wire, so
+	/// a claimed id cannot disagree with the content (invariant 12).
+	pub fn id(&self) -> MessageId {
+		let mut hasher = Sha256::new();
+		hasher.update(b"veil-channel-message-v1");
+		hasher.update(self.community.as_bytes());
+		hasher.update((self.channel.len() as u32).to_le_bytes());
+		hasher.update(self.channel.as_bytes());
+		hasher.update(self.sender.user.as_bytes());
+		hasher.update(self.sender.device.as_bytes());
+		hasher.update(self.origin_ts.to_le_bytes());
+		hasher.update(self.nonce);
+		hasher.update((self.body.len() as u64).to_le_bytes());
+		hasher.update(&self.body);
+		MessageId::from_bytes(hasher.finalize().into())
+	}
+
+	/// What the *next* message chains onto.
+	pub fn chain_hash(&self) -> [u8; 32] {
+		let mut hasher = Sha256::new();
+		hasher.update(b"veil-channel-chain-v1");
+		hasher.update(self.prev_hash);
+		hasher.update(self.sequence.to_le_bytes());
+		hasher.update(self.id().as_bytes());
+		hasher.finalize().into()
+	}
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
@@ -586,10 +709,30 @@ mod tests {
 	#[test]
 	fn replay_guard_rejects_a_stale_timestamp() {
 		let mut guard = ReplayGuard::default();
-		let now = now_ms().unwrap();
 
-		assert!(guard.check(now - REPLAY_WINDOW_MS - 1, [1; 16]).is_err());
-		assert!(guard.check(now + REPLAY_WINDOW_MS + 1, [2; 16]).is_err());
+		// `check_at` rather than `check`, so "now" is the same value the
+		// assertion was written against. Reading the clock twice made this
+		// flaky: a millisecond passing between the two put a timestamp one
+		// millisecond outside the window exactly on the boundary, where it is
+		// accepted, and the test failed for a reason that had nothing to do
+		// with replay.
+		let now = 1_000_000_000_000;
+
+		assert!(
+			guard
+				.check_at(now, now - REPLAY_WINDOW_MS - 1, [1; 16])
+				.is_err()
+		);
+		assert!(
+			guard
+				.check_at(now, now + REPLAY_WINDOW_MS + 1, [2; 16])
+				.is_err()
+		);
+
+		// The boundary itself is inside the window, which is what the two
+		// assertions above are one millisecond beyond.
+		assert!(guard.check_at(now, now - REPLAY_WINDOW_MS, [3; 16]).is_ok());
+		assert!(guard.check_at(now, now + REPLAY_WINDOW_MS, [4; 16]).is_ok());
 	}
 
 	/// §13.3: the limiter must not accumulate an entry per key ever seen.

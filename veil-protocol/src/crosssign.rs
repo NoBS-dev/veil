@@ -115,6 +115,20 @@ impl CrossSigningSecrets {
 
 	/// Enrols a device. Note this uses the **self-signing** key — the master key
 	/// is not touched, which is the entire reason for the split.
+	/// The master key itself, for the rare things only it can do.
+	///
+	/// Founding a community is one: the root is verified against the founder's
+	/// master key, which is what their user id is derived from (§5.1), so
+	/// nothing else can stand in for it.
+	///
+	/// Deliberately not used for anything routine. Invariant 9 keeps the master
+	/// key out of device enrolment — that is what the self-signing key exists
+	/// for — and every additional caller here is another reason it has to be
+	/// warm when it should be cold.
+	pub fn master_secret(&self) -> &Ed25519SecretKey {
+		&self.master
+	}
+
 	pub fn sign_device(&self, device: &DeviceId, device_ed25519: &[u8; 32]) -> [u8; 64] {
 		self.self_signing
 			.sign(&device_binding_input(

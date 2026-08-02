@@ -193,7 +193,7 @@ async fn free_port() -> u16 {
 	port
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.unwrap()
@@ -682,4 +682,47 @@ pub fn compose_offline(recipient: DeviceAddress, text: &str) -> Vec<u8> {
 	)
 	.unwrap()
 	.to_vec()
+}
+
+/// Re-exported so tests can build a post without importing the internals.
+pub fn nonce() -> [u8; 16] {
+	random_nonce()
+}
+
+/// A Megolm ciphertext, as a Sealed client would send.
+///
+/// Uses the real provider rather than a stand-in, so what the host is asked to
+/// store is genuinely what a Sealed community produces — a test that stored
+/// scrambled bytes would prove nothing about the tier.
+pub fn sealed_body(plaintext: &[u8]) -> Vec<u8> {
+	use veil_protocol::{
+		community::Mode,
+		groupkeys::{ChannelId, GroupKeyProvider, MegolmProvider, Readership},
+	};
+
+	let founder = CrossSigningSecrets::new();
+	let community = veil_protocol::community::CommunityRoot::found(
+		Mode::Sealed,
+		vec![founder.master_public()],
+		1,
+		founder.master_secret(),
+		now_ms(),
+	)
+	.unwrap()
+	.id();
+
+	let channel = ChannelId::new(community, "general");
+	let mut provider = MegolmProvider::new();
+	let reader = DeviceAddress::new(CrossSigningSecrets::new().user_id(), DeviceId::generate());
+	provider
+		.set_readership(
+			&channel,
+			&Readership {
+				devices: [reader].into_iter().collect(),
+				policy_sequence: 1,
+			},
+		)
+		.unwrap();
+
+	provider.encrypt(&channel, plaintext).unwrap()
 }
