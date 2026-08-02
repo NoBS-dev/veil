@@ -1,17 +1,25 @@
 use crate::{
-	ReadStream,
+	ReadStream, WriteStream,
 	state::{PeerSession, State},
 };
+use futures_util::SinkExt;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tungstenite::Bytes;
 use tungstenite::protocol::Message;
 use veil_protocol::{
-	EncryptedMessage, ProtocolMessage, ReplayGuard, display_key, message::MessageId, open_envelope,
+	EncryptedMessage, Envelope, ProtocolMessage, ReplayGuard, display_key, message::MessageId,
+	open_envelope,
 };
 use vodozemac::olm::OlmMessage;
 
-pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_identity: [u8; 32]) {
+pub async fn listener(
+	mut read: ReadStream,
+	write: Arc<Mutex<WriteStream>>,
+	state: Arc<Mutex<State>>,
+	server_identity: [u8; 32],
+) {
 	let mut replay_guard = ReplayGuard::default();
 
 	while let Some(incoming_data) = read.next().await {
@@ -34,6 +42,39 @@ pub async fn listener(mut read: ReadStream, state: Arc<Mutex<State>>, server_ide
 					ProtocolMessage::EncryptedMessage(encrypted_message) => {
 						process_encrypted_message(state.clone(), opened.sender, encrypted_message)
 							.await;
+					}
+
+					// Mail queued while we were away. Only the server can
+					// legitimately send this, and only the *inner* frame is
+					// trusted — it carries its own sender's signature.
+					ProtocolMessage::Mail(mail) => {
+						if opened.sender != server_identity {
+							eprintln!(
+								"[Notification] Ignoring queued mail offered by {}, which is not the server.",
+								display_key(&opened.sender)
+							);
+							continue;
+						}
+
+						match open_envelope(&mail.frame) {
+							Ok(inner) => {
+								if let ProtocolMessage::EncryptedMessage(msg) = inner.message {
+									process_encrypted_message(state.clone(), inner.sender, msg)
+										.await;
+								} else {
+									eprintln!("[Notification] Queued mail was not a message.");
+								}
+							}
+							Err(e) => {
+								eprintln!("[Notification] Queued mail is unverifiable: {e:#}")
+							}
+						}
+
+						// Acknowledged after processing, not on receipt: if we
+						// die in between, the server still holds it (§12.2).
+						if let Err(e) = acknowledge(&write, &state, mail.id).await {
+							eprintln!("[Notification] Could not acknowledge mail: {e:#}");
+						}
 					}
 					ProtocolMessage::RemainingOneTimeKeys(remaining_otks) => {
 						// Only the server has a view of the pool, so anyone else
@@ -188,4 +229,23 @@ async fn process_encrypted_message(
 	} else {
 		eprintln!("Saved!");
 	}
+}
+
+/// Tells the server a queued message has been dealt with, so it can drop it.
+async fn acknowledge(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &Arc<Mutex<State>>,
+	id: u64,
+) -> anyhow::Result<()> {
+	let framed = {
+		let state = state.lock().await;
+		Envelope::seal(&ProtocolMessage::Acknowledge(vec![id]), &state.account)?
+	};
+
+	write
+		.lock()
+		.await
+		.send(Message::Binary(Bytes::copy_from_slice(&framed)))
+		.await?;
+	Ok(())
 }

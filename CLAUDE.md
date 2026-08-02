@@ -162,24 +162,29 @@ explicitly — each one closes a specific attack.
 10. **Device lists served by a host are untrusted input.** Every entry is
     checked against the owner's cross-signing keys before it is believed;
     entries that fail are dropped rather than failing the whole list.
-11. **A message's id is recomputed, never read off the wire.** It is a hash of
+11. **Queued mail is dropped only on acknowledgement.** The server has exactly
+    one delete path and it runs when a client says a message arrived — sending
+    is not receiving, so a client that dies mid-flush gets the mail again.
+    Acknowledgement is scoped to the acknowledging device, since an id is just a
+    row number.
+12. **A message's id is recomputed, never read off the wire.** It is a hash of
     the message, so a claimed id cannot disagree with the content. Duplicates
     are dropped *before* any Olm work, since decrypting twice would advance a
     ratchet for a message already handled.
-12. **A community's encryption mode is inside its id.** `CommunityId` hashes the
+13. **A community's encryption mode is inside its id.** `CommunityId` hashes the
     root record, mode included, so a host cannot serve a different mode under
     the same id. Anything that might ever change belongs in the signed policy
     chain instead — a root field is frozen for the community's life.
-13. **Version ranges are negotiated inside signed envelopes, and echoed back.**
+14. **Version ranges are negotiated inside signed envelopes, and echoed back.**
     Signing alone is not enough — an old challenge is genuinely signed, so the
     client replay-guards it and the server checks the client saw the range it
     actually advertised. Both are downgrade defences.
-14. **The relay is not an arbitrary tunnel.** It authenticates the user first
+15. **The relay is not an arbitrary tunnel.** It authenticates the user first
     (so limits are per user), and refuses any destination that cannot produce a
     signed Veil challenge. That check is what stops it being an open proxy —
     it cannot be pointed at a web server at all, rather than merely being
     discouraged from it.
-15. **Policy needs k *distinct* controllers.** One controller signing twice must
+16. **Policy needs k *distinct* controllers.** One controller signing twice must
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
 

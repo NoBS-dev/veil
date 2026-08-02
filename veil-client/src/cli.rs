@@ -11,7 +11,7 @@ use veil_protocol::{display_key, identity::UserId, safety_number};
 pub async fn cli(
 	prompt: &str,
 	url: &str,
-	mut write: WriteStream,
+	write: Arc<Mutex<WriteStream>>,
 	state: Arc<Mutex<State>>,
 ) -> Result<()> {
 	loop {
@@ -54,7 +54,7 @@ pub async fn cli(
 			"msg" => {
 				println!("{:?}", list_clients(url).await?);
 
-				if let Err(e) = messaging::send(&mut write, &mut state, url).await {
+				if let Err(e) = messaging::send(&mut *write.lock().await, &mut state, url).await {
 					eprintln!("Send message error: {e:#}");
 				}
 			}

@@ -438,6 +438,18 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				eprintln!("Key upload from {address} handled properly.");
 			}
 
+			ProtocolMessage::Acknowledge(ids) => {
+				let ids: Vec<i64> = ids.iter().map(|id| *id as i64).collect();
+				match state.store.lock().await.acknowledge_for(&address, &ids) {
+					Ok(dropped) => {
+						eprintln!("{address} acknowledged {dropped} queued message(s)")
+					}
+					Err(e) => eprintln!("Could not clear mail for {address}: {e:#}"),
+				}
+			}
+			ProtocolMessage::Mail(_) => {
+				eprintln!("Received mail from a client. Should be impossible; ignoring.")
+			}
 			ProtocolMessage::Challenge(_) | ProtocolMessage::Authenticate(_) => {
 				eprintln!("Received a handshake message outside the handshake. Ignoring.")
 			}
@@ -452,38 +464,43 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 	println!("{address} disconnected");
 }
 
-// TODO: this hands the full roster to anyone who asks, which is a metadata leak
-// no amount of rate limiting fixes. It wants replacing with per-user contact
-// lists before this faces an untrusted network.
-/// Delivers whatever was waiting for a device, then forgets it.
+/// Offers whatever was waiting for a device.
 ///
-/// Acknowledgement is delivery to the outbox rather than a client-side receipt.
-/// That is weaker than §12.2's "retained until every device has acked" and is
-/// noted as such — a client that dies between queue and read loses the frame.
-/// Closing that needs an explicit ack from the client, which is the next step.
+/// Nothing is dropped here. §12.2 makes delivery acknowledgement-based, so an
+/// entry is retained until the client says it arrived — a client that dies
+/// between the send and reading it gets the same mail again rather than losing
+/// it. Sending is not receiving.
 async fn flush_mailbox(state: &ServerState, address: &DeviceAddress) -> Result<()> {
 	let pending = state.store.lock().await.pending(address)?;
 	if pending.is_empty() {
 		return Ok(());
 	}
 
-	eprintln!(
-		"Delivering {} queued message(s) to {address}",
-		pending.len()
-	);
+	eprintln!("Offering {} queued message(s) to {address}", pending.len());
 
-	let mut delivered = Vec::with_capacity(pending.len());
 	for (id, frame) in pending {
-		if route_to(address, frame).await.is_err() {
-			break; // it went away again; the rest stays queued
+		let framed = {
+			let account = state.server_account.lock().await;
+			Envelope::seal(
+				&ProtocolMessage::Mail(Mail {
+					id: id as u64,
+					frame,
+				}),
+				&account,
+			)?
+		};
+
+		if route_to(address, framed.to_vec()).await.is_err() {
+			break; // gone again; the rest stays queued
 		}
-		delivered.push(id);
 	}
 
-	state.store.lock().await.acknowledge(&delivered)?;
 	Ok(())
 }
 
+// TODO: this hands the full roster to anyone who asks, which is a metadata leak
+// no amount of rate limiting fixes. It wants replacing with per-user contact
+// lists before this faces an untrusted network.
 async fn list_clients(
 	State(state): State<ServerState>,
 	ConnectInfo(peer): ConnectInfo<SocketAddr>,

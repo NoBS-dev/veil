@@ -376,14 +376,24 @@ impl Store {
 			.collect::<Result<Vec<_>, _>>()?)
 	}
 
-	/// Drops delivered frames. Called only once the recipient has them, so an
-	/// interrupted delivery is retried rather than lost.
-	pub fn acknowledge(&self, ids: &[i64]) -> Result<()> {
+	/// Drops frames the recipient has confirmed receiving.
+	///
+	/// Scoped to the acknowledging device on purpose: an id is just a row
+	/// number, so without this a client could acknowledge — and therefore
+	/// delete — mail addressed to somebody else.
+	pub fn acknowledge_for(&self, recipient: &DeviceAddress, ids: &[i64]) -> Result<usize> {
+		let mut dropped = 0;
 		for id in ids {
-			self.db
-				.execute("DELETE FROM mailbox WHERE id = ?1", params![id])?;
+			dropped += self.db.execute(
+				"DELETE FROM mailbox WHERE id = ?1 AND user_id = ?2 AND device_id = ?3",
+				params![
+					id,
+					recipient.user.as_bytes().as_slice(),
+					recipient.device.as_bytes().as_slice()
+				],
+			)?;
 		}
-		Ok(())
+		Ok(dropped)
 	}
 
 	#[cfg(test)]
@@ -545,9 +555,28 @@ mod tests {
 		assert_eq!(waiting[0].1, b"first", "oldest first");
 
 		// Acknowledged only after delivery, so an interrupted flush retries.
-		store.acknowledge(&[waiting[0].0]).unwrap();
+		store.acknowledge_for(&address, &[waiting[0].0]).unwrap();
 		assert_eq!(store.pending_count(&address).unwrap(), 1);
 		assert_eq!(store.pending(&address).unwrap()[0].1, b"second");
+	}
+
+	/// An id is a row number, so acknowledgement must be scoped to the device
+	/// doing the acknowledging — otherwise a client could delete other people's
+	/// mail by guessing.
+	#[test]
+	fn a_device_cannot_acknowledge_another_devices_mail() {
+		let (store, user, _, device) = fixture();
+		let mine = DeviceAddress::new(user, device.device_id);
+		let other = DeviceAddress::new(user, DeviceId::generate());
+
+		store.enqueue(&mine, b"private", 1).unwrap();
+		let id = store.pending(&mine).unwrap()[0].0;
+
+		assert_eq!(store.acknowledge_for(&other, &[id]).unwrap(), 0);
+		assert_eq!(store.pending_count(&mine).unwrap(), 1, "mail must survive");
+
+		assert_eq!(store.acknowledge_for(&mine, &[id]).unwrap(), 1);
+		assert_eq!(store.pending_count(&mine).unwrap(), 0);
 	}
 
 	#[test]

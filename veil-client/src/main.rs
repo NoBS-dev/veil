@@ -118,7 +118,14 @@ async fn main() -> anyhow::Result<()> {
 	state.save_to_keyring()?;
 
 	let state = Arc::new(Mutex::new(state));
-	tokio::spawn(listener::listener(read, state.clone(), server_identity));
+	// Shared so the listener can acknowledge mail without waiting on the CLI.
+	let write = Arc::new(Mutex::new(write));
+	tokio::spawn(listener::listener(
+		read,
+		write.clone(),
+		state.clone(),
+		server_identity,
+	));
 	cli(&prompt, &url, write, state).await?;
 
 	Ok(())

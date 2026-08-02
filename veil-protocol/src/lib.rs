@@ -264,6 +264,17 @@ pub enum ProtocolMessage {
 	Authenticate(Box<Authenticate>),
 	UploadKeys(UploadKeys),
 	EncryptedMessage(EncryptedMessage),
+	/// Server -> client: a frame that was queued while the device was away.
+	///
+	/// The inner frame is the sender's own signed envelope, untouched — this
+	/// wrapper only carries the id to acknowledge. The server is not trusted for
+	/// the contents; it is trusted to say what it is holding.
+	Mail(Mail),
+	/// Client -> server: these mailbox entries arrived and may be dropped.
+	///
+	/// Delivery is by acknowledgement rather than by send (§12.2), so a client
+	/// that dies mid-flush gets the same mail again rather than losing it.
+	Acknowledge(Vec<u64>),
 	RemainingOneTimeKeys(u16),
 }
 
@@ -298,6 +309,14 @@ pub struct Authenticate {
 	/// The **self-signing** key's signature over (user, device, device key).
 	/// Verified against `keys`, so the chain runs device -> SSK -> MSK -> user.
 	pub binding: [u8; 64],
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Mail {
+	pub id: u64,
+	/// A complete signed envelope from the original sender.
+	pub frame: Vec<u8>,
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]
