@@ -321,6 +321,17 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 	let mut state = state.lock().await;
 	let channel = ChannelId::new(delivery.community, &delivery.channel);
 
+	// A tombstone has no content to show and none to decrypt (§10.5). Shown as
+	// a gap rather than hidden, so history stays legible: something was here,
+	// and its place in the chain is intact.
+	if delivery.tombstoned {
+		println!(
+			"[{}#{} {}] <deleted>",
+			delivery.community, delivery.channel, delivery.sequence
+		);
+		return;
+	}
+
 	let body = match state.community_mode(&delivery.community) {
 		Some(Mode::Sealed) => {
 			let mut provider = match state.megolm() {
@@ -494,6 +505,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::Backfill { .. } => "backfill request",
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
+		ProtocolMessage::DeleteMessage { .. } => "delete",
 		ProtocolMessage::ChannelKey(_) => "channel key",
 		ProtocolMessage::CommunityResult { .. } => "community result",
 	}

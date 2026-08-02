@@ -284,6 +284,35 @@ async fn deliver_key(
 	.await
 }
 
+/// Discards a message's content (§10.5).
+///
+/// **"Deleted for everyone" would be a lie**, and the client says so rather than
+/// printing it. The host's copy goes and well-behaved clients drop theirs on
+/// receipt; member exports and offline clients keep what they have. Every
+/// messaging system provides exactly this and most imply more — here, where
+/// members are *encouraged* to keep copies (§12.3), implying more would be worse.
+pub async fn delete(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let channel = ask("Channel: ")?;
+	let sequence: u64 = ask("Message number: ")?.parse()?;
+
+	println!(
+		"This removes it from the host and from anyone online. It cannot reach a copy \
+		 someone already kept."
+	);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::DeleteMessage {
+			community: id,
+			channel,
+			sequence,
+		},
+	)
+	.await
+}
+
 /// Assigns a member's role, as a signed policy record (§8.5).
 ///
 /// Only *reading* needs cryptographic enforcement — everything this grants is

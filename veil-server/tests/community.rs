@@ -509,6 +509,200 @@ async fn ban(
 	tokio::time::sleep(BEAT).await;
 }
 
+/// §10.5: deletion is tombstoning, and the chain survives it.
+///
+/// This is the property the whole design of §10 was arranged to get for free:
+/// the chain links message *ids*, and an id hashes the original content, so
+/// blanking a body leaves identity and position untouched. Deleting the row
+/// would break the chain for everyone.
+#[tokio::test]
+async fn deleting_a_message_tombstones_it_and_the_chain_still_holds() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+
+	for n in 1..=3 {
+		alice
+			.send(&post(id, "general", format!("message {n}").as_bytes()))
+			.await
+			.unwrap();
+		tokio::time::sleep(Duration::from_millis(300)).await;
+	}
+	tokio::time::sleep(BEAT).await;
+
+	let before = history(&mut alice, id).await;
+	assert_eq!(before.len(), 3);
+	let doomed_id = before[1].id();
+
+	alice
+		.send(&ProtocolMessage::DeleteMessage {
+			community: id,
+			channel: "general".into(),
+			sequence: 2,
+		})
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut alice).await;
+	assert!(
+		ok,
+		"an author should be able to delete their own message: {detail}"
+	);
+	tokio::time::sleep(BEAT).await;
+
+	let after = history(&mut alice, id).await;
+	assert_eq!(after.len(), 3, "the entry stays; only its content goes");
+	assert!(
+		after[1].tombstoned,
+		"the middle message should be a tombstone"
+	);
+	assert!(after[1].body.is_empty(), "its content should be gone");
+	assert_eq!(
+		after[1].id(),
+		doomed_id,
+		"a tombstone keeps the identity it had, which is what the chain links"
+	);
+
+	// The chain still verifies across the gap, end to end.
+	assert_eq!(after[0].prev_hash, [0u8; 32]);
+	assert_eq!(after[1].prev_hash, after[0].chain_hash());
+	assert_eq!(
+		after[2].prev_hash,
+		after[1].chain_hash(),
+		"the link after a tombstone must still verify"
+	);
+
+	// And the host's own copy is genuinely gone.
+	let mut raw = std::fs::read(&server.db).unwrap();
+	if let Ok(wal) = std::fs::read(format!("{}-wal", server.db)) {
+		raw.extend_from_slice(&wal);
+	}
+	assert!(
+		!raw.windows(b"message 2".len()).any(|w| w == b"message 2"),
+		"the deleted content must not remain in the host's database"
+	);
+	assert!(
+		raw.windows(b"message 3".len()).any(|w| w == b"message 3"),
+		"and its neighbours must be untouched"
+	);
+
+	server.stop().await;
+}
+
+/// Deleting is the author's or a moderator's, and nobody else's.
+#[tokio::test]
+async fn an_ordinary_member_cannot_delete_someone_elses_message() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+	alice
+		.send(&post(id, "general", b"alice wrote this"))
+		.await
+		.unwrap();
+	tokio::time::sleep(BEAT).await;
+
+	let mut mallory = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	mallory.upload_keys(5).await.unwrap();
+	mallory
+		.send(&ProtocolMessage::JoinCommunity(id))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut mallory).await.1);
+
+	mallory
+		.send(&ProtocolMessage::DeleteMessage {
+			community: id,
+			channel: "general".into(),
+			sequence: 1,
+		})
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut mallory).await;
+	assert!(
+		!ok,
+		"an ordinary member must not delete someone else's message"
+	);
+	assert!(detail.contains("only delete your own"), "got: {detail}");
+
+	// The control: it is still there, and still readable.
+	let history = history(&mut alice, id).await;
+	assert_eq!(history[0].body, b"alice wrote this");
+	assert!(!history[0].tombstoned);
+
+	server.stop().await;
+}
+
+/// A moderator can, which is the difference §8.5 draws between the two.
+#[tokio::test]
+async fn a_moderator_can_delete_anyone_s_message() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+
+	let mut bob = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	bob.upload_keys(5).await.unwrap();
+	bob.send(&ProtocolMessage::JoinCommunity(id)).await.unwrap();
+	assert!(expect_result(&mut bob).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	bob.send(&post(id, "general", b"bob wrote this"))
+		.await
+		.unwrap();
+	let (_, ok, _) = expect_result(&mut bob).await;
+	assert!(ok);
+	tokio::time::sleep(BEAT).await;
+
+	// Alice founded it, so she moderates by construction.
+	alice
+		.send(&ProtocolMessage::DeleteMessage {
+			community: id,
+			channel: "general".into(),
+			sequence: 1,
+		})
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut alice).await;
+	assert!(ok, "a moderator should be able to delete: {detail}");
+	tokio::time::sleep(BEAT).await;
+
+	let history = history(&mut alice, id).await;
+	assert!(history[0].tombstoned);
+
+	server.stop().await;
+}
+
+/// Everything in a channel, oldest first.
+///
+/// Drains first: posting fans the message straight back to the sender, so those
+/// live deliveries are still queued and would otherwise be counted alongside the
+/// backfill — which read as six messages where three were sent.
+async fn history(client: &mut TestClient, id: CommunityId) -> Vec<veil_protocol::ChannelDelivery> {
+	while next_delivery(client).await.is_some() {}
+
+	client
+		.send(&ProtocolMessage::Backfill {
+			community: id,
+			channel: "general".into(),
+			after: 0,
+		})
+		.await
+		.unwrap();
+
+	let mut history = Vec::new();
+	while let Some(delivery) = next_delivery(client).await {
+		history.push(delivery);
+	}
+	history
+}
+
 /// Communities are the host's authoritative state (§3.3), so they must survive
 /// a restart like anything else.
 #[tokio::test]

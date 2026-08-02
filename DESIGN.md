@@ -108,7 +108,7 @@ to.
 | Attachments and media | designed, §10.2 |
 | Presence, typing, read state | designed, §10.3 |
 | Search (client-side index) | designed, §10.4 |
-| Deletion, tombstoning, erasure | designed, §10.5 |
+| Deletion, tombstoning | **[built]** author or moderator; chain survives |
 | Attestations, standing | **[built]** `attestation.rs` |
 | Reputation, discovery, finding people | designed, §11.4–11.6 |
 | Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
@@ -176,7 +176,18 @@ The client says so rather than letting the two be confused — §8.5's asymmetry
 between a cheap permission change and an expensive one, surfaced instead of
 hidden.
 
-What remains is **moderation and reporting under Sealed** (§7.6) and **channel
+Deletion is tombstoning (§10.5) and the chain survives it, which is the property
+content-addressing was arranged to give for free. An author may delete their own
+message; a moderator may delete anyone's.
+
+One thing worth recording, because it was found by testing rather than by
+reasoning: blanking the row is **not** enough to make the content gone. SQLite
+leaves the original bytes in the write-ahead log, so a test that grepped the
+store still found a deleted message. A checkpoint after tombstoning is what
+actually removes them, and §10.5's claim that the host's copy is "not
+recoverable from the server" was false until that was added.
+
+What remains is **reporting under Sealed** (§7.6) and **channel
 administration**, which are designed but unbuilt, and **bots**, which are not
 designed.
 

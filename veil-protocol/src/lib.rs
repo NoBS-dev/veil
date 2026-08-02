@@ -329,6 +329,16 @@ pub enum ProtocolMessage {
 	},
 	/// Adds a signed policy record to the chain (§7.4).
 	SubmitPolicy(Box<community::SignedPolicy>),
+	/// Discards a message's content, keeping its place in history (§10.5).
+	///
+	/// Permitted to the author, and to a moderator. Deliberately *not* a policy
+	/// record: policy is the community's constitution and every member replays
+	/// it, whereas deleting a message is an operational act on one row.
+	DeleteMessage {
+		community: community::CommunityId,
+		channel: String,
+		sequence: u64,
+	},
 	/// Asks for a community's current root and policy chain.
 	///
 	/// A sender needs this before encrypting to a Sealed channel: readership
@@ -430,12 +440,40 @@ pub struct ChannelDelivery {
 	/// prevention — the honest guarantee, since a single host necessarily
 	/// could serve two clients different histories.
 	pub prev_hash: [u8; 32],
+
+	/// Whether the content has been discarded (§10.5).
+	///
+	/// A tombstone keeps its identity, its position and its sender, and loses
+	/// its body. That works because the chain links *message ids*, and a message
+	/// id hashes the original content — so blanking the body leaves the chain
+	/// verifying end to end. Removing the row would break it.
+	pub tombstoned: bool,
+	/// The id the host recorded when the message was filed.
+	///
+	/// Normally redundant: [`Self::id`] recomputes it, and invariant 12 says a
+	/// message's id is recomputed rather than read off the wire. A tombstone is
+	/// the exception that proves it — there is no content left to recompute
+	/// from, so this is host-asserted and checkable only by someone who kept a
+	/// copy. §10.5 states that cost plainly: the tombstoned link becomes
+	/// unverifiable, and the chain around it is unaffected.
+	pub message_id: [u8; 32],
 }
 
 impl ChannelDelivery {
-	/// The content-addressed id (§10). Recomputed, never read off the wire, so
-	/// a claimed id cannot disagree with the content (invariant 12).
+	/// The content-addressed id (§10).
+	///
+	/// Recomputed, never read off the wire, so a claimed id cannot disagree with
+	/// the content (invariant 12) — except for a tombstone, which has no content
+	/// to disagree with and so falls back to what the host recorded. See
+	/// [`Self::message_id`].
 	pub fn id(&self) -> MessageId {
+		if self.tombstoned {
+			return MessageId::from_bytes(self.message_id);
+		}
+		self.computed_id()
+	}
+
+	fn computed_id(&self) -> MessageId {
 		let mut hasher = Sha256::new();
 		hasher.update(b"veil-channel-message-v1");
 		hasher.update(self.community.as_bytes());

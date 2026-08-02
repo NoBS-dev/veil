@@ -44,6 +44,11 @@ impl Store {
 		db.execute_batch(
 			"PRAGMA journal_mode = WAL;
 			 PRAGMA foreign_keys = ON;
+			 -- Zero freed content rather than merely unlinking it, so a page
+			 -- that later shrinks does not leave the old bytes behind. Defence
+			 -- in depth for §10.5 rather than the mechanism — what actually
+			 -- removes a deleted message is the WAL checkpoint in `tombstone`.
+			 PRAGMA secure_delete = ON;
 
 			 CREATE TABLE IF NOT EXISTS users (
 			     user_id BLOB PRIMARY KEY,
@@ -153,6 +158,16 @@ impl Store {
 			     origin_ts    INTEGER NOT NULL,
 			     prev_hash    BLOB    NOT NULL,
 			     chain_hash   BLOB    NOT NULL,
+			     -- Stored rather than derived, because a tombstone has no
+			     -- content left to derive it from (§10.5). The chain links
+			     -- message ids, so keeping this is what lets deletion leave the
+			     -- chain intact.
+			     -- Nullable: SQLite only accepts constant defaults, and a
+			     -- column added to an existing store cannot have a computed
+			     -- one. A missing id reads as all-zero, which is what a row
+			     -- written before this column existed has.
+			     message_id   BLOB,
+			     tombstoned   INTEGER NOT NULL DEFAULT 0,
 			     PRIMARY KEY (community_id, channel, sequence)
 			 );
 
@@ -161,6 +176,17 @@ impl Store {
 			     pickle  TEXT NOT NULL
 			 );",
 		)?;
+
+		// Columns added after the table first shipped. `CREATE TABLE IF NOT
+		// EXISTS` will not add them to a store that already exists, and an
+		// operator's database is not something to discard on an upgrade (§1.3).
+		for column in [
+			"ALTER TABLE channel_messages ADD COLUMN message_id BLOB",
+			"ALTER TABLE channel_messages ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0",
+		] {
+			// Already present is the common case, and not an error.
+			let _ = db.execute(column, []);
+		}
 
 		Ok(Self { db })
 	}
@@ -562,8 +588,8 @@ impl Store {
 		self.db.execute(
 			"INSERT INTO channel_messages
 			   (community_id, channel, sequence, sender_user, sender_device,
-			    body, nonce, origin_ts, prev_hash, chain_hash)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+			    body, nonce, origin_ts, prev_hash, chain_hash, message_id)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
 			params![
 				delivery.community.as_bytes().as_slice(),
 				delivery.channel,
@@ -575,9 +601,59 @@ impl Store {
 				delivery.origin_ts,
 				delivery.prev_hash.as_slice(),
 				delivery.chain_hash().as_slice(),
+				delivery.id().as_bytes().as_slice(),
 			],
 		)?;
 		Ok(())
+	}
+
+	/// Discards a message's content, keeping its place in the chain (§10.5).
+	///
+	/// Tombstoning rather than deleting the row. The chain links message ids,
+	/// and a message id is a hash of the *original* content, so blanking the
+	/// body leaves identity and position untouched and the chain still verifies
+	/// end to end. Removing the row would break it.
+	///
+	/// Returns who wrote it, so the caller can decide whether this was allowed —
+	/// and `None` when there is nothing at that position.
+	pub fn author_of(
+		&self,
+		id: &CommunityId,
+		channel: &str,
+		sequence: u64,
+	) -> Result<Option<UserId>> {
+		let row: Option<Vec<u8>> = self
+			.db
+			.query_row(
+				"SELECT sender_user FROM channel_messages
+				 WHERE community_id = ?1 AND channel = ?2 AND sequence = ?3",
+				params![id.as_bytes().as_slice(), channel, sequence],
+				|r| r.get(0),
+			)
+			.optional()?;
+
+		Ok(row.and_then(|bytes| bytes.as_slice().try_into().ok().map(UserId::from_bytes)))
+	}
+
+	pub fn tombstone(&self, id: &CommunityId, channel: &str, sequence: u64) -> Result<bool> {
+		let changed = self.db.execute(
+			"UPDATE channel_messages SET body = zeroblob(0), tombstoned = 1
+			 WHERE community_id = ?1 AND channel = ?2 AND sequence = ?3",
+			params![id.as_bytes().as_slice(), channel, sequence],
+		)?;
+
+		// **This is what makes the deletion real**, and it was found by testing
+		// rather than by reasoning: blanking the row leaves the original bytes
+		// sitting in the write-ahead log, so a test that grepped the store for
+		// the deleted content still found it. Folding the log back in and
+		// truncating it is what removes them.
+		//
+		// Verified by mutation: without this the content is still there;
+		// without `secure_delete` it is not. So this line is load-bearing and
+		// that pragma is defence in depth, not the mechanism.
+		self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+
+		Ok(changed == 1)
 	}
 
 	/// The tail of a channel: the next sequence, and what to chain onto.
@@ -611,7 +687,8 @@ impl Store {
 		limit: usize,
 	) -> Result<Vec<ChannelDelivery>> {
 		let mut stmt = self.db.prepare(
-			"SELECT sequence, sender_user, sender_device, body, nonce, origin_ts, prev_hash
+			"SELECT sequence, sender_user, sender_device, body, nonce, origin_ts,
+			        prev_hash, tombstoned, message_id
 			 FROM channel_messages
 			 WHERE community_id = ?1 AND channel = ?2 AND sequence > ?3
 			 ORDER BY sequence LIMIT ?4",
@@ -639,6 +716,11 @@ impl Store {
 					origin_ts: r.get::<_, i64>(5)? as u64,
 					sequence: r.get::<_, i64>(0)? as u64,
 					prev_hash: prev.as_slice().try_into().unwrap_or([0; 32]),
+					tombstoned: r.get::<_, i64>(7)? == 1,
+					message_id: r
+						.get::<_, Option<Vec<u8>>>(8)?
+						.and_then(|bytes| bytes.as_slice().try_into().ok())
+						.unwrap_or([0; 32]),
 				})
 			},
 		)?;

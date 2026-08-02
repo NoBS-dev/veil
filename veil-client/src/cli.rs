@@ -105,6 +105,11 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"delete" => {
+				if let Err(e) = communities::delete(&write, &state).await {
+					eprintln!("Could not delete: {e:#}");
+				}
+			}
 			"role" => {
 				if let Err(e) = communities::role(&write, &state).await {
 					eprintln!("Could not set a role: {e:#}");

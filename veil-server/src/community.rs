@@ -218,6 +218,8 @@ pub async fn post(state: &ServerState, sender: &DeviceAddress, post: ChannelPost
 			origin_ts: post.origin_ts,
 			sequence,
 			prev_hash,
+			tombstoned: false,
+			message_id: [0u8; 32],
 		};
 
 		if let Err(e) = store.append_channel_message(&delivery) {
@@ -271,6 +273,65 @@ async fn fan_out(state: &ServerState, delivery: &ChannelDelivery, members: &[Use
 	for address in addresses {
 		let _ = route_to(&address, framed.clone()).await;
 	}
+}
+
+/// Discards a message's content, keeping its place in the chain (§10.5).
+///
+/// **Tombstoning, not deletion.** The chain links message ids, and a message id
+/// hashes the original content, so blanking the body leaves identity and
+/// position untouched and the chain still verifies end to end. Removing the row
+/// would break it for everyone.
+///
+/// What this guarantees is narrow, and §10.5 says so: the host's copy is gone
+/// and well-behaved clients drop theirs on receipt. Member exports and offline
+/// clients keep what they have. "Deleted for everyone" is a lie in every product
+/// that prints it, and here — where members are *encouraged* to keep copies —
+/// it would be a larger one.
+pub async fn delete(
+	state: &ServerState,
+	sender: &DeviceAddress,
+	id: CommunityId,
+	channel: &str,
+	sequence: u64,
+) -> Response {
+	let author = match state.store.lock().await.author_of(&id, channel, sequence) {
+		Ok(Some(author)) => author,
+		Ok(None) => return Response::refused(id, "there is no message at that position"),
+		Err(e) => return Response::refused(id, &format!("could not read that message: {e}")),
+	};
+
+	// Your own, or anyone's if you moderate. Host-enforced like every permission
+	// except reading (§8.5) — this is an action the host can simply refuse.
+	let allowed = match policy(state, &id).await {
+		Ok(community) => author == sender.user || community.may_moderate(&sender.user),
+		Err(e) => return Response::refused(id, &format!("policy: {e}")),
+	};
+
+	if !allowed {
+		return Response::refused(id, "you may only delete your own messages");
+	}
+
+	match state.store.lock().await.tombstone(&id, channel, sequence) {
+		Ok(true) => {}
+		Ok(false) => return Response::refused(id, "there is no message at that position"),
+		Err(e) => return Response::refused(id, &format!("could not delete: {e}")),
+	}
+
+	// Told to everyone, so well-behaved clients drop their copy. A client that
+	// does not is exactly the case the guarantee above excludes.
+	let members = state.store.lock().await.members(&id).unwrap_or_default();
+	if let Ok(mut tombstoned) =
+		state
+			.store
+			.lock()
+			.await
+			.channel_since(&id, channel, sequence - 1, 1)
+		&& let Some(delivery) = tombstoned.pop()
+	{
+		fan_out(state, &delivery, &members).await;
+	}
+
+	Response::ok(id, &format!("deleted message {sequence}"))
 }
 
 /// Sends every connected member the community's current state.

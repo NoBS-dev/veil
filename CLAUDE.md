@@ -131,7 +131,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`.
+`history`, `delete`.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
 can be sent to it — `readers` writes one. Without it `say` refuses, because
@@ -265,7 +265,13 @@ explicitly — each one closes a specific attack.
     a reader list rotates the session and is the expensive operation. Keep the
     two separate and say which is which — conflating them promises something
     the design cannot deliver.
-23. **Never send plaintext under a Sealed id.** The mode is inside the community
+23. **Deleting is tombstoning, and the bytes must actually go.** The chain links
+    message ids, so blanking a body keeps history verifying — but blanking the
+    row leaves the original bytes in SQLite's write-ahead log. A checkpoint
+    after tombstoning is what removes them, and without it §10.5's "not
+    recoverable from the server" is untrue. This was found by grepping the store
+    in a test, not by reading the code.
+24. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

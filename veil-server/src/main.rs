@@ -682,6 +682,14 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::DeleteMessage {
+				community: id,
+				channel,
+				sequence,
+			} => {
+				let response = community::delete(&state, &address, id, &channel, sequence).await;
+				reply(&state, &address, response.into_message()).await;
+			}
 			ProtocolMessage::FetchCommunity(id) => match community::view(&state, id).await {
 				Ok(view) => {
 					reply(
