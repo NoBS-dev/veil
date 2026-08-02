@@ -212,6 +212,24 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	Ok(())
 }
 
+/// The client used for directory lookups.
+///
+/// **Certificate validation is deliberately not what secures these.** A device
+/// list is verified against the owner's cross-signing keys (§5.4) and a prekey
+/// bundle is then checked against that list, so a host — or anything on the path
+/// — can withhold entries but cannot get one it controls accepted. That check
+/// runs whatever the transport did.
+///
+/// Requiring a CA-issued certificate here would instead mean a self-hosted
+/// server could not be looked up at all (§1.3), which trades a property the
+/// protocol does not rely on for one it does. The session that carries messages
+/// is separately bound to the server's identity key (§3.2).
+pub fn directory_client() -> Result<reqwest::Client> {
+	Ok(reqwest::Client::builder()
+		.danger_accept_invalid_certs(true)
+		.build()?)
+}
+
 /// Fetches a device's prekey bundle: signing key, Olm identity key, and a
 /// one-time key to open a session with.
 pub async fn fetch_prekey_bundle(
@@ -220,7 +238,7 @@ pub async fn fetch_prekey_bundle(
 ) -> Result<([u8; 32], [u8; 32], [u8; 32])> {
 	let url = format!("{url}/devices/{}/{}/otk", target.user, target.device);
 
-	let body = reqwest::get(url).await?.text().await?;
+	let body = directory_client()?.get(url).send().await?.text().await?;
 	let mut lines = body.lines();
 
 	let mut next = |what: &str| -> Result<[u8; 32]> {
@@ -254,7 +272,9 @@ pub async fn fetch_device_list(
 		devices: Vec<Device>,
 	}
 
-	let response: Response = reqwest::get(format!("{url}/users/{user}/devices"))
+	let response: Response = directory_client()?
+		.get(format!("{url}/users/{user}/devices"))
+		.send()
 		.await?
 		.error_for_status()?
 		.json()

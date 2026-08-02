@@ -1,5 +1,6 @@
 mod delivery;
 mod store;
+mod tlsframe;
 
 use anyhow::Result;
 use axum::{
@@ -77,6 +78,10 @@ struct ServerState {
 	/// Hosts that have proved they speak Veil, so the proof is not repeated on
 	/// every directory lookup (§3.4).
 	verified_hosts: Arc<RwLock<std::collections::HashSet<String>>>,
+	/// SHA-256 of our own TLS certificate, or zeros when serving plaintext.
+	/// Signed into every challenge so a client reaching us through a relay can
+	/// tell whether it is really talking to us (§3.2).
+	tls_binding: [u8; 32],
 }
 
 /// Frames queued for one connection.
@@ -138,6 +143,28 @@ impl std::fmt::Display for RouteError {
 	}
 }
 
+/// SHA-256 of the first certificate in a PEM chain.
+///
+/// The leaf, which is the one a peer actually negotiates with. Hashing the whole
+/// DER rather than picking the public key out of it avoids an X.509 parser for
+/// no loss: the binding only has to be something the server can state and the
+/// client can recompute from what it was shown.
+fn leaf_certificate_hash(path: &str) -> Result<[u8; 32]> {
+	use sha2::{Digest, Sha256};
+
+	let pem = std::fs::read_to_string(path)?;
+	let der = pem
+		.split("-----BEGIN CERTIFICATE-----")
+		.nth(1)
+		.and_then(|rest| rest.split("-----END CERTIFICATE-----").next())
+		.ok_or_else(|| anyhow::anyhow!("{path} holds no certificate"))?;
+
+	let der: String = der.chars().filter(|c| !c.is_whitespace()).collect();
+	let der = data_encoding::BASE64.decode(der.as_bytes())?;
+
+	Ok(Sha256::digest(&der).into())
+}
+
 fn prompt(question: &str) -> Result<String> {
 	print!("{question}");
 	io::stdout().flush()?;
@@ -154,6 +181,20 @@ async fn main() -> Result<()> {
 	};
 
 	let certificate_path = prompt("Enter TLS certificate chain path (empty for plaintext): ")?;
+	// Hashed before anything is served, because it goes into every challenge:
+	// a client behind a relay compares this against the certificate it actually
+	// negotiated, and a relay terminating that session with its own certificate
+	// cannot make our identity key vouch for it (§3.2).
+	let tls_binding = if certificate_path.is_empty() {
+		[0u8; 32]
+	} else {
+		leaf_certificate_hash(&certificate_path)?
+	};
+
+	// Installed unconditionally: the relay makes TLS client connections when
+	// probing a destination, whether or not this server serves TLS itself.
+	let _ = rustls::crypto::ring::default_provider().install_default();
+
 	let tls = if certificate_path.is_empty() {
 		eprintln!(
 			"WARNING: serving without TLS. Message bodies stay end-to-end encrypted, but\n\
@@ -164,9 +205,6 @@ async fn main() -> Result<()> {
 		None
 	} else {
 		let key_path = prompt("Enter TLS private key path: ")?;
-		rustls::crypto::ring::default_provider()
-			.install_default()
-			.map_err(|_| anyhow::anyhow!("failed to install the rustls crypto provider"))?;
 		Some(
 			axum_server::tls_rustls::RustlsConfig::from_pem_file(certificate_path, key_path)
 				.await?,
@@ -241,6 +279,7 @@ async fn main() -> Result<()> {
 			RATE_WINDOW_MS,
 		))),
 		verified_hosts: Arc::new(RwLock::new(std::collections::HashSet::new())),
+		tls_binding,
 	};
 
 	delivery::spawn_retry_loop(state.clone());
@@ -371,6 +410,7 @@ async fn authenticate(
 			&ProtocolMessage::Challenge(Challenge {
 				challenge,
 				versions: ours,
+				tls_binding: state.tls_binding,
 			}),
 			&account,
 		)?
@@ -902,17 +942,33 @@ async fn handle_relay(socket: WebSocket, state: ServerState) {
 
 	match open_verified_tunnel(&target).await {
 		Ok((upstream, first_frame)) => {
-			// Hand the client the destination's challenge — the same frame the
-			// probe just verified, so nothing is wasted and the destination sees
-			// exactly one connection.
-			if sender
-				.send(Message::Binary(Bytes::copy_from_slice(&first_frame)))
-				.await
-				.is_err()
+			// The probe connection has done its job — it proved the destination
+			// is a Veil host — and is dropped here.
+			//
+			// It cannot be reused as the tunnel, which an earlier version did to
+			// save the destination a connection. That version forwarded parsed
+			// Veil frames, so the relay could read everything passing through;
+			// carrying an end-to-end TLS session instead means the tunnel has to
+			// be a byte stream the relay never interprets, and a WebSocket that
+			// has already spoken Veil is not one. The cost is that a destination
+			// sees two connections per tunnel: one probe, one carrying.
+			drop(upstream);
+			let _ = first_frame;
+
+			let stream = match tokio::time::timeout(
+				std::time::Duration::from_secs(10),
+				tokio::net::TcpStream::connect(strip_scheme(&target)),
+			)
+			.await
 			{
-				return;
-			}
-			pump(sender, receiver, upstream, address).await;
+				Ok(Ok(stream)) => stream,
+				_ => {
+					eprintln!("Relay: could not open a byte tunnel to {target}");
+					return;
+				}
+			};
+
+			pump(sender, receiver, stream, address).await;
 		}
 		Err(e) => {
 			eprintln!("Relay: refusing {address} -> {target}: {e:#}");
@@ -947,9 +1003,23 @@ async fn open_verified_tunnel(
 		format!("ws://{target}")
 	};
 
+	// A permissive TLS client on purpose. The relay is not authenticating the
+	// destination's certificate — it is checking that the destination can
+	// produce a signed Veil challenge, which a web server cannot. Requiring a
+	// CA-issued certificate here would make every self-hosted community
+	// unreachable through a relay (§1.3), while proving nothing the challenge
+	// does not already prove. The *client* binds the certificate to the
+	// destination's identity key end-to-end (§3.2); that is where it belongs.
+	let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+		rustls::ClientConfig::builder()
+			.dangerous()
+			.with_custom_certificate_verifier(std::sync::Arc::new(AnyCertificate))
+			.with_no_client_auth(),
+	));
+
 	let (mut upstream, _) = tokio::time::timeout(
 		std::time::Duration::from_secs(10),
-		tokio_tungstenite::connect_async(url),
+		tokio_tungstenite::connect_async_tls_with_config(url, None, false, Some(connector)),
 	)
 	.await
 	.map_err(|_| anyhow::anyhow!("destination did not answer in time"))??;
@@ -977,16 +1047,30 @@ async fn open_verified_tunnel(
 }
 
 /// Moves bytes both ways without looking at them.
+/// Moves bytes both ways without looking at them.
+///
+/// The client runs its own TLS session with the destination through this
+/// (§3.2), so what crosses is opaque: the relay sees record types, lengths and
+/// timing, never content. That is what keeps a home server out of the trust set
+/// for traffic to a community host — which matters most for **Open**
+/// communities, whose content is not end-to-end encrypted and would otherwise
+/// be readable by two operators rather than one.
+///
+/// Framing is validated in the client-to-destination direction only. The
+/// destination has already proved it is a Veil host, so its output is not the
+/// open-proxy concern; the client's input is.
 async fn pump(
 	mut client_out: SplitSink<WebSocket, Message>,
 	mut client_in: SplitStream<WebSocket>,
-	upstream: tokio_tungstenite::WebSocketStream<
-		tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-	>,
+	upstream: tokio::net::TcpStream,
 	address: DeviceAddress,
 ) {
 	use futures::SinkExt as _;
-	let (mut up_out, mut up_in) = upstream.split();
+	use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+	let (mut up_read, mut up_write) = upstream.into_split();
+	let mut records = tlsframe::RecordValidator::new();
+	let mut buffer = vec![0u8; 16 * 1024];
 
 	loop {
 		tokio::select! {
@@ -996,34 +1080,106 @@ async fn pump(
 						eprintln!("Relay: {address} sent an oversized frame; closing");
 						break;
 					}
-					if up_out
-						.send(tokio_tungstenite::tungstenite::Message::Binary(bytes))
-						.await
-						.is_err()
-					{
+					// The one thing the relay does inspect (§3.2): that this is
+					// TLS at all. A tunnel carrying anything else could be
+					// pointed at a plaintext service, which is the open-proxy
+					// vector the destination check alone does not close.
+					if let tlsframe::Verdict::NotTls(why) = records.check(&bytes) {
+						eprintln!("Relay: {address} sent something that is not TLS ({why}); closing");
+						break;
+					}
+					if up_write.write_all(&bytes).await.is_err() {
 						break;
 					}
 				}
 				Some(Ok(Message::Close(_))) | None => break,
-				Some(Ok(_)) => break, // only binary crosses a tunnel
+				// Keepalives are the transport's business, not the tunnel's;
+				// tearing a tunnel down over one would break long-lived idle
+				// connections, which is most of them.
+				Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
+				Some(Ok(_)) => break, // nothing else crosses a tunnel
 				Some(Err(_)) => break,
 			},
-			from_upstream = up_in.next() => match from_upstream {
-				Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+			read = up_read.read(&mut buffer) => match read {
+				Ok(0) | Err(_) => break,
+				Ok(n) => {
 					if client_out
-						.send(Message::Binary(Bytes::copy_from_slice(&bytes)))
+						.send(Message::Binary(Bytes::copy_from_slice(&buffer[..n])))
 						.await
 						.is_err()
 					{
 						break;
 					}
 				}
-				Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
-				Some(Ok(_)) => continue,
-				Some(Err(_)) => break,
 			},
 		}
 	}
 
+	if !records.saw_tls() {
+		eprintln!("Relay: {address} closed a tunnel that never carried TLS");
+	}
 	eprintln!("Relay: {address} tunnel closed");
+}
+
+/// Accepts any certificate during the relay's destination probe.
+///
+/// See the note at the call site: the probe's question is "does this speak
+/// Veil", answered by a signature, not "is this certificate trusted".
+#[derive(Debug)]
+struct AnyCertificate;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCertificate {
+	fn verify_server_cert(
+		&self,
+		_end_entity: &rustls::pki_types::CertificateDer<'_>,
+		_intermediates: &[rustls::pki_types::CertificateDer<'_>],
+		_server_name: &rustls::pki_types::ServerName<'_>,
+		_ocsp: &[u8],
+		_now: rustls::pki_types::UnixTime,
+	) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+		Ok(rustls::client::danger::ServerCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &rustls::pki_types::CertificateDer<'_>,
+		dss: &rustls::DigitallySignedStruct,
+	) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls12_signature(
+			message,
+			cert,
+			dss,
+			&rustls::crypto::ring::default_provider().signature_verification_algorithms,
+		)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &rustls::pki_types::CertificateDer<'_>,
+		dss: &rustls::DigitallySignedStruct,
+	) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls13_signature(
+			message,
+			cert,
+			dss,
+			&rustls::crypto::ring::default_provider().signature_verification_algorithms,
+		)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+		rustls::crypto::ring::default_provider()
+			.signature_verification_algorithms
+			.supported_schemes()
+	}
+}
+
+/// A bare `host:port` for `TcpStream::connect`.
+fn strip_scheme(target: &str) -> String {
+	target
+		.trim_start_matches("wss://")
+		.trim_start_matches("ws://")
+		.trim_end_matches('/')
+		.to_owned()
 }

@@ -5,6 +5,11 @@
 //! what `VEIL_STATE_DIR` is for. That indirection was added to make this
 //! possible and turned out to be needed for headless use anyway — a client that
 //! requires a Secret Service cannot run in a container either.
+//!
+//! Each test file compiles this module separately, so anything only one of them
+//! uses reads as dead code in the others — hence the allow, rather than trimming
+//! it to whatever the current caller set happens to be.
+#![allow(dead_code)]
 
 use std::{process::Stdio, time::Duration};
 use tokio::{
@@ -16,6 +21,8 @@ pub struct Fixture {
 	server: Child,
 	pub port: u16,
 	dir: std::path::PathBuf,
+	/// Servers started beyond the first, killed when the fixture is dropped.
+	extra: std::sync::Mutex<Vec<Child>>,
 }
 
 impl Fixture {
@@ -43,7 +50,12 @@ impl Fixture {
 		stdin.flush().await.unwrap();
 		drop(stdin);
 
-		let fixture = Self { server, port, dir };
+		let fixture = Self {
+			server,
+			port,
+			dir,
+			extra: std::sync::Mutex::new(Vec::new()),
+		};
 		fixture.await_ready().await;
 		fixture
 	}
@@ -107,10 +119,207 @@ impl Fixture {
 			.to_owned()
 	}
 
+	/// An extra plaintext server, for tests that need more than one host.
+	pub async fn start_server(&self) -> String {
+		self.spawn_server(None).await
+	}
+
+	/// An extra server with a **self-signed** certificate, plus its SHA-256.
+	///
+	/// Self-signed because that is what a self-hoster has (§1.3). The nested-TLS
+	/// binding is what makes it safe, so this is the configuration it has to be
+	/// safe under.
+	pub async fn start_tls_server(&self) -> (String, [u8; 32]) {
+		use sha2::{Digest, Sha256};
+
+		let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+		let hash: [u8; 32] = Sha256::digest(certified.cert.der()).into();
+		let address = self.spawn_server(Some(certified)).await;
+		(address, hash)
+	}
+
+	async fn spawn_server(&self, tls: Option<rcgen::CertifiedKey>) -> String {
+		let port = free_port().await;
+		let dir = self.dir.join(format!("server-{port}"));
+		std::fs::create_dir_all(&dir).unwrap();
+
+		let mut child = Command::new(binary("veil-server"))
+			.stdin(Stdio::piped())
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.kill_on_drop(true)
+			.spawn()
+			.unwrap();
+
+		let db = dir.join("store.db");
+		let answers = match &tls {
+			None => format!("127.0.0.1:{port}\n\n{}\n", db.display()),
+			Some(certified) => {
+				let cert = dir.join("cert.pem");
+				let key = dir.join("key.pem");
+				std::fs::write(&cert, certified.cert.pem()).unwrap();
+				std::fs::write(&key, certified.key_pair.serialize_pem()).unwrap();
+				format!(
+					"127.0.0.1:{port}\n{}\n{}\n{}\n",
+					cert.display(),
+					key.display(),
+					db.display()
+				)
+			}
+		};
+
+		let mut stdin = child.stdin.take().unwrap();
+		stdin.write_all(answers.as_bytes()).await.unwrap();
+		stdin.flush().await.unwrap();
+		drop(stdin);
+
+		self.extra.lock().unwrap().push(child);
+		await_port(port).await;
+		format!("127.0.0.1:{port}")
+	}
+
+	/// A relay that terminates the inner TLS session itself.
+	///
+	/// **The attack nested TLS exists to stop.** This relay behaves correctly at
+	/// every layer a client can see without the binding: it authenticates the
+	/// user, it forwards to the host that was actually asked for, and the Veil
+	/// handshake the client completes is with the genuine destination. What it
+	/// also does is decrypt everything in between — which for an Open community
+	/// is the entire content of the conversation.
+	///
+	/// It cannot make the destination's identity key sign a hash of the
+	/// certificate it presents, so the client's binding check catches it.
+	pub async fn start_mitm_relay(&self, destination: &str) -> String {
+		use futures_util::{SinkExt, StreamExt};
+		use tungstenite::protocol::Message;
+
+		// The fixture runs TLS itself here, so it needs a provider too.
+		let _ = rustls::crypto::ring::default_provider().install_default();
+
+		let port = free_port().await;
+		let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+			.await
+			.unwrap();
+
+		// The relay's own certificate — perfectly valid, and not the one the
+		// destination signed for.
+		let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+		let tls_config = std::sync::Arc::new(
+			rustls::ServerConfig::builder()
+				.with_no_client_auth()
+				.with_single_cert(
+					vec![certified.cert.der().clone()],
+					rustls::pki_types::PrivateKeyDer::try_from(certified.key_pair.serialize_der())
+						.unwrap(),
+				)
+				.unwrap(),
+		);
+
+		let destination = destination.to_owned();
+		tokio::spawn(async move {
+			let account = vodozemac::olm::Account::new();
+			while let Ok((socket, _)) = listener.accept().await {
+				let destination = destination.clone();
+				let tls_config = tls_config.clone();
+				let pickle = account.pickle();
+
+				tokio::spawn(async move {
+					let account = vodozemac::olm::Account::from_pickle(pickle);
+					let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+						return;
+					};
+
+					// The relay half of the handshake, played straight.
+					let mut challenge = [0u8; 32];
+					rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut challenge);
+					let framed = veil_protocol::Envelope::seal(
+						&veil_protocol::ProtocolMessage::Challenge(veil_protocol::Challenge {
+							challenge,
+							versions: veil_protocol::version::VersionRange::supported(),
+							tls_binding: [0u8; 32],
+						}),
+						&account,
+					)
+					.unwrap();
+					if ws
+						.send(Message::Binary(framed.to_vec().into()))
+						.await
+						.is_err()
+					{
+						return;
+					}
+					let _ = ws.next().await; // Authenticate
+					let _ = ws.next().await; // the destination it asked for
+
+					// From here the client believes it is speaking TLS to the
+					// destination. It is speaking TLS to us.
+					let Ok(inner) = tokio_rustls::TlsAcceptor::from(tls_config)
+						.accept(WsBytes::new(ws))
+						.await
+					else {
+						return;
+					};
+					let Ok(mut client) = tokio_tungstenite::accept_async(inner).await else {
+						return;
+					};
+
+					// And we hold the real session with the destination.
+					let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+						rustls::ClientConfig::builder()
+							.dangerous()
+							.with_custom_certificate_verifier(std::sync::Arc::new(AnyCert))
+							.with_no_client_auth(),
+					));
+					let Ok((mut upstream, _)) = tokio_tungstenite::connect_async_tls_with_config(
+						format!("wss://{destination}/"),
+						None,
+						false,
+						Some(connector),
+					)
+					.await
+					else {
+						return;
+					};
+
+					loop {
+						tokio::select! {
+							from_client = client.next() => match from_client {
+								Some(Ok(m)) => { if upstream.send(m).await.is_err() { break } }
+								_ => break,
+							},
+							from_host = upstream.next() => match from_host {
+								Some(Ok(m)) => { if client.send(m).await.is_err() { break } }
+								_ => break,
+							},
+						}
+					}
+				});
+			}
+		});
+
+		format!("127.0.0.1:{port}")
+	}
+
 	pub async fn stop(mut self) {
 		let _ = self.server.kill().await;
+		for child in self.extra.lock().unwrap().iter_mut() {
+			let _ = child.start_kill();
+		}
 		let _ = std::fs::remove_dir_all(&self.dir);
 	}
+}
+
+async fn await_port(port: u16) {
+	for _ in 0..200 {
+		if tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.is_ok()
+		{
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(100)).await;
+	}
+	panic!("server on port {port} never became ready");
 }
 
 /// Small helper: feed stdin, wait, collect stdout and stderr together.
@@ -160,4 +369,164 @@ pub async fn free_port() -> u16 {
 	let port = listener.local_addr().unwrap().port();
 	drop(listener);
 	port
+}
+
+/// A byte stream over a server-side WebSocket, so TLS can be run inside one.
+///
+/// The mirror of the client's `TunnelStream`. Lives here rather than being
+/// shared because the client crate is a binary and this is a test fixture; the
+/// duplication is deliberate, since a test that reuses the code under test
+/// cannot disagree with it.
+pub struct WsBytes {
+	socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+	pending: Vec<u8>,
+	read_from: usize,
+}
+
+impl WsBytes {
+	pub fn new(socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) -> Self {
+		Self {
+			socket,
+			pending: Vec::new(),
+			read_from: 0,
+		}
+	}
+}
+
+impl tokio::io::AsyncRead for WsBytes {
+	fn poll_read(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &mut tokio::io::ReadBuf<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		use futures_util::StreamExt;
+		use std::task::Poll;
+		use tungstenite::protocol::Message;
+
+		loop {
+			let buffered = self.pending.len() - self.read_from;
+			if buffered > 0 {
+				let take = buffered.min(buf.remaining());
+				let from = self.read_from;
+				let slice = self.pending[from..from + take].to_vec();
+				buf.put_slice(&slice);
+				self.read_from += take;
+				if self.read_from == self.pending.len() {
+					self.pending.clear();
+					self.read_from = 0;
+				}
+				return Poll::Ready(Ok(()));
+			}
+
+			match self.socket.poll_next_unpin(cx) {
+				Poll::Ready(Some(Ok(Message::Binary(bytes)))) => {
+					self.pending = bytes.to_vec();
+					self.read_from = 0;
+				}
+				Poll::Ready(Some(Ok(Message::Close(_)))) | Poll::Ready(None) => {
+					return Poll::Ready(Ok(()));
+				}
+				Poll::Ready(Some(Ok(_))) => continue,
+				Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(std::io::Error::other(e))),
+				Poll::Pending => return Poll::Pending,
+			}
+		}
+	}
+}
+
+impl tokio::io::AsyncWrite for WsBytes {
+	fn poll_write(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+		buf: &[u8],
+	) -> std::task::Poll<std::io::Result<usize>> {
+		use futures_util::SinkExt;
+		use std::task::Poll;
+		use tungstenite::protocol::Message;
+
+		match self.socket.poll_ready_unpin(cx) {
+			Poll::Ready(Ok(())) => {
+				match self
+					.socket
+					.start_send_unpin(Message::Binary(buf.to_vec().into()))
+				{
+					Ok(()) => Poll::Ready(Ok(buf.len())),
+					Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
+				}
+			}
+			Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(e))),
+			Poll::Pending => Poll::Pending,
+		}
+	}
+
+	fn poll_flush(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		use futures_util::SinkExt;
+		self.socket
+			.poll_flush_unpin(cx)
+			.map_err(std::io::Error::other)
+	}
+
+	fn poll_shutdown(
+		mut self: std::pin::Pin<&mut Self>,
+		cx: &mut std::task::Context<'_>,
+	) -> std::task::Poll<std::io::Result<()>> {
+		use futures_util::SinkExt;
+		self.socket
+			.poll_close_unpin(cx)
+			.map_err(std::io::Error::other)
+	}
+}
+
+/// Accepts anything, so the fixture can reach a self-signed test server.
+#[derive(Debug)]
+pub struct AnyCert;
+
+impl rustls::client::danger::ServerCertVerifier for AnyCert {
+	fn verify_server_cert(
+		&self,
+		_end_entity: &rustls::pki_types::CertificateDer<'_>,
+		_intermediates: &[rustls::pki_types::CertificateDer<'_>],
+		_server_name: &rustls::pki_types::ServerName<'_>,
+		_ocsp: &[u8],
+		_now: rustls::pki_types::UnixTime,
+	) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+		Ok(rustls::client::danger::ServerCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &rustls::pki_types::CertificateDer<'_>,
+		dss: &rustls::DigitallySignedStruct,
+	) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls12_signature(
+			message,
+			cert,
+			dss,
+			&rustls::crypto::ring::default_provider().signature_verification_algorithms,
+		)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &rustls::pki_types::CertificateDer<'_>,
+		dss: &rustls::DigitallySignedStruct,
+	) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+		rustls::crypto::verify_tls13_signature(
+			message,
+			cert,
+			dss,
+			&rustls::crypto::ring::default_provider().signature_verification_algorithms,
+		)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+		rustls::crypto::ring::default_provider()
+			.signature_verification_algorithms
+			.supported_schemes()
+	}
 }

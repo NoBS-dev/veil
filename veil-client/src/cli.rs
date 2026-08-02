@@ -215,7 +215,9 @@ fn show_safety_number(state: &mut State) -> Result<()> {
 }
 
 async fn list_clients(url: &str) -> anyhow::Result<Vec<String>> {
-	Ok(reqwest::get(format!("{url}/clients"))
+	Ok(messaging::directory_client()?
+		.get(format!("{url}/clients"))
+		.send()
 		.await?
 		.text()
 		.await?

@@ -92,9 +92,9 @@ to.
 | Optional TLS transport | **[built]** |
 | Prekey/roster rate limiting | **[built]** |
 | Relay tunnel, destination verification, per-user limits | **[built]** `veil-server` `/relay` |
-| Nested TLS through the tunnel | designed, §3.2 — see below |
+| Nested TLS through the tunnel, certificate binding | **[built]** `veil-client/src/tunnel.rs`, `veil-server/src/tlsframe.rs` |
 | DM mailboxes, local | **[built]** `store.rs`, acknowledgement-scoped |
-| DM store-and-forward *across servers* | designed, §3.3–3.4 — nothing S2S exists |
+| DM store-and-forward across servers | **[built]** `veil-server/src/delivery.rs` |
 | Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
@@ -128,15 +128,15 @@ encrypted text between CLI clients: identities cross-sign, devices are verified
 before a session opens, state survives a restart, and mail for an offline device
 waits in a mailbox until that device acknowledges it.
 
-Three things are load-bearing and absent. **There is no server-to-server path
-at all** (§3.3), so two people on different home servers cannot reach each
-other — every test to date has both parties on one host. **The relay is not yet
-blind** (§3.2): it authenticates the user and proves the destination speaks
-Veil, but forwards frames it could parse, so it sees who is talking to whom.
-Nested TLS is what closes that, and it is the difference between the design's
-claim and the code's behaviour. And **communities and channels do not exist**
-above the primitives — `community.rs` and `groupkeys.rs` are correct and tested
-but nothing carries them over a wire.
+Mail crosses server boundaries (§3.4), so two people on different home servers
+can reach each other, and the relay is genuinely blind (§3.2) — it carries an
+end-to-end TLS session it cannot read, and validates only that what passes is
+TLS at all.
+
+What remains absent is **communities and channels above the primitives**:
+`community.rs` and `groupkeys.rs` are correct and tested, but nothing carries
+them over a wire and the server has no notion of a channel. That is a design
+gap before it is an implementation one — see the table above.
 
 ---
 
@@ -236,13 +236,25 @@ If richer inspection ever proves necessary, add a **minimal outer frame versione
 independently of the inner protocol** — type and length only, stable across
 protocol changes — so relays never need updating in lockstep.
 
-**Nested TLS is not yet built.** The tunnel and its destination check are, and
-the relay forwards without inspecting — but the inner session is currently the
-Veil protocol directly rather than a second TLS session inside the tunnel. For
-Sealed traffic the practical gap is small, since content is already E2EE and the
-relay is a user's own home server which is expected to know who they talk to
-(§14). It matters for **Open** communities, whose content is not E2EE, so this
-must land before Open-tier traffic exists.
+**Nested TLS is built.** The tunnel carries opaque bytes to a TCP connection and
+validates TLS record framing; the client runs a second TLS session end-to-end
+with the destination inside it.
+
+The certificate is bound to the Veil identity rather than to a certificate
+authority. The destination hashes its own certificate and signs that hash into
+the challenge (`Challenge::tls_binding`); the client refuses if the certificate
+it negotiated does not match. A relay that terminated the inner session would
+have to present its own certificate, and cannot make the destination's identity
+key vouch for it.
+
+**Requiring a CA would have broken §1.3.** A self-hoster's certificate is
+self-signed, so "validate against a CA" and "anyone can host a community" cannot
+both hold. Binding to the identity key needs no authority at all, and inherits
+the trust-on-first-use property the identity key already has (invariant 6) —
+no more and no less. The residual limitation is the usual one for TOFU: on a
+*first* connection through a relay, nothing yet distinguishes the intended host
+from another genuine Veil host the relay chose. Invite links carry the identity
+key, which is what closes that in practice.
 
 Note this narrows the blindness above slightly and deliberately: the relay learns
 framing and volume, never content. For **Open** communities that distinction

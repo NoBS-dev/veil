@@ -234,6 +234,7 @@ async fn authenticate_server(
 			&ProtocolMessage::Challenge(veil_protocol::Challenge {
 				challenge,
 				versions: ours,
+				tls_binding: state.tls_binding,
 			}),
 			&account,
 		)?

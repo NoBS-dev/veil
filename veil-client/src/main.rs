@@ -2,29 +2,48 @@ mod cli;
 mod listener;
 mod messaging;
 mod state;
+mod tunnel;
 
 use crate::{cli::cli, state::State};
-use futures_util::{
-	SinkExt, StreamExt,
-	stream::{SplitSink, SplitStream},
-};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use std::{
 	io::{self, Write},
+	pin::Pin,
 	sync::Arc,
 };
-use tokio::{net::TcpStream, sync::Mutex};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
 	Authenticate, Envelope, ProtocolMessage, ReplayGuard, UploadKeys, display_key, open_envelope,
 	version::VersionRange,
 };
 
-pub type ReadStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
-pub type WriteStream = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
+/// The two halves of a connection, whatever it is carried over.
+///
+/// Boxed because there are now two shapes: a direct WebSocket, and one running
+/// inside a TLS session inside a relay tunnel (§3.2). The rest of the client
+/// does not care which it has, and should not — that is the point of the relay
+/// being transparent.
+pub type ReadStream = Pin<Box<dyn Stream<Item = Result<Message, tungstenite::Error>> + Send>>;
+pub type WriteStream = Pin<Box<dyn Sink<Message, Error = tungstenite::Error> + Send>>;
+
+fn split_boxed<S>(socket: S) -> (WriteStream, ReadStream)
+where
+	S: Sink<Message, Error = tungstenite::Error>
+		+ Stream<Item = Result<Message, tungstenite::Error>>
+		+ Send
+		+ 'static,
+{
+	let (write, read) = socket.split();
+	(Box::pin(write), Box::pin(read))
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+	// Must happen before any TLS: rustls refuses to guess when more than one
+	// provider could apply, and the failure is a panic deep inside a handshake.
+	let _ = rustls::crypto::ring::default_provider().install_default();
+
 	print!("Enter profile name (none for default): ");
 	io::stdout().flush()?;
 
@@ -80,16 +99,30 @@ async fn main() -> anyhow::Result<()> {
 		);
 	}
 
-	let (mut write, mut read) = match state.relay.as_deref() {
+	let connection = match state.relay.as_deref() {
 		None => {
 			eprintln!(
 				"Connecting directly — {} will see this machine's IP. Set a relay to avoid that.",
 				state.ip_and_port
 			);
-			tokio_tungstenite::connect_async(socket).await?.0.split()
+			let tcp = tokio::net::TcpStream::connect(state.ip_and_port.as_ref()).await?;
+
+			if state.use_tls {
+				let (tls, negotiated) = tunnel::tls_direct(tcp, &state.ip_and_port).await?;
+				let (socket, _) =
+					tokio_tungstenite::client_async(format!("ws://{}/", state.ip_and_port), tls)
+						.await?;
+				(split_boxed(socket), *negotiated.lock().unwrap())
+			} else {
+				let (socket, _) =
+					tokio_tungstenite::client_async(format!("ws://{}/", state.ip_and_port), tcp)
+						.await?;
+				(split_boxed(socket), None)
+			}
 		}
 		Some(relay) => open_relayed(relay, &state).await?,
 	};
+	let ((mut write, mut read), tls_binding) = connection;
 
 	println!("My address: {}", state.address());
 	println!(
@@ -99,7 +132,8 @@ async fn main() -> anyhow::Result<()> {
 		display_key(state.account.ed25519_key().as_bytes())
 	);
 
-	let (server_identity, version) = handshake(&mut write, &mut read, &mut state).await?;
+	let (server_identity, version) =
+		handshake(&mut write, &mut read, &mut state, tls_binding).await?;
 	println!("Speaking protocol v{version} with the server.");
 
 	// We're just generating 20 for now, should increase later in prod
@@ -138,33 +172,63 @@ async fn main() -> anyhow::Result<()> {
 /// because it is a service we hold an account with and its limits are per user;
 /// and one with the destination *through* the tunnel, which is the session that
 /// actually matters. The destination only ever sees the relay's address.
-async fn open_relayed(relay: &str, state: &State) -> anyhow::Result<(WriteStream, ReadStream)> {
+type Connection = ((WriteStream, ReadStream), Option<[u8; 32]>);
+
+async fn open_relayed(relay: &str, state: &State) -> anyhow::Result<Connection> {
 	let (scheme, _) = state.schemes();
-	let (mut write, mut read) =
-		tokio_tungstenite::connect_async(format!("{scheme}://{relay}/relay"))
-			.await?
-			.0
-			.split();
+
+	// The relay's own transport is independent of the destination's. Deriving
+	// one from the other — which is what this did — tried to speak TLS to a
+	// plaintext relay whenever the destination happened to use TLS. Two
+	// different hosts, two different operators, two separate decisions.
+	let relay_url = if relay.starts_with("ws://") || relay.starts_with("wss://") {
+		format!("{relay}/relay")
+	} else {
+		format!("ws://{relay}/relay")
+	};
+
+	let socket = tokio_tungstenite::connect_async(relay_url).await?.0;
+	let (mut write, mut read) = socket.split();
 
 	// The relay authenticates us like any other connection.
 	relay_handshake(&mut write, &mut read, state).await?;
 
+	// With its scheme: the relay has to reach the destination itself to prove it
+	// speaks Veil, and cannot guess whether that means TLS.
 	write
-		.send(Message::Text(state.ip_and_port.to_string().into()))
+		.send(Message::Text(
+			format!("{scheme}://{}", state.ip_and_port).into(),
+		))
 		.await?;
+	write.flush().await?;
 
-	println!("Tunnelling to {} via {relay}.", state.ip_and_port);
-	Ok((write, read))
+	// From here the relay carries bytes it cannot read (§3.2). Everything above
+	// was addressed to the relay; everything below is addressed through it.
+	let tunnel = tunnel::TunnelStream::new(write.reunite(read)?);
+	let (tls, negotiated) = tunnel::tls_over_tunnel(tunnel, &state.ip_and_port).await?;
+
+	let (socket, _) =
+		tokio_tungstenite::client_async(format!("ws://{}/", state.ip_and_port), tls).await?;
+
+	let binding = *negotiated.lock().unwrap();
+	println!(
+		"Tunnelling to {} via {relay}, end-to-end encrypted.",
+		state.ip_and_port
+	);
+	Ok((split_boxed(socket), binding))
 }
 
 /// The relay's own challenge/response. Deliberately does not pin the relay's
 /// identity the way the destination handshake does: the relay is transport, and
 /// the session that carries anything sensitive is the one negotiated through it.
-async fn relay_handshake(
-	write: &mut WriteStream,
-	read: &mut ReadStream,
-	state: &State,
-) -> anyhow::Result<()> {
+/// Generic over the socket halves rather than taking [`WriteStream`], because
+/// this runs *before* the tunnel exists — the relay's own connection is a plain
+/// WebSocket, and the two halves have to be rejoined afterwards to carry TLS.
+async fn relay_handshake<W, R>(write: &mut W, read: &mut R, state: &State) -> anyhow::Result<()>
+where
+	W: Sink<Message, Error = tungstenite::Error> + Unpin,
+	R: Stream<Item = Result<Message, tungstenite::Error>> + Unpin,
+{
 	let Some(Ok(Message::Binary(bytes))) = read.next().await else {
 		anyhow::bail!("relay closed the connection before challenging us");
 	};
@@ -203,6 +267,7 @@ async fn handshake(
 	write: &mut WriteStream,
 	read: &mut ReadStream,
 	state: &mut State,
+	tls_binding: Option<[u8; 32]>,
 ) -> anyhow::Result<([u8; 32], u16)> {
 	let Some(Ok(Message::Binary(bytes))) = read.next().await else {
 		anyhow::bail!("server closed the connection before sending a challenge");
@@ -219,6 +284,19 @@ async fn handshake(
 		ProtocolMessage::Challenge(challenge) => challenge,
 		other => anyhow::bail!("expected a challenge from the server, got {other:?}"),
 	};
+
+	// Through a relay, this is the check that makes the tunnel private: the
+	// certificate we negotiated must be the one this server signed for. A relay
+	// terminating the session in the middle has to present its own, and cannot
+	// make the server's identity key vouch for it (§3.2).
+	if let Some(negotiated) = tls_binding {
+		tunnel::check_binding(Some(negotiated), &challenge.tls_binding)?;
+	}
+	// A server that serves TLS but signs no binding cannot be told apart from
+	// one being impersonated, so this is refused rather than warned about.
+	if state.use_tls && tls_binding.is_none() {
+		anyhow::bail!("expected a TLS session but none was negotiated");
+	}
 
 	let ours = VersionRange::supported();
 	let agreed = ours.agree(&challenge.versions)?;

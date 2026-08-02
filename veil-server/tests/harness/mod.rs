@@ -62,7 +62,32 @@ impl Server {
 		Self::start_inner(Some(port), existing).await
 	}
 
+	/// Starts with a self-signed certificate, and reports its SHA-256.
+	///
+	/// A self-signed certificate rather than a CA-issued one because that is
+	/// what §1.3 actually requires to work: if a home server needs a certificate
+	/// authority, one person on a domestic connection cannot host a community.
+	/// The nested-TLS binding (§3.2) is what makes that safe, and this is the
+	/// setup it has to be safe under.
+	pub async fn start_with_tls() -> (Self, [u8; 32]) {
+		use sha2::{Digest, Sha256};
+
+		let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+		let hash: [u8; 32] = Sha256::digest(certified.cert.der()).into();
+
+		let server = Self::start_inner_tls(None, None, Some(certified)).await;
+		(server, hash)
+	}
+
 	async fn start_inner(fixed_port: Option<u16>, existing: Option<String>) -> Self {
+		Self::start_inner_tls(fixed_port, existing, None).await
+	}
+
+	async fn start_inner_tls(
+		fixed_port: Option<u16>,
+		existing: Option<String>,
+		tls: Option<rcgen::CertifiedKey>,
+	) -> Self {
 		let port = match fixed_port {
 			Some(port) => port,
 			None => free_port().await,
@@ -81,10 +106,21 @@ impl Server {
 
 		// address, TLS cert (blank), database path
 		let mut stdin = child.stdin.take().unwrap();
-		stdin
-			.write_all(format!("127.0.0.1:{port}\n\n{db}\n").as_bytes())
-			.await
-			.unwrap();
+		let answers = match &tls {
+			None => format!("127.0.0.1:{port}\n\n{db}\n"),
+			Some(certified) => {
+				let cert_path = dir.join("cert.pem");
+				let key_path = dir.join("key.pem");
+				std::fs::write(&cert_path, certified.cert.pem()).unwrap();
+				std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
+				format!(
+					"127.0.0.1:{port}\n{}\n{}\n{db}\n",
+					cert_path.display(),
+					key_path.display()
+				)
+			}
+		};
+		stdin.write_all(answers.as_bytes()).await.unwrap();
 		stdin.flush().await.unwrap();
 		drop(stdin);
 
@@ -108,6 +144,10 @@ impl Server {
 			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
 		panic!("server on port {} never became ready", self.port);
+	}
+
+	pub fn wss_url(&self) -> String {
+		format!("wss://127.0.0.1:{}", self.port)
 	}
 
 	pub fn ws_url(&self) -> String {
@@ -347,11 +387,30 @@ impl TestClient {
 	}
 
 	/// Whether the peer is still willing to talk to us.
+	/// Whether the peer is still willing to talk to us.
+	///
+	/// Sends a ping and waits for the answer. Checking only that the *send*
+	/// succeeded — which is what this did — proves nothing: a write to a socket
+	/// the far end has already closed lands in a local buffer and reports
+	/// success, so the check passed against a server that had hung up.
 	pub async fn is_connected(&mut self) -> bool {
-		self.socket
+		if self
+			.socket
 			.send(Message::Ping(Vec::new().into()))
 			.await
-			.is_ok()
+			.is_err()
+		{
+			return false;
+		}
+
+		loop {
+			match tokio::time::timeout(Duration::from_millis(1500), self.socket.next()).await {
+				Ok(Some(Ok(Message::Pong(_)))) => return true,
+				Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => return false,
+				Ok(Some(Ok(_))) => continue, // traffic in flight; keep looking
+				Err(_) => return false,      // no answer at all
+			}
+		}
 	}
 
 	/// Sends a text frame — the relay names its destination this way.
@@ -520,6 +579,7 @@ impl PendingClient {
 		let Challenge {
 			challenge,
 			versions,
+			tls_binding: _,
 		} = match opened.message {
 			ProtocolMessage::Challenge(c) => c,
 			other => anyhow::bail!("expected a challenge, got {other:?}"),

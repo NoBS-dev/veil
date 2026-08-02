@@ -350,6 +350,27 @@ pub struct Challenge {
 	/// rather than exchanged separately, so tampering breaks the signature
 	/// instead of silently forcing a downgrade.
 	pub versions: VersionRange,
+	/// SHA-256 of the server's own TLS certificate, or zero if it serves
+	/// plaintext.
+	///
+	/// **This is what makes the blind relay actually blind (§3.2).** The client
+	/// reaches a community host through a relay it does not trust, and runs a
+	/// second TLS session end-to-end inside that tunnel. A relay that terminated
+	/// that session with a certificate of its own would read everything — which
+	/// matters most for Open communities, whose content is not E2EE.
+	///
+	/// Certificate authorities cannot be the answer here: §1.3 requires that one
+	/// person on a domestic connection can host a community, and self-signed
+	/// certificates are the norm for that. So the binding runs through Veil's
+	/// own identity instead. This field is inside the signed challenge, so only
+	/// the holder of the server's identity key can claim a certificate, and the
+	/// client refuses if the certificate it actually negotiated does not hash to
+	/// this. A relay in the middle cannot produce that signature for its own
+	/// certificate.
+	///
+	/// The client pins the identity key on first sight (invariant 6), so this
+	/// inherits the same trust-on-first-use property and no more.
+	pub tls_binding: [u8; 32],
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug)]

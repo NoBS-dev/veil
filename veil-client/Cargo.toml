@@ -13,6 +13,9 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 url = "2"
 veil-protocol = { path = "../veil-protocol" }
 tungstenite = "0.27"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+sha2 = "0.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
 rkyv = { version = "0.8", features = ["std", "alloc"] }
 zstd = "0.13"
@@ -31,3 +34,5 @@ base64 = "0.2"
 # The hostile-host test needs to *be* a server: it proxies a real one and lies
 # about keys on the way past.
 axum = { version = "0.8", features = ["ws"] }
+# Self-signed certificates for the nested-TLS tests.
+rcgen = "0.13"

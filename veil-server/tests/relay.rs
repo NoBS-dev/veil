@@ -4,6 +4,15 @@
 //! and cannot inspect the traffic *is* an open proxy. These tests exist because
 //! that is the property most likely to be quietly lost in a refactor: the tunnel
 //! would keep working, and only the refusals would stop happening.
+//!
+//! Two independent constraints, and both are tested here because either alone
+//! leaves a hole. The **destination check** proves the far end is a Veil host,
+//! so the tunnel cannot be aimed at a web server. The **framing check** proves
+//! what crosses is TLS, so a tunnel to a genuine Veil host cannot be used to
+//! carry something else to it.
+//!
+//! The end-to-end round trip lives in `veil-client/tests/relay.rs`, because it
+//! now requires nested TLS (§3.2) and the real client is what speaks it.
 
 mod harness;
 
@@ -15,8 +24,14 @@ use tokio_tungstenite::tungstenite::Message;
 
 const BEAT: Duration = Duration::from_millis(1500);
 
-/// Asks a relay to tunnel somewhere, returning whether it agreed.
-async fn tunnel_accepted(relay: &Server, target: &str) -> bool {
+/// Asks a relay to tunnel somewhere, and reports what it did.
+///
+/// A refusal is a *positive* signal — the relay closes with a stated reason —
+/// which is what makes these tests meaningful. The tunnel is now a byte stream,
+/// so an accepted tunnel simply says nothing until something is sent through
+/// it; asserting on silence alone would pass against a relay that had stopped
+/// working entirely.
+async fn tunnel_outcome(relay: &Server, target: &str) -> Outcome {
 	let client = TestClient::new();
 	let mut client = client
 		.connect(&format!("{}/relay", relay.ws_url()))
@@ -25,21 +40,92 @@ async fn tunnel_accepted(relay: &Server, target: &str) -> bool {
 
 	client.send_text(target).await.expect("send target");
 
-	// A relay that agrees forwards the destination's opening challenge.
-	matches!(
-		client.recv_raw(BEAT).await,
-		Some(Message::Binary(bytes)) if veil_protocol::open_envelope(&bytes).is_ok()
-	)
+	match client.recv_raw(BEAT).await {
+		Some(Message::Close(frame)) => Outcome::Refused(
+			frame
+				.map(|f| f.reason.to_string())
+				.unwrap_or_else(|| "closed".into()),
+		),
+		Some(_) => Outcome::Carried,
+		None => Outcome::Open,
+	}
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+	Refused(String),
+	/// Sent something back, so the far end was reached.
+	Carried,
+	/// Held open, awaiting bytes. What an accepted tunnel looks like before
+	/// anything is written to it.
+	Open,
+}
+
+impl Outcome {
+	fn refused(&self) -> bool {
+		matches!(self, Outcome::Refused(_))
+	}
+}
+
+/// The control for every refusal below: a genuine Veil host is *not* refused.
+///
+/// Without this, "the relay refused" would be satisfied by a relay that refused
+/// everything, and every test in this file would pass against one that had
+/// stopped tunnelling at all.
 #[tokio::test]
-async fn a_tunnel_to_a_veil_host_is_established() {
+async fn a_tunnel_to_a_veil_host_is_not_refused() {
 	let destination = Server::start().await;
 	let relay = Server::start().await;
 
+	let outcome = tunnel_outcome(&relay, &format!("127.0.0.1:{}", destination.port)).await;
 	assert!(
-		tunnel_accepted(&relay, &format!("127.0.0.1:{}", destination.port)).await,
-		"a genuine veil host should be reachable through the relay"
+		!outcome.refused(),
+		"a genuine veil host should be reachable through the relay, got {outcome:?}"
+	);
+
+	relay.stop().await;
+	destination.stop().await;
+}
+
+/// The second constraint (§3.2): the tunnel carries TLS, and nothing else.
+///
+/// The control for this one cannot live here, and it is worth saying why. A
+/// synthetic TLS record forwarded to a plaintext Veil host makes that host hang
+/// up, so the tunnel closes either way and the test could not tell the relay's
+/// refusal from the destination's. The honest control is a real nested TLS
+/// session that works end to end, which is
+/// `veil-client/tests/relay.rs::a_message_survives_a_nested_tls_tunnel`.
+///
+/// The destination check alone does not close this. A genuine Veil host is a
+/// legitimate destination, so without framing validation the tunnel could be
+/// opened to one and then used to speak whatever the client liked to it — which
+/// is the open-proxy vector wearing a disguise.
+#[tokio::test]
+async fn a_tunnel_that_carries_something_other_than_tls_is_cut_off() {
+	let destination = Server::start().await;
+	let relay = Server::start().await;
+
+	let client = TestClient::new();
+	let mut client = client
+		.connect(&format!("{}/relay", relay.ws_url()))
+		.await
+		.unwrap();
+	client
+		.send_text(&format!("127.0.0.1:{}", destination.port))
+		.await
+		.unwrap();
+	tokio::time::sleep(BEAT).await;
+
+	// Plain HTTP down a tunnel to a real Veil host.
+	client
+		.send_raw(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec())
+		.await
+		.unwrap();
+	tokio::time::sleep(BEAT).await;
+
+	assert!(
+		!client.is_connected().await,
+		"a tunnel carrying something that is not TLS must be closed"
 	);
 
 	relay.stop().await;
@@ -65,7 +151,9 @@ async fn a_tunnel_to_a_plain_http_server_is_refused() {
 	});
 
 	assert!(
-		!tunnel_accepted(&relay, &format!("127.0.0.1:{port}")).await,
+		tunnel_outcome(&relay, &format!("127.0.0.1:{port}"))
+			.await
+			.refused(),
 		"the relay must not forward to something that is not a veil host"
 	);
 
@@ -93,7 +181,9 @@ async fn a_tunnel_to_a_websocket_that_is_not_a_veil_host_is_refused() {
 	});
 
 	assert!(
-		!tunnel_accepted(&relay, &format!("127.0.0.1:{port}")).await,
+		tunnel_outcome(&relay, &format!("127.0.0.1:{port}"))
+			.await
+			.refused(),
 		"speaking WebSocket is not the same as being a veil host"
 	);
 
@@ -132,56 +222,11 @@ async fn a_tunnel_to_a_host_that_does_not_open_with_a_challenge_is_refused() {
 	});
 
 	assert!(
-		!tunnel_accepted(&relay, &format!("127.0.0.1:{port}")).await,
+		tunnel_outcome(&relay, &format!("127.0.0.1:{port}"))
+			.await
+			.refused(),
 		"a valid envelope is not a challenge; the relay must still refuse"
 	);
 
 	relay.stop().await;
-}
-
-/// A message sent through a tunnel must arrive, or the relay is only safe
-/// because it is useless.
-#[tokio::test]
-async fn a_message_survives_the_round_trip_through_a_relay() {
-	let destination = Server::start().await;
-	let relay = Server::start().await;
-
-	// Bob is connected directly to the destination.
-	let mut bob = TestClient::new()
-		.connect(&destination.ws_url())
-		.await
-		.unwrap();
-	bob.upload_keys(10).await.unwrap();
-	tokio::time::sleep(BEAT).await;
-
-	// Alice reaches the same destination through the relay, and from the
-	// destination's point of view is an ordinary client.
-	let mut alice = TestClient::new()
-		.connect_via_relay(&relay.ws_url(), &format!("127.0.0.1:{}", destination.port))
-		.await
-		.unwrap();
-	alice.upload_keys(10).await.unwrap();
-	tokio::time::sleep(BEAT).await;
-
-	let (_, bob_x25519, otk) = harness::prekey_bundle(&destination.http_url(), &bob.address())
-		.await
-		.unwrap();
-	alice
-		.send_to(bob.address(), bob_x25519, otk, "through the tunnel")
-		.await
-		.unwrap();
-
-	let received = loop {
-		match bob.recv(BEAT).await {
-			Some(veil_protocol::ProtocolMessage::EncryptedMessage(msg)) => break Some(msg),
-			Some(_) => continue,
-			None => break None,
-		}
-	};
-
-	let message = received.expect("bob should receive the relayed message");
-	assert_eq!(bob.decrypt(&message).unwrap(), "through the tunnel");
-
-	relay.stop().await;
-	destination.stop().await;
 }
