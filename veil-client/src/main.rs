@@ -55,7 +55,16 @@ async fn main() -> anyhow::Result<()> {
 				let mut ip_and_port = String::new();
 				io::stdin().read_line(&mut ip_and_port)?;
 
-				State::new(ip_and_port.trim(), profile)?
+				print!("Enter relay to tunnel through (blank for a direct connection): ");
+				io::stdout().flush()?;
+				let mut relay = String::new();
+				io::stdin().read_line(&mut relay)?;
+
+				let mut state = State::new(ip_and_port.trim(), profile)?;
+				if !relay.trim().is_empty() {
+					state.relay = Some(relay.trim().into());
+				}
+				state
 			}
 		};
 
@@ -71,7 +80,16 @@ async fn main() -> anyhow::Result<()> {
 		);
 	}
 
-	let (mut write, mut read) = tokio_tungstenite::connect_async(socket).await?.0.split();
+	let (mut write, mut read) = match state.relay.as_deref() {
+		None => {
+			eprintln!(
+				"Connecting directly — {} will see this machine's IP. Set a relay to avoid that.",
+				state.ip_and_port
+			);
+			tokio_tungstenite::connect_async(socket).await?.0.split()
+		}
+		Some(relay) => open_relayed(relay, &state).await?,
+	};
 
 	println!("My address: {}", state.address());
 	println!(
@@ -102,6 +120,71 @@ async fn main() -> anyhow::Result<()> {
 	let state = Arc::new(Mutex::new(state));
 	tokio::spawn(listener::listener(read, state.clone(), server_identity));
 	cli(&prompt, &url, write, state).await?;
+
+	Ok(())
+}
+
+/// Connects through a home server, which forwards to the destination without
+/// reading what passes (§3.2).
+///
+/// Two handshakes happen, and they are separate on purpose: one with the relay,
+/// because it is a service we hold an account with and its limits are per user;
+/// and one with the destination *through* the tunnel, which is the session that
+/// actually matters. The destination only ever sees the relay's address.
+async fn open_relayed(relay: &str, state: &State) -> anyhow::Result<(WriteStream, ReadStream)> {
+	let (scheme, _) = state.schemes();
+	let (mut write, mut read) =
+		tokio_tungstenite::connect_async(format!("{scheme}://{relay}/relay"))
+			.await?
+			.0
+			.split();
+
+	// The relay authenticates us like any other connection.
+	relay_handshake(&mut write, &mut read, state).await?;
+
+	write
+		.send(Message::Text(state.ip_and_port.to_string().into()))
+		.await?;
+
+	println!("Tunnelling to {} via {relay}.", state.ip_and_port);
+	Ok((write, read))
+}
+
+/// The relay's own challenge/response. Deliberately does not pin the relay's
+/// identity the way the destination handshake does: the relay is transport, and
+/// the session that carries anything sensitive is the one negotiated through it.
+async fn relay_handshake(
+	write: &mut WriteStream,
+	read: &mut ReadStream,
+	state: &State,
+) -> anyhow::Result<()> {
+	let Some(Ok(Message::Binary(bytes))) = read.next().await else {
+		anyhow::bail!("relay closed the connection before challenging us");
+	};
+
+	let opened = open_envelope(&bytes)?;
+	let challenge = match opened.message {
+		ProtocolMessage::Challenge(challenge) => challenge,
+		other => anyhow::bail!("expected a challenge from the relay, got {other:?}"),
+	};
+
+	let ours = VersionRange::supported();
+	ours.agree(&challenge.versions)?;
+
+	write
+		.send(Message::Binary(Bytes::copy_from_slice(&Envelope::seal(
+			&ProtocolMessage::Authenticate(Box::new(Authenticate {
+				challenge: challenge.challenge,
+				versions: ours,
+				server_versions_seen: challenge.versions,
+				user: state.user_id,
+				device: state.device_id,
+				keys: state.cross_signing_public(),
+				binding: state.device_binding(),
+			})),
+			&state.account,
+		)?)))
+		.await?;
 
 	Ok(())
 }

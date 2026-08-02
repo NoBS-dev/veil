@@ -12,7 +12,7 @@ use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
 
 /// Bumped whenever `State` changes shape. Profiles from an older version are
 /// refused rather than migrated — see `load_from_keyring`.
-const STATE_VERSION: u32 = 4;
+const STATE_VERSION: u32 = 5;
 
 fn serialize_session<S: Serializer>(session: &Session, serializer: S) -> Result<S::Ok, S::Error> {
 	session.pickle().serialize(serializer)
@@ -130,6 +130,14 @@ pub struct State {
 	pub verified_users: HashMap<UserId, VerifiedUser>,
 
 	pub ip_and_port: Box<str>,
+	/// Home server to tunnel through, if any (§3.2).
+	///
+	/// With one set, the destination sees the relay's address rather than ours.
+	/// Without one we connect directly, which is faster and exposes our IP to
+	/// whoever runs the destination — a fine trade for a host you run yourself,
+	/// and a poor one for a stranger's.
+	#[serde(default)]
+	pub relay: Option<Box<str>>,
 	pub profile: Box<str>,
 	/// Pinned on first connect. A server that later signs with a different key
 	/// is refused rather than trusted afresh.
@@ -155,6 +163,7 @@ impl State {
 			peer_devices: HashMap::new(),
 			verified_users: HashMap::new(),
 			ip_and_port,
+			relay: None,
 			profile: normalized_profile(profile).into(),
 			server_identity: None,
 			use_tls,

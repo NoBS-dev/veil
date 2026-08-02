@@ -103,6 +103,16 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `remove`, `quit`.
 
+A profile may carry a relay (§3.2). With one set the client tunnels through it,
+so the destination sees the relay's address rather than the client's. Test it by
+running two servers and giving one as the relay:
+
+```sh
+printf '127.0.0.1:9901\n\n' | ./target/debug/veil-server   # destination
+printf '127.0.0.1:9902\n\n' | ./target/debug/veil-server   # relay
+# then at the client prompts: server 127.0.0.1:9901, relay 127.0.0.1:9902
+```
+
 Addresses are `<user-id>/<device-id>` in base32 (§5.3) — `msg` and the prekey
 endpoint both take that form, not a raw key. Profiles predating the identity
 model are refused on load rather than migrated; use `remove` or a new profile.
@@ -160,7 +170,12 @@ explicitly — each one closes a specific attack.
     Signing alone is not enough — an old challenge is genuinely signed, so the
     client replay-guards it and the server checks the client saw the range it
     actually advertised. Both are downgrade defences.
-14. **Policy needs k *distinct* controllers.** One controller signing twice must
+14. **The relay is not an arbitrary tunnel.** It authenticates the user first
+    (so limits are per user), and refuses any destination that cannot produce a
+    signed Veil challenge. That check is what stops it being an open proxy —
+    it cannot be pointed at a web server at all, rather than merely being
+    discouraged from it.
+15. **Policy needs k *distinct* controllers.** One controller signing twice must
     not reach the threshold, or k-of-n collapses to 1-of-n. Sequences must
     advance, or a stale migration could redirect a community backwards.
 

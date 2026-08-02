@@ -3348,6 +3348,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "tokio",
+ "tokio-tungstenite 0.27.0",
  "veil-protocol",
  "vodozemac",
 ]

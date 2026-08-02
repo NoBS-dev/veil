@@ -91,7 +91,8 @@ to.
 | Safety numbers | **[built]** primitive only; no verification flow |
 | Optional TLS transport | **[built]** |
 | Prekey/roster rate limiting | **[built]** |
-| Blind relay, tunnel, anti-open-proxy checks | designed, §3.2 |
+| Relay tunnel, destination verification, per-user limits | **[built]** `veil-server` `/relay` |
+| Nested TLS through the tunnel | designed, §3.2 — see below |
 | DM store-and-forward mailboxes | designed, §3.3–3.4 |
 | Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
@@ -222,6 +223,14 @@ contents encrypted, which satisfies constraints 2 and 3 at no versioning cost.
 If richer inspection ever proves necessary, add a **minimal outer frame versioned
 independently of the inner protocol** — type and length only, stable across
 protocol changes — so relays never need updating in lockstep.
+
+**Nested TLS is not yet built.** The tunnel and its destination check are, and
+the relay forwards without inspecting — but the inner session is currently the
+Veil protocol directly rather than a second TLS session inside the tunnel. For
+Sealed traffic the practical gap is small, since content is already E2EE and the
+relay is a user's own home server which is expected to know who they talk to
+(§14). It matters for **Open** communities, whose content is not E2EE, so this
+must land before Open-tier traffic exists.
 
 Note this narrows the blindness above slightly and deliberately: the relay learns
 framing and volume, never content. For **Open** communities that distinction

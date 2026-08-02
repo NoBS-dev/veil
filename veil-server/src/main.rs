@@ -40,6 +40,11 @@ const OTK_BUDGET_PER_WINDOW: u32 = 5;
 /// Prekey requests a single IP may make per window, whatever it asks about.
 const REQUESTS_PER_IP_PER_WINDOW: u32 = 30;
 const RATE_WINDOW_MS: u64 = 60_000;
+/// Tunnels one user may open per window (§3.2).
+const TUNNELS_PER_USER_PER_WINDOW: u32 = 20;
+/// Largest frame the relay will forward. Bounds memory and stops a client
+/// using the tunnel as an amplifier.
+const MAX_TUNNEL_FRAME: usize = 1 << 20;
 
 type KeyMap = Arc<RwLock<HashMap<DeviceAddress, ClientStore>>>;
 
@@ -64,6 +69,7 @@ struct ServerState {
 	replay_guard: Arc<Mutex<ReplayGuard>>,
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
 	otk_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
+	tunnel_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
 }
 
 struct ClientStore {
@@ -136,6 +142,10 @@ async fn main() -> Result<()> {
 			OTK_BUDGET_PER_WINDOW,
 			RATE_WINDOW_MS,
 		))),
+		tunnel_limiter: Arc::new(Mutex::new(RateLimiter::new(
+			TUNNELS_PER_USER_PER_WINDOW,
+			RATE_WINDOW_MS,
+		))),
 	};
 
 	println!(
@@ -151,6 +161,7 @@ async fn main() -> Result<()> {
 			routing::get(get_prekey_bundle),
 		)
 		.route("/users/{user}/devices", routing::get(get_device_list))
+		.route("/relay", routing::any(relay))
 		.with_state(state);
 
 	let listener = TcpListener::bind(address).await?;
@@ -586,4 +597,187 @@ async fn get_device_list(
 		"keys": record.keys,
 		"devices": devices,
 	})))
+}
+
+// ---------------------------------------------------------------------------
+// Blind relay (§3.2)
+// ---------------------------------------------------------------------------
+
+/// Tunnels a client to another Veil host, without reading what passes through.
+///
+/// The point of the relay is that a community host never learns the user's IP:
+/// it sees this server's address instead. The cost is that a server opening
+/// connections to arbitrary destinations on a user's behalf, unable to inspect
+/// the traffic, **is an open proxy** — users could route attacks through the
+/// operator's IP, and the operator could neither see it nor prove innocence.
+///
+/// So this is not an arbitrary tunnel. Three constraints, none of which require
+/// reading content:
+///
+/// 1. the client authenticates first, so limits are per user rather than per IP;
+/// 2. the destination must prove it speaks Veil before any bytes are forwarded;
+/// 3. tunnels are rate limited per user.
+async fn relay(socket: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
+	socket.on_upgrade(|socket| handle_relay(socket, state))
+}
+
+async fn handle_relay(socket: WebSocket, state: ServerState) {
+	let (mut sender, mut receiver) = socket.split();
+
+	// Same handshake as a normal connection: a relay is a service its users
+	// hold an account with, not an open service (§3.2).
+	let (address, _, _) = match authenticate(&mut sender, &mut receiver, &state).await {
+		Ok(identity) => identity,
+		Err(e) => {
+			eprintln!("Relay handshake failed: {e:#}");
+			return;
+		}
+	};
+
+	let Some(Ok(Message::Text(target))) = receiver.next().await else {
+		eprintln!("Relay: {address} did not name a destination");
+		return;
+	};
+	let target = target.trim().to_owned();
+
+	let now = now_ms().unwrap_or_default();
+	if !state.tunnel_limiter.lock().await.allow(address, now) {
+		eprintln!("Relay: {address} is over its tunnel budget");
+		let _ = sender
+			.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+				code: 1013,
+				reason: "tunnel rate limit".into(),
+			})))
+			.await;
+		return;
+	}
+
+	eprintln!("Relay: {address} -> {target}");
+
+	match open_verified_tunnel(&target).await {
+		Ok((upstream, first_frame)) => {
+			// Hand the client the destination's challenge — the same frame the
+			// probe just verified, so nothing is wasted and the destination sees
+			// exactly one connection.
+			if sender
+				.send(Message::Binary(Bytes::copy_from_slice(&first_frame)))
+				.await
+				.is_err()
+			{
+				return;
+			}
+			pump(sender, receiver, upstream, address).await;
+		}
+		Err(e) => {
+			eprintln!("Relay: refusing {address} -> {target}: {e:#}");
+			let _ = sender
+				.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+					code: 1008,
+					reason: "destination is not a veil host".into(),
+				})))
+				.await;
+		}
+	}
+}
+
+/// Connects to a destination and proves it speaks Veil before returning.
+///
+/// **This is the load-bearing anti-open-proxy check.** Because a Veil host
+/// opens with a signed `Challenge`, a web server, game server or DNS resolver
+/// cannot satisfy it — so the relay cannot be pointed at one at all. That
+/// removes the general open-proxy vector rather than mitigating it.
+///
+/// The probe *is* the first frame of the real session, so verifying costs
+/// nothing extra and the destination sees a single connection.
+async fn open_verified_tunnel(
+	target: &str,
+) -> Result<(
+	tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+	Vec<u8>,
+)> {
+	let url = if target.starts_with("ws://") || target.starts_with("wss://") {
+		target.to_owned()
+	} else {
+		format!("ws://{target}")
+	};
+
+	let (mut upstream, _) = tokio::time::timeout(
+		std::time::Duration::from_secs(10),
+		tokio_tungstenite::connect_async(url),
+	)
+	.await
+	.map_err(|_| anyhow::anyhow!("destination did not answer in time"))??;
+
+	let first = tokio::time::timeout(std::time::Duration::from_secs(10), upstream.next())
+		.await
+		.map_err(|_| anyhow::anyhow!("destination sent no opening frame in time"))?;
+
+	let Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) = first else {
+		anyhow::bail!("destination did not open with a binary frame");
+	};
+
+	// A signed Veil challenge, or nothing doing.
+	let opened = open_envelope(&bytes)
+		.map_err(|e| anyhow::anyhow!("destination's opening frame is not a veil envelope: {e}"))?;
+
+	if !matches!(opened.message, ProtocolMessage::Challenge(_)) {
+		anyhow::bail!(
+			"destination opened with {:?}, not a challenge",
+			opened.message
+		);
+	}
+
+	Ok((upstream, bytes.to_vec()))
+}
+
+/// Moves bytes both ways without looking at them.
+async fn pump(
+	mut client_out: SplitSink<WebSocket, Message>,
+	mut client_in: SplitStream<WebSocket>,
+	upstream: tokio_tungstenite::WebSocketStream<
+		tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+	>,
+	address: DeviceAddress,
+) {
+	use futures::SinkExt as _;
+	let (mut up_out, mut up_in) = upstream.split();
+
+	loop {
+		tokio::select! {
+			from_client = client_in.next() => match from_client {
+				Some(Ok(Message::Binary(bytes))) => {
+					if bytes.len() > MAX_TUNNEL_FRAME {
+						eprintln!("Relay: {address} sent an oversized frame; closing");
+						break;
+					}
+					if up_out
+						.send(tokio_tungstenite::tungstenite::Message::Binary(bytes))
+						.await
+						.is_err()
+					{
+						break;
+					}
+				}
+				Some(Ok(Message::Close(_))) | None => break,
+				Some(Ok(_)) => break, // only binary crosses a tunnel
+				Some(Err(_)) => break,
+			},
+			from_upstream = up_in.next() => match from_upstream {
+				Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => {
+					if client_out
+						.send(Message::Binary(Bytes::copy_from_slice(&bytes)))
+						.await
+						.is_err()
+					{
+						break;
+					}
+				}
+				Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None => break,
+				Some(Ok(_)) => continue,
+				Some(Err(_)) => break,
+			},
+		}
+	}
+
+	eprintln!("Relay: {address} tunnel closed");
 }
