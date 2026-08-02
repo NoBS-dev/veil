@@ -88,13 +88,20 @@ need (`paru -S --noconfirm --needed <pkg>`). The Rust toolchain and
 Bash tool calls generally need `dangerouslyDisableSandbox: true` — the sandbox
 presents a restricted PATH where `cargo`, `paru`, and `pacman` are not visible.
 
-The client stores state in the OS keyring via the Secret Service, which does
-work in this container. Test profiles create real keyring entries — clean them
-up afterwards:
+The client stores state in the OS keyring via the Secret Service by default,
+which does work in this container. Test profiles create real keyring entries —
+clean them up afterwards:
 
 ```sh
 secret-tool clear service veil-client username <profile>
 ```
+
+Setting `VEIL_STATE_DIR` switches to files instead, one JSON profile per name,
+`0600`. That is what the client tests use, and it is also the only way the
+client runs anywhere without a Secret Service — containers, CI, a headless box.
+The client says so on stdout when it takes that path, because the secrets are
+then protected by file permissions and nothing else. Prefer it for manual
+experiments too: no keyring residue to clean up.
 
 ## Running it
 
@@ -215,12 +222,26 @@ share cannot hide behind itself. Those cover handshake refusal, routing, the
 offline mailbox, acknowledgement, restart persistence, prekey exhaustion, and
 the relay's anti-open-proxy checks.
 
+`veil-client/tests/` drives the **real client binary** the way a person does:
+commands on stdin, judgement on stdout. `VEIL_STATE_DIR` is what makes that
+possible without a keyring. `hostile_host.rs` is the one worth understanding —
+it stands a proxy in front of a real server that passes the WebSocket through
+byte-for-byte, so the handshake and the pinned server identity are genuine, and
+rewrites only the HTTP prekey bundle. That isolates the cross-signing check: the
+client refuses because the peer's own device list does not vouch for the
+substituted key, not because anything else looked wrong. It carries a
+**no-tampering control**, without which a broken proxy would make every send
+fail and the attack tests would pass for the wrong reason.
+
 **Check a new test by breaking the thing it defends and confirming it fails.**
-Three tests written for this suite passed against deliberately sabotaged code
-before being fixed — asserting silence where silence was ambiguous, counting a
-roster that stays the same size during a takeover, and refusing a destination
-for the wrong reason. A test that has never failed has not been shown to test
-anything.
+Three tests written for the server suite passed against deliberately sabotaged
+code before being fixed — asserting silence where silence was ambiguous,
+counting a roster that stays the same size during a takeover, and refusing a
+destination for the wrong reason. A test that has never failed has not been
+shown to test anything. Every test in `attacks.rs` and `hostile_host.rs` has
+been checked this way; the client ones were verified against five separate
+mutations (identity-key check, signing-key check, device-list membership,
+profile persistence, and the stdin-EOF quit), each failing only its own test.
 
 `veil-protocol` has 80 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the

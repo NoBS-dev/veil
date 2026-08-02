@@ -184,6 +184,27 @@ impl TestClient {
 	}
 
 	/// Publishes prekeys, which is what completes this device's directory entry.
+	/// Builds a key upload without sending, so a test can replay it.
+	pub fn compose_upload(&mut self, count: usize) -> ProtocolMessage {
+		self.account.generate_one_time_keys(count);
+		let one_time_keys = self
+			.account
+			.one_time_keys()
+			.values()
+			.map(|k| *k.as_bytes())
+			.collect();
+		self.account.generate_fallback_key();
+		let (_, fallback) = self.account.fallback_key().into_iter().next().unwrap();
+		self.account.mark_keys_as_published();
+
+		ProtocolMessage::UploadKeys(UploadKeys {
+			encryption_key: self.account.curve25519_key().to_bytes(),
+			one_time_keys,
+			fallback_key: fallback.to_bytes(),
+			display_name: "test".into(),
+		})
+	}
+
 	pub async fn upload_keys(&mut self, count: usize) -> anyhow::Result<()> {
 		self.account.generate_one_time_keys(count);
 		let one_time_keys = self
@@ -252,6 +273,53 @@ impl TestClient {
 
 	pub async fn acknowledge(&mut self, id: u64) -> anyhow::Result<()> {
 		self.send(&ProtocolMessage::Acknowledge(vec![id])).await
+	}
+
+	/// Sends bytes verbatim, so a test can replay or corrupt a captured frame.
+	pub async fn send_raw(&mut self, bytes: Vec<u8>) -> anyhow::Result<()> {
+		self.socket.send(Message::Binary(bytes.into())).await?;
+		Ok(())
+	}
+
+	/// Seals a message and returns the bytes *without* sending, so a test can
+	/// keep a copy to replay later.
+	pub fn frame(&self, message: &ProtocolMessage) -> anyhow::Result<Vec<u8>> {
+		Ok(Envelope::seal(message, &self.account)?.to_vec())
+	}
+
+	/// Builds an encrypted message without sending it.
+	pub fn compose(
+		&mut self,
+		recipient: DeviceAddress,
+		peer_x25519: [u8; 32],
+		otk: [u8; 32],
+		text: &str,
+	) -> anyhow::Result<ProtocolMessage> {
+		let mut session = self.account.create_outbound_session(
+			SessionConfig::version_2(),
+			peer_x25519.into(),
+			otk.into(),
+		);
+		let (message_type, ciphertext) = session.encrypt(text).to_parts();
+
+		Ok(ProtocolMessage::EncryptedMessage(EncryptedMessage {
+			sender: self.address(),
+			recipient,
+			sender_x25519: self.account.curve25519_key().to_bytes(),
+			nonce: random_nonce(),
+			origin_ts: now_ms(),
+			seen_head: MessageId::ROOT,
+			message_type,
+			message: ciphertext,
+		}))
+	}
+
+	/// Whether the peer is still willing to talk to us.
+	pub async fn is_connected(&mut self) -> bool {
+		self.socket
+			.send(Message::Ping(Vec::new().into()))
+			.await
+			.is_ok()
 	}
 
 	/// Sends a text frame — the relay names its destination this way.

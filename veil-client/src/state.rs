@@ -237,7 +237,7 @@ impl State {
 	}
 
 	pub fn load_from_keyring(profile: &str) -> Result<Self> {
-		let stored = entry_for(profile)?.get_password()?;
+		let stored = store().load(profile)?;
 
 		// Profiles written before the identity model are refused rather than
 		// migrated. The shape changed at the root — one Olm account was both
@@ -275,13 +275,11 @@ impl State {
 	}
 
 	pub fn save_to_keyring(&self) -> Result<()> {
-		entry_for(&self.profile)?.set_password(&serde_json::to_string(&self)?)?;
-		Ok(())
+		store().save(&self.profile, &serde_json::to_string(&self)?)
 	}
 
 	pub fn delete_from_keyring(&self) -> Result<()> {
-		entry_for(&self.profile)?.delete_password()?;
-		Ok(())
+		store().delete(&self.profile)
 	}
 }
 
@@ -313,6 +311,121 @@ pub fn normalized_profile(profile: &str) -> &str {
 	}
 }
 
-fn entry_for(profile: &str) -> Result<Entry> {
-	Ok(Entry::new("veil-client", profile)?)
+/// Where a profile's secrets live.
+///
+/// An indirection rather than calling the keyring directly, for two reasons
+/// that turned out to be the same reason: the client could not be tested
+/// without a Secret Service running, and it could not be *run* without one
+/// either — which rules out containers, CI, and anything headless.
+pub trait SecretStore: Send + Sync {
+	fn load(&self, profile: &str) -> Result<String>;
+	fn save(&self, profile: &str, data: &str) -> Result<()>;
+	fn delete(&self, profile: &str) -> Result<()>;
+}
+
+/// The OS keyring, via Secret Service. The default.
+pub struct Keyring;
+
+impl SecretStore for Keyring {
+	fn load(&self, profile: &str) -> Result<String> {
+		Ok(Entry::new("veil-client", profile)?.get_password()?)
+	}
+	fn save(&self, profile: &str, data: &str) -> Result<()> {
+		Entry::new("veil-client", profile)?.set_password(data)?;
+		Ok(())
+	}
+	fn delete(&self, profile: &str) -> Result<()> {
+		Entry::new("veil-client", profile)?.delete_password()?;
+		Ok(())
+	}
+}
+
+/// Profiles as files in a directory.
+///
+/// **Secrets sit on disk unencrypted**, protected only by file permissions, so
+/// this is for tests and headless use rather than a desktop where the keyring
+/// is available. Selected by setting `VEIL_STATE_DIR`, and the client says so
+/// out loud when it is in use.
+pub struct FileStore {
+	dir: std::path::PathBuf,
+}
+
+impl FileStore {
+	pub fn new(dir: impl Into<std::path::PathBuf>) -> Result<Self> {
+		let dir = dir.into();
+		std::fs::create_dir_all(&dir)?;
+		Ok(Self { dir })
+	}
+
+	fn path(&self, profile: &str) -> std::path::PathBuf {
+		// Profile names reach the filesystem here, so anything that could climb
+		// out of the directory is replaced rather than trusted.
+		let safe: String = profile
+			.chars()
+			.map(|c| {
+				if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+					c
+				} else {
+					'_'
+				}
+			})
+			.collect();
+		self.dir.join(format!("{safe}.json"))
+	}
+}
+
+impl SecretStore for FileStore {
+	fn load(&self, profile: &str) -> Result<String> {
+		Ok(std::fs::read_to_string(self.path(profile))?)
+	}
+
+	fn save(&self, profile: &str, data: &str) -> Result<()> {
+		let path = self.path(profile);
+		// Written beside and renamed, so an interrupted save cannot leave a
+		// half-written profile where a whole one used to be.
+		let temporary = path.with_extension("tmp");
+		std::fs::write(&temporary, data)?;
+
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::PermissionsExt;
+			std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+		}
+
+		std::fs::rename(&temporary, &path)?;
+		Ok(())
+	}
+
+	fn delete(&self, profile: &str) -> Result<()> {
+		std::fs::remove_file(self.path(profile))?;
+		Ok(())
+	}
+}
+
+/// The process-wide store.
+///
+/// A global because `State` is serialised and cannot carry a handle. When the
+/// UI-agnostic core is extracted (§17.1) this becomes something the core owns,
+/// and the global goes away.
+static STORE: std::sync::OnceLock<Box<dyn SecretStore>> = std::sync::OnceLock::new();
+
+/// Initialises from the environment if nothing has been chosen yet.
+pub fn store() -> &'static dyn SecretStore {
+	STORE
+		.get_or_init(|| default_store().expect("a usable secret store"))
+		.as_ref()
+}
+
+/// `VEIL_STATE_DIR` selects files; otherwise the keyring.
+pub fn default_store() -> Result<Box<dyn SecretStore>> {
+	match std::env::var("VEIL_STATE_DIR") {
+		Ok(dir) if !dir.trim().is_empty() => {
+			eprintln!(
+				"Using file-backed profiles in {dir} — secrets are stored unencrypted, \
+				 protected only by file permissions."
+			);
+			Ok(Box::new(FileStore::new(dir)?))
+		}
+		_ => Ok(Box::new(Keyring)),
+	}
 }

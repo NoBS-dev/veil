@@ -26,3 +26,8 @@ serde_json = "1"
 serde_with = "3"
 keyring = "2"
 base64 = "0.2"
+
+[dev-dependencies]
+# The hostile-host test needs to *be* a server: it proxies a real one and lies
+# about keys on the way past.
+axum = { version = "0.8", features = ["ws"] }

@@ -3363,6 +3363,7 @@ name = "veil-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64 0.2.1",
  "chacha20poly1305",
  "constcat",
