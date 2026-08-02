@@ -88,12 +88,13 @@ to.
 | Signed envelope, replay defence | **[built]** `veil-protocol/src/lib.rs` |
 | Connection authentication (challenge/response) | **[built]** `veil-server/src/main.rs` |
 | 1:1 Olm sessions, prekey/fallback bundles | **[built]** |
-| Safety numbers | **[built]** primitive only; no verification flow |
+| Safety numbers, user verification | **[built]** `safety` command, `verify_user` |
 | Optional TLS transport | **[built]** |
 | Prekey/roster rate limiting | **[built]** |
 | Relay tunnel, destination verification, per-user limits | **[built]** `veil-server` `/relay` |
 | Nested TLS through the tunnel | designed, §3.2 — see below |
-| DM store-and-forward mailboxes | designed, §3.3–3.4 |
+| DM mailboxes, local | **[built]** `store.rs`, acknowledgement-scoped |
+| DM store-and-forward *across servers* | designed, §3.3–3.4 — nothing S2S exists |
 | Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
@@ -122,10 +123,20 @@ to.
 §4 (threat model), §6 (trust establishment), §14 (metadata) and §15 (sequencing)
 are analysis rather than subsystems and carry no build status of their own.
 
-Today's implementation is a working single-process relay for 1:1 encrypted text
-messages between two CLI clients. Everything is in memory; a restart drops all
-key material, and messages to offline recipients are discarded. None of the
-network architecture in §3 exists.
+Today's implementation is a working **single-server** deployment for 1:1
+encrypted text between CLI clients: identities cross-sign, devices are verified
+before a session opens, state survives a restart, and mail for an offline device
+waits in a mailbox until that device acknowledges it.
+
+Three things are load-bearing and absent. **There is no server-to-server path
+at all** (§3.3), so two people on different home servers cannot reach each
+other — every test to date has both parties on one host. **The relay is not yet
+blind** (§3.2): it authenticates the user and proves the destination speaks
+Veil, but forwards frames it could parse, so it sees who is talking to whom.
+Nested TLS is what closes that, and it is the difference between the design's
+claim and the code's behaviour. And **communities and channels do not exist**
+above the primitives — `community.rs` and `groupkeys.rs` are correct and tested
+but nothing carries them over a wire.
 
 ---
 
