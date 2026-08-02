@@ -57,14 +57,26 @@ pub async fn listener(
 						}
 
 						match open_envelope(&mail.frame) {
-							Ok(inner) => {
-								if let ProtocolMessage::EncryptedMessage(msg) = inner.message {
+							// Anything routed to a device can end up queued, so
+							// this has to handle every such frame rather than
+							// only DMs. A channel key that arrived while the
+							// device was away is the common case, and dropping
+							// it here left the device permanently unable to read
+							// a channel it had been given access to.
+							Ok(inner) => match inner.message {
+								ProtocolMessage::EncryptedMessage(msg) => {
 									process_encrypted_message(state.clone(), inner.sender, msg)
 										.await;
-								} else {
-									eprintln!("[Notification] Queued mail was not a message.");
 								}
-							}
+								ProtocolMessage::ChannelKey(key) => {
+									accept_channel_key(state.clone(), inner.sender, key).await;
+								}
+								other => eprintln!(
+									"[Notification] Queued mail was a {}, which is not \
+									 something a device can be sent.",
+									frame_name(&other)
+								),
+							},
 							Err(e) => {
 								eprintln!("[Notification] Queued mail is unverifiable: {e:#}")
 							}
@@ -93,16 +105,10 @@ pub async fn listener(
 						// If we have less than half OTKs in our pool, regen some more
 					}
 					ProtocolMessage::Delivery(delivery) => {
-						// Position and chain come from the host (§10.1). Shown
-						// so a discrepancy is visible to a person rather than
-						// silently absorbed.
-						println!(
-							"[{}#{} {}] {}",
-							delivery.community,
-							delivery.channel,
-							delivery.sequence,
-							String::from_utf8_lossy(&delivery.body)
-						);
+						show_delivery(state.clone(), *delivery).await;
+					}
+					ProtocolMessage::ChannelKey(key) => {
+						accept_channel_key(state.clone(), opened.sender, key).await;
 					}
 					ProtocolMessage::CommunityResult {
 						community,
@@ -116,11 +122,36 @@ pub async fn listener(
 						}
 					}
 					ProtocolMessage::CommunityState(view) => {
-						println!(
-							"[community] {} member(s), {} policy record(s)",
-							view.members.len(),
-							view.policy_chain.len()
-						);
+						let mut state = state.lock().await;
+						// The root is checked against the id it was served
+						// under, and the chain is replayed, before any of it is
+						// believed. A host that edits either is caught here
+						// rather than trusted not to (invariant 13, 16).
+						match serde_json::from_str::<veil_protocol::community::CommunityRoot>(
+							&view.root,
+						)
+						.map_err(anyhow::Error::from)
+						.and_then(|root| {
+							let id = root.id();
+							state
+								.accept_community(id, &view.root, &view.policy_chain)
+								.map(|()| id)
+						}) {
+							Ok(id) => {
+								println!(
+									"[{id}] verified: {} member(s), {} policy record(s)",
+									view.members.len(),
+									view.policy_chain.len()
+								);
+								if let Err(e) = state.save_to_keyring() {
+									eprintln!("[Notification] Save state failed: {e:#}");
+								}
+							}
+							Err(e) => eprintln!(
+								"[Notification] Refusing a community the host could not \
+								 justify: {e:#}"
+							),
+						}
 					}
 					protocol_message => {
 						println!(
@@ -278,4 +309,191 @@ async fn acknowledge(
 		.send(Message::Binary(Bytes::copy_from_slice(&framed)))
 		.await?;
 	Ok(())
+}
+
+/// Prints a channel message, decrypting it first if the channel is Sealed.
+async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::ChannelDelivery) {
+	use veil_protocol::{
+		community::Mode,
+		groupkeys::{ChannelId, GroupKeyProvider},
+	};
+
+	let mut state = state.lock().await;
+	let channel = ChannelId::new(delivery.community, &delivery.channel);
+
+	let body = match state.community_mode(&delivery.community) {
+		Some(Mode::Sealed) => {
+			let mut provider = match state.megolm() {
+				Ok(provider) => provider,
+				Err(e) => {
+					eprintln!("[Notification] Could not load group keys: {e:#}");
+					return;
+				}
+			};
+
+			match provider.decrypt(&channel, &delivery.sender, &delivery.body) {
+				Ok(plaintext) => {
+					// Decrypting advances a ratchet, so the result has to be
+					// kept or the next message fails.
+					let _ = state.store_megolm(&provider);
+					let _ = state.save_to_keyring();
+					String::from_utf8_lossy(&plaintext).into_owned()
+				}
+				// Not an error worth hiding: it usually means the key for this
+				// session never arrived, which is what a reader added after the
+				// fact looks like (§8.3 — joiners cannot read earlier history).
+				Err(e) => format!("<unreadable: {e}>"),
+			}
+		}
+		_ => String::from_utf8_lossy(&delivery.body).into_owned(),
+	};
+
+	// Position and chain come from the host (§10.1), and are shown so a
+	// discrepancy is visible to a person rather than silently absorbed.
+	println!(
+		"[{}#{} {}] {body}",
+		delivery.community, delivery.channel, delivery.sequence
+	);
+}
+
+/// Takes a Megolm session key a peer sent us.
+///
+/// The envelope's signer is what identifies the sender — not the `sender` field
+/// (invariant 1). A key accepted from the wrong device would let anyone inject a
+/// session and then author messages that appear to come from it.
+async fn accept_channel_key(
+	state: Arc<Mutex<State>>,
+	envelope_signer: [u8; 32],
+	key: veil_protocol::ChannelKey,
+) {
+	use veil_protocol::groupkeys::{ChannelId, GroupKeyProvider};
+
+	let mut state = state.lock().await;
+
+	if key.recipient != state.address() {
+		eprintln!(
+			"[Notification] Discarding a channel key addressed to {}",
+			key.recipient
+		);
+		return;
+	}
+
+	// The sender must be a device we have a session with, and that session's
+	// pinned signing key must be the one that signed this envelope.
+	match state.peers.get(&key.sender) {
+		Some(peer) if peer.ed25519 == envelope_signer => {}
+		Some(_) => {
+			eprintln!(
+				"[Notification] Discarding a channel key from {}: signed by a different key \
+				 than the session we hold with it",
+				key.sender
+			);
+			return;
+		}
+		// No session yet: this is the first thing that device has sent us, and
+		// the payload is a prekey message that establishes one.
+		None => {}
+	}
+
+	let plaintext = match decrypt_channel_key(&mut state, &key, envelope_signer) {
+		Ok(plaintext) => plaintext,
+		Err(e) => {
+			eprintln!(
+				"[Notification] Could not open a channel key from {}: {e:#}",
+				key.sender
+			);
+			return;
+		}
+	};
+
+	let channel = ChannelId::new(key.community, &key.channel);
+	let mut provider = match state.megolm() {
+		Ok(provider) => provider,
+		Err(e) => {
+			eprintln!("[Notification] Could not load group keys: {e:#}");
+			return;
+		}
+	};
+
+	match provider.accept_key(&channel, &key.sender, &plaintext) {
+		Ok(()) => {
+			if let Err(e) = state.store_megolm(&provider) {
+				eprintln!("[Notification] Could not store group keys: {e:#}");
+				return;
+			}
+			let _ = state.save_to_keyring();
+			println!("[{channel}] key accepted from {}.", key.sender);
+		}
+		Err(e) => eprintln!("[Notification] Refusing a channel key: {e:#}"),
+	}
+}
+
+/// Olm-decrypts a key delivery, opening an inbound session if this is the first
+/// thing we have had from that device.
+fn decrypt_channel_key(
+	state: &mut State,
+	key: &veil_protocol::ChannelKey,
+	envelope_signer: [u8; 32],
+) -> anyhow::Result<Vec<u8>> {
+	use vodozemac::olm::OlmMessage;
+
+	let olm = OlmMessage::from_parts(key.message_type, &key.message)?;
+
+	if let Some(peer) = state.peers.get_mut(&key.sender) {
+		return Ok(peer.session.decrypt(&olm)?);
+	}
+
+	let OlmMessage::PreKey(prekey) = olm else {
+		anyhow::bail!(
+			"no session with {} and this is not a prekey message",
+			key.sender
+		);
+	};
+
+	let opened = state
+		.account
+		.create_inbound_session(prekey.identity_key(), &prekey)?;
+
+	state.peers.insert(
+		key.sender,
+		crate::state::PeerSession {
+			x25519: key.sender_x25519,
+			// Pinned to whoever actually signed this envelope, not to the
+			// address it claims. Everything from this device afterwards has to
+			// match, which is what stops a third party taking over the session
+			// by claiming the same address.
+			ed25519: envelope_signer,
+			seen_head: veil_protocol::message::MessageId::ROOT,
+			seen_ids: Default::default(),
+			sent_ids: Default::default(),
+			session: opened.session,
+		},
+	);
+
+	Ok(opened.plaintext)
+}
+
+/// A frame's name, for diagnostics that should not print its contents.
+fn frame_name(message: &ProtocolMessage) -> &'static str {
+	match message {
+		ProtocolMessage::Challenge(_) => "challenge",
+		ProtocolMessage::Authenticate(_) => "authentication",
+		ProtocolMessage::UploadKeys(_) => "key upload",
+		ProtocolMessage::EncryptedMessage(_) => "message",
+		ProtocolMessage::Mail(_) => "mail",
+		ProtocolMessage::Acknowledge(_) => "acknowledgement",
+		ProtocolMessage::RemainingOneTimeKeys(_) => "one-time key count",
+		ProtocolMessage::ServerAuthenticate(_) => "server authentication",
+		ProtocolMessage::Deposit(_) => "deposit",
+		ProtocolMessage::DepositResult(_) => "deposit result",
+		ProtocolMessage::CreateCommunity(_) => "community creation",
+		ProtocolMessage::JoinCommunity(_) => "community join",
+		ProtocolMessage::CommunityState(_) => "community state",
+		ProtocolMessage::Post(_) => "channel post",
+		ProtocolMessage::Delivery(_) => "channel delivery",
+		ProtocolMessage::Backfill { .. } => "backfill request",
+		ProtocolMessage::SubmitPolicy(_) => "policy record",
+		ProtocolMessage::ChannelKey(_) => "channel key",
+		ProtocolMessage::CommunityResult { .. } => "community result",
+	}
 }

@@ -6,26 +6,33 @@
 //! signatures — so there is little for a client to do beyond asking and
 //! verifying.
 //!
-//! **Sealed content is not encrypted here yet.** `groupkeys.rs` has the Megolm
-//! provider and it is tested, but wiring it in needs the reader set from the
-//! policy chain and a device list per reader, which is the next piece of work
-//! rather than this one. Until then this refuses to post to a Sealed community
-//! rather than sending plaintext into one — sending in the clear under a Sealed
-//! id would be the worst possible failure, because the id is exactly what tells
-//! everyone else the content is protected.
+//! **Sealed channels encrypt with Megolm** (§8.4). The reader set comes from the
+//! community's *verified policy chain*, never from the host — in Sealed, read
+//! access is key possession rather than an ACL, so a host able to supply the
+//! reader set could add itself and have every sender dutifully encrypt to it
+//! (§8.5). A Sealed channel with no `ChannelReaders` record is refused rather
+//! than defaulted to the membership the host reports, because that default is
+//! exactly the attack.
+//!
+//! Sending in the clear under a Sealed id is never a fallback. That id is what
+//! tells everyone else the content is protected, so failing to encrypt has to
+//! fail the send.
 
-use crate::{WriteStream, state::State};
+use crate::{WriteStream, messaging, state::State};
 use anyhow::Result;
 use futures_util::SinkExt;
 use std::{
+	collections::BTreeSet,
 	io::{self, Write as _},
 	sync::Arc,
 };
 use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
-	ChannelPost, Envelope, ProtocolMessage,
-	community::{CommunityId, CommunityRoot, Mode},
+	ChannelKey, ChannelPost, Envelope, ProtocolMessage,
+	community::{CommunityId, CommunityRoot, Mode, PolicyRecord, SignedPolicy},
+	groupkeys::{ChannelId, GroupKeyProvider, Readership},
+	identity::DeviceAddress,
 };
 
 fn ask(question: &str) -> Result<String> {
@@ -89,9 +96,12 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 	println!("Community id: {}", root.id());
 	println!("Share that, with this host's address, as an invite.");
 
-	// Recorded before it is sent: we built this root, so we know its mode
-	// without having to ask the host what it is.
+	// Recorded *and persisted* before it is sent: we built this root, so we know
+	// its mode without having to ask the host. Keeping it only in memory meant
+	// the next run had forgotten its own community and refused to post to it —
+	// correctly, since not knowing the mode must never be treated as Open.
 	state.remember_community(&root);
+	state.save_to_keyring()?;
 
 	send(
 		write,
@@ -106,20 +116,31 @@ pub async fn join(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> 
 	send(write, state, ProtocolMessage::JoinCommunity(id)).await
 }
 
-pub async fn say(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+pub async fn say(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+) -> Result<()> {
 	let id = CommunityId::parse(&ask("Community id: ")?)?;
 	let channel = ask("Channel: ")?;
 	let body = ask("Message: ")?;
 
 	// The mode is not asked for and not taken from the host: it is inside the
-	// id. Whatever the host says about this community, it cannot make an id
-	// mean a mode its root did not.
-	if state.community_mode(&id) == Some(Mode::Sealed) {
-		anyhow::bail!(
-			"this is a Sealed community and Megolm is not wired into the client yet. \
-			 Refusing rather than sending plaintext under an id that promises otherwise."
-		);
-	}
+	// id. Whatever the host says about this community, it cannot make an id mean
+	// a mode its root did not.
+	let body = match state.community_mode(&id) {
+		Some(Mode::Sealed) => {
+			seal_for_channel(write, state, directory, &id, &channel, body.as_bytes()).await?
+		}
+		Some(Mode::Open) => body.into_bytes(),
+		// Not knowing is not the same as Open. A community we have not verified
+		// might be Sealed, and guessing wrong sends plaintext under an id that
+		// promised otherwise.
+		None => anyhow::bail!(
+			"this device has not verified {id}. Join it first, so its mode comes from a \
+			 root that hashes to its id rather than from whatever the host says."
+		),
+	};
 
 	send(
 		write,
@@ -127,10 +148,179 @@ pub async fn say(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
 		ProtocolMessage::Post(ChannelPost {
 			community: id,
 			channel,
-			body: body.into_bytes(),
+			body,
 			nonce: veil_protocol::message::random_nonce(),
 			origin_ts: veil_protocol::now_ms()?,
 		}),
+	)
+	.await
+}
+
+/// Encrypts for a Sealed channel, delivering key material if the readership
+/// changed.
+///
+/// The order matters: keys go out *before* the message. A reader who receives
+/// ciphertext for a session they were never given cannot ask for it later —
+/// Megolm has no such request — so it would simply be unreadable to them.
+async fn seal_for_channel(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+	id: &CommunityId,
+	channel: &str,
+	plaintext: &[u8],
+) -> Result<Vec<u8>> {
+	let community = state.community_state(id)?;
+
+	// From the signed chain, not from the host. This is the load-bearing line
+	// in the whole Sealed path (§8.5).
+	let readers = community.channel_readers.get(channel).ok_or_else(|| {
+		anyhow::anyhow!(
+			"{id}#{channel} has no signed reader list. Sealed read access is key \
+			 possession, so there is nobody to encrypt to — and taking the membership \
+			 the host reports instead would let it add itself. Run `readers` first."
+		)
+	})?;
+
+	// Every reader's devices, each verified against their own cross-signing
+	// keys (§5.4). A host that invents a device gets it dropped here rather
+	// than handed a key.
+	let mut devices = BTreeSet::new();
+	for reader in readers {
+		let (_, list) = messaging::fetch_device_list(reader, directory).await?;
+		for device in list {
+			devices.insert(DeviceAddress::new(*reader, device.device_id));
+		}
+	}
+
+	if devices.is_empty() {
+		anyhow::bail!("no verified devices among {id}#{channel}'s readers");
+	}
+
+	let channel_id = ChannelId::new(*id, channel);
+	let mut provider = state.megolm()?;
+
+	let delivery = provider.set_readership(
+		&channel_id,
+		&Readership {
+			devices,
+			policy_sequence: community.sequence,
+		},
+	)?;
+
+	if let Some((cause, delivery)) = delivery {
+		println!(
+			"Distributing {}#{channel} keys to {} device(s) ({cause:?}).",
+			id,
+			delivery.recipients.len()
+		);
+
+		for recipient in &delivery.recipients {
+			// Every device but this one. Our *other* devices are readers like
+			// any other and must be sent the key; this device already holds the
+			// session it just created, and an Olm session cannot decrypt its own
+			// output anyway.
+			if *recipient == state.address() {
+				continue;
+			}
+
+			if let Err(e) = deliver_key(
+				write,
+				state,
+				directory,
+				&channel_id,
+				*recipient,
+				&delivery.payload,
+			)
+			.await
+			{
+				// One unreachable device must not stop the rest. It will get
+				// the key when it next appears, because the host queues an
+				// undeliverable frame like any other.
+				eprintln!("Could not deliver a key to {recipient}: {e:#}");
+			}
+		}
+	}
+
+	let ciphertext = provider.encrypt(&channel_id, plaintext)?;
+	state.store_megolm(&provider)?;
+	state.save_to_keyring()?;
+
+	Ok(ciphertext)
+}
+
+/// Sends one device the key material for a channel, Olm-encrypted.
+async fn deliver_key(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+	channel: &ChannelId,
+	recipient: DeviceAddress,
+	payload: &[u8],
+) -> Result<()> {
+	messaging::ensure_session(state, recipient, directory).await?;
+
+	let (message_type, message) = {
+		let peer = state
+			.peers
+			.get_mut(&recipient)
+			.ok_or_else(|| anyhow::anyhow!("no session with {recipient}"))?;
+		peer.session.encrypt(payload).to_parts()
+	};
+
+	send(
+		write,
+		state,
+		ProtocolMessage::ChannelKey(ChannelKey {
+			community: channel.community,
+			channel: channel.name.clone(),
+			sender: state.address(),
+			recipient,
+			sender_x25519: state.account.curve25519_key().to_bytes(),
+			message_type,
+			message,
+		}),
+	)
+	.await
+}
+
+/// Sets who may read a channel, as a signed policy record (§8.5).
+///
+/// A controller signs this, and it is the *only* thing senders consult when
+/// deciding who receives Megolm keys — which is why it has to be signed rather
+/// than served.
+pub async fn readers(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let channel = ask("Channel: ")?;
+
+	let mut readers = Vec::new();
+	loop {
+		let entry = ask("Reader user id (blank when done): ")?;
+		if entry.is_empty() {
+			break;
+		}
+		readers.push(veil_protocol::identity::UserId::parse(&entry)?);
+	}
+
+	// The next free sequence, from the chain we have verified. A record that
+	// does not advance is refused by every replayer, so guessing low simply
+	// fails rather than overwriting anything.
+	let sequence = state
+		.community_state(&id)
+		.map(|community| community.sequence + 1)
+		.unwrap_or(1);
+
+	let policy = SignedPolicy::sign(
+		id,
+		sequence,
+		PolicyRecord::ChannelReaders { channel, readers },
+		&[(0, state.cross_signing().master_secret())],
+	);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::SubmitPolicy(Box::new(policy)),
 	)
 	.await
 }

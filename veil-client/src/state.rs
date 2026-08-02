@@ -4,12 +4,26 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
 use std::collections::HashMap;
 use veil_protocol::{
-	community::{CommunityId, CommunityRoot, Mode},
+	community::{CommunityId, CommunityRoot, CommunityState, Mode, SignedPolicy},
 	crosssign::{CrossSigningPublic, CrossSigningSecrets},
+	groupkeys::{MegolmProvider, ProviderState},
 	identity::{DeviceAddress, DeviceId, DeviceList, UserId},
 	message::{MessageId, SeenWindow},
 };
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
+
+/// An empty provider's state, for profiles written before Megolm was stored.
+fn empty_provider() -> ProviderState {
+	// The address is irrelevant for an empty provider — nothing is keyed by it
+	// until a session exists, and `State::megolm` supplies the real one on every
+	// restore.
+	MegolmProvider::new(DeviceAddress::new(
+		UserId::from_bytes([0; 16]),
+		DeviceId::from_bytes([0; 16]),
+	))
+	.save()
+	.expect("an empty provider always saves")
+}
 
 /// Bumped whenever `State` changes shape. Profiles from an older version are
 /// refused rather than migrated — see `load_from_keyring`.
@@ -134,6 +148,23 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub known_communities: HashMap<CommunityId, Mode>,
+	/// Roots and policy chains, as JSON, for communities this device has
+	/// verified.
+	///
+	/// Kept raw rather than as a parsed `CommunityState` so it can be replayed
+	/// and re-checked on use. Readership decides who receives Megolm keys, so a
+	/// value cached in a form that no longer carries its own proof is a value a
+	/// future bug can quietly widen (§8.5).
+	#[serde_as(as = "Vec<(_, _)>")]
+	#[serde(default)]
+	pub community_roots: HashMap<CommunityId, String>,
+	#[serde_as(as = "Vec<(_, _)>")]
+	#[serde(default)]
+	pub community_chains: HashMap<CommunityId, Vec<String>>,
+	/// Megolm sessions (§8.4). Persisted because a session is the only thing
+	/// that can read what was sent under it.
+	#[serde(default = "empty_provider")]
+	pub megolm: ProviderState,
 	/// People we have verified. Keyed by user, never by device (§5.4).
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
@@ -181,6 +212,9 @@ impl State {
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
 			known_communities: HashMap::new(),
+			community_roots: HashMap::new(),
+			community_chains: HashMap::new(),
+			megolm: empty_provider(),
 			verified_users: HashMap::new(),
 			ip_and_port,
 			relay: None,
@@ -260,6 +294,77 @@ impl State {
 	/// Records a community whose root has been checked against its id.
 	pub fn remember_community(&mut self, root: &CommunityRoot) {
 		self.known_communities.insert(root.id(), root.mode);
+		if let Ok(json) = serde_json::to_string(root) {
+			self.community_roots.insert(root.id(), json);
+		}
+	}
+
+	/// Accepts a root and policy chain a host served, having checked them.
+	///
+	/// **The id is recomputed from the root.** That is the check that matters:
+	/// the id is a hash of the root with the mode inside it (invariant 13), so a
+	/// host cannot serve a different community — or the same one in a different
+	/// mode — under an id somebody was given in an invite.
+	///
+	/// The chain is then replayed, which is what enforces k distinct
+	/// controllers and advancing sequences (invariant 16). A record that does
+	/// not apply causes the whole chain to be refused rather than the bad record
+	/// skipped: policy is cumulative, so a chain with a hole in it is not a
+	/// smaller truth, it is a different one.
+	pub fn accept_community(
+		&mut self,
+		id: CommunityId,
+		root_json: &str,
+		chain: &[String],
+	) -> Result<()> {
+		let root: CommunityRoot = serde_json::from_str(root_json)?;
+
+		if root.id() != id {
+			anyhow::bail!(
+				"the host served a root that hashes to {} under the id {id}",
+				root.id()
+			);
+		}
+
+		let mut community = CommunityState::without_founder_check(root.clone())?;
+		for entry in chain {
+			let policy: SignedPolicy = serde_json::from_str(entry)?;
+			community.apply(&policy)?;
+		}
+
+		self.known_communities.insert(id, root.mode);
+		self.community_roots.insert(id, root_json.to_owned());
+		self.community_chains.insert(id, chain.to_vec());
+		Ok(())
+	}
+
+	/// The verified policy for a community, replayed from what we stored.
+	pub fn community_state(&self, id: &CommunityId) -> Result<CommunityState> {
+		let root_json = self
+			.community_roots
+			.get(id)
+			.ok_or_else(|| anyhow::anyhow!("no verified root for {id}; join it first"))?;
+
+		let root: CommunityRoot = serde_json::from_str(root_json)?;
+		let mut community = CommunityState::without_founder_check(root)?;
+
+		for entry in self.community_chains.get(id).into_iter().flatten() {
+			community.apply(&serde_json::from_str::<SignedPolicy>(entry)?)?;
+		}
+
+		Ok(community)
+	}
+
+	/// The Megolm provider, restored from stored state.
+	pub fn megolm(&self) -> Result<MegolmProvider> {
+		MegolmProvider::restore(self.megolm.clone(), self.address())
+	}
+
+	/// Writes the provider back. Callers must do this after anything that
+	/// establishes, rotates or accepts a session, or the work is lost on exit.
+	pub fn store_megolm(&mut self, provider: &MegolmProvider) -> Result<()> {
+		self.megolm = provider.save()?;
+		Ok(())
 	}
 
 	pub fn schemes(&self) -> (&'static str, &'static str) {

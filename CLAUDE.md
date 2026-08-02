@@ -130,7 +130,13 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 ```
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
-`remove`, `quit`, and for communities `found`, `join`, `say`, `history`.
+`remove`, `quit`, and for communities `found`, `join`, `readers`, `say`,
+`history`.
+
+A **Sealed** community needs a signed `ChannelReaders` record before anything
+can be sent to it — `readers` writes one. Without it `say` refuses, because
+read access is key possession and defaulting to the host's membership list would
+let the host add itself (§8.5).
 
 The client quits as soon as stdin closes, so a command whose answer arrives
 asynchronously — anything to do with a community, or an incoming message — needs
@@ -284,7 +290,12 @@ stranger cannot post or backfill, the host assigns position, policy needs k
 distinct controllers, and a Sealed channel leaves nothing readable in the host's
 database — checked by grepping the database file, WAL included).
 
-`veil-protocol` has 82 tests covering envelope forgery, re-attribution, replay,
+`veil-client/tests/sealed.rs` drives a Sealed community with two real clients:
+signed readers, a Megolm session delivered per device, a recipient who was
+offline when the key was issued, and a check that the host's database holds no
+plaintext.
+
+`veil-protocol` has 84 tests covering envelope forgery, re-attribution, replay,
 the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and the
 message model (§10).
 Extend them when touching those paths.

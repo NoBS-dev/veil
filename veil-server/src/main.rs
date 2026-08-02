@@ -712,8 +712,54 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				}
 			},
 			ProtocolMessage::SubmitPolicy(policy) => {
+				let id = policy.community;
 				let response = community::submit_policy(&state, *policy).await;
+				let accepted = response.ok;
 				reply(&state, &address, response.into_message()).await;
+
+				// The chain the submitter holds is now stale — including their
+				// own record, which they signed but have not seen applied. A
+				// client whose chain lags cannot derive readership (§8.5), so
+				// it would be unable to send to the very channel it just
+				// configured.
+				if accepted && let Ok(view) = community::view(&state, id).await {
+					reply(
+						&state,
+						&address,
+						ProtocolMessage::CommunityState(Box::new(view)),
+					)
+					.await;
+				}
+			}
+			ProtocolMessage::ChannelKey(key) => {
+				// Routed, not read. The payload is Olm-encrypted to the
+				// recipient device, so this host carries a channel's keys
+				// without ever being able to use them — which is what makes
+				// Sealed mean anything on a host somebody else runs.
+				if key.sender != address {
+					eprintln!(
+						"Discarding a channel key claiming to be from {}",
+						key.sender
+					);
+					continue;
+				}
+
+				let recipient = key.recipient;
+				if let Err(e) = route_to(&recipient, bytes.to_vec()).await {
+					// Queued like any other undelivered frame: a device that
+					// was offline when a key was issued must still get it, or
+					// it can never read the channel.
+					let queued =
+						state
+							.store
+							.lock()
+							.await
+							.enqueue(&recipient, &bytes, opened.timestamp_ms);
+					match queued {
+						Ok(()) => eprintln!("{recipient} is {e}; channel key queued"),
+						Err(err) => eprintln!("Could not queue a channel key: {err:#}"),
+					}
+				}
 			}
 			// Host -> client only; a client sending one is confused or probing.
 			ProtocolMessage::CommunityState(_)

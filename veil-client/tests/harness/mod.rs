@@ -119,6 +119,11 @@ impl Fixture {
 			.to_owned()
 	}
 
+	/// The first server's database, for tests that check what a host holds.
+	pub fn db_path(&self) -> String {
+		self.dir.join("server.db").to_string_lossy().into_owned()
+	}
+
 	/// An extra plaintext server, for tests that need more than one host.
 	pub async fn start_server(&self) -> String {
 		self.spawn_server(None).await

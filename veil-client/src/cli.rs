@@ -96,8 +96,13 @@ pub async fn cli(
 				}
 			}
 			"say" => {
-				if let Err(e) = communities::say(&write, &state).await {
+				if let Err(e) = communities::say(&write, &mut state, url).await {
 					eprintln!("Could not post: {e:#}");
+				}
+			}
+			"readers" => {
+				if let Err(e) = communities::readers(&write, &state).await {
+					eprintln!("Could not set readers: {e:#}");
 				}
 			}
 			"history" => {

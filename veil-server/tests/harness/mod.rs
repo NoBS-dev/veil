@@ -712,7 +712,10 @@ pub fn sealed_body(plaintext: &[u8]) -> Vec<u8> {
 	.id();
 
 	let channel = ChannelId::new(community, "general");
-	let mut provider = MegolmProvider::new();
+	let mut provider = MegolmProvider::new(DeviceAddress::new(
+		CrossSigningSecrets::new().user_id(),
+		DeviceId::generate(),
+	));
 	let reader = DeviceAddress::new(CrossSigningSecrets::new().user_id(), DeviceId::generate());
 	provider
 		.set_readership(

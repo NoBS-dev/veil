@@ -12,13 +12,14 @@
 //! leaks into the caller.
 
 use crate::{community::CommunityId, identity::DeviceAddress};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use vodozemac::megolm::{
 	GroupSession, InboundGroupSession, MegolmMessage, SessionConfig, SessionKey,
 };
 
 /// A channel within a community.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChannelId {
 	pub community: CommunityId,
 	pub name: String,
@@ -115,15 +116,110 @@ struct Outbound {
 }
 
 /// Megolm behind the boundary.
-#[derive(Default)]
 pub struct MegolmProvider {
+	/// The device this provider speaks as.
+	///
+	/// Needed because a sender has to be able to read its own channel. Megolm
+	/// is one-way — an outbound session encrypts and never decrypts — so
+	/// without registering an inbound session against ourselves at the moment we
+	/// establish one, every message we sent would come back unreadable to us.
+	own: DeviceAddress,
 	outbound: HashMap<ChannelId, Outbound>,
 	inbound: HashMap<(ChannelId, DeviceAddress), InboundGroupSession>,
 }
 
+/// The provider's state, in a form that can be written to disk.
+///
+/// **Sessions have to survive a restart.** A Megolm session is the only thing
+/// that can read what was sent under it, so a client that regenerated on every
+/// start would lose every Sealed channel it had ever read — and a *sender* that
+/// did so would rotate on every start, which is `Σ(devices)` pairwise
+/// encryptions each time (§8.3). Neither is a security failure; both make
+/// Sealed unusable, which comes to the same thing.
+///
+/// Kept separate from the provider rather than derived on it, because vodozemac's
+/// session types are not themselves serialisable — pickling is the supported
+/// route, and going through it explicitly keeps the conversion in one place.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ProviderState {
+	outbound: Vec<(ChannelId, OutboundState)>,
+	inbound: Vec<(ChannelId, DeviceAddress, String)>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct OutboundState {
+	session: String,
+	readers: BTreeSet<DeviceAddress>,
+	policy_sequence: u64,
+}
+
 impl MegolmProvider {
-	pub fn new() -> Self {
-		Self::default()
+	/// Captures everything worth keeping.
+	pub fn save(&self) -> anyhow::Result<ProviderState> {
+		Ok(ProviderState {
+			outbound: self
+				.outbound
+				.iter()
+				.map(|(channel, out)| {
+					Ok((
+						channel.clone(),
+						OutboundState {
+							session: serde_json::to_string(&out.session.pickle())?,
+							readers: out.readers.clone(),
+							policy_sequence: out.policy_sequence,
+						},
+					))
+				})
+				.collect::<anyhow::Result<Vec<_>>>()?,
+			inbound: self
+				.inbound
+				.iter()
+				.map(|((channel, sender), session)| {
+					Ok((
+						channel.clone(),
+						*sender,
+						serde_json::to_string(&session.pickle())?,
+					))
+				})
+				.collect::<anyhow::Result<Vec<_>>>()?,
+		})
+	}
+
+	/// The device address is supplied rather than stored: it is a property of
+	/// this device, not of the sessions, and reading it back from a file would
+	/// let a tampered profile change who we think we are.
+	pub fn restore(state: ProviderState, own: DeviceAddress) -> anyhow::Result<Self> {
+		let mut provider = Self::new(own);
+
+		for (channel, out) in state.outbound {
+			provider.outbound.insert(
+				channel,
+				Outbound {
+					session: GroupSession::from_pickle(serde_json::from_str(&out.session)?),
+					readers: out.readers,
+					policy_sequence: out.policy_sequence,
+				},
+			);
+		}
+
+		for (channel, sender, pickle) in state.inbound {
+			provider.inbound.insert(
+				(channel, sender),
+				InboundGroupSession::from_pickle(serde_json::from_str(&pickle)?),
+			);
+		}
+
+		Ok(provider)
+	}
+}
+
+impl MegolmProvider {
+	pub fn new(own: DeviceAddress) -> Self {
+		Self {
+			own,
+			outbound: HashMap::new(),
+			inbound: HashMap::new(),
+		}
 	}
 
 	/// Cost of the next rotation, in pairwise Olm encryptions. Exposed because
@@ -145,6 +241,14 @@ impl MegolmProvider {
 	) -> (RotationCause, KeyDelivery) {
 		let session = GroupSession::new(SessionConfig::version_2());
 		let payload = session.session_key().to_base64().into_bytes();
+
+		// Our own inbound copy, so what we send comes back readable. The host
+		// fans a message out to every member including the sender, and a sender
+		// that could not read its own channel would be plainly broken.
+		self.inbound.insert(
+			(channel.clone(), self.own),
+			InboundGroupSession::new(&session.session_key(), SessionConfig::version_2()),
+		);
 
 		self.outbound.insert(
 			channel.clone(),
@@ -313,7 +417,7 @@ mod tests {
 		let channel = channel();
 		let (alice, bob) = (device(), device());
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		let (cause, delivery) = sender
 			.set_readership(&channel, &readership(&[alice, bob], 1))
 			.unwrap()
@@ -321,7 +425,7 @@ mod tests {
 		assert_eq!(cause, RotationCause::Established);
 		assert!(delivery.recipients.contains(&bob));
 
-		let mut receiver = MegolmProvider::new();
+		let mut receiver = MegolmProvider::new(device());
 		receiver
 			.accept_key(&channel, &alice, &delivery.payload)
 			.unwrap();
@@ -340,14 +444,14 @@ mod tests {
 		let channel = channel();
 		let (alice, bob, carol) = (device(), device(), device());
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		let (_, first) = sender
 			.set_readership(&channel, &readership(&[alice, bob, carol], 1))
 			.unwrap()
 			.unwrap();
 
 		// Carol holds the original key.
-		let mut carols = MegolmProvider::new();
+		let mut carols = MegolmProvider::new(device());
 		carols.accept_key(&channel, &alice, &first.payload).unwrap();
 
 		let before = sender.encrypt(&channel, b"carol may read this").unwrap();
@@ -382,7 +486,7 @@ mod tests {
 		let channel = channel();
 		let (alice, bob, dave) = (device(), device(), device());
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		let (_, first) = sender
 			.set_readership(&channel, &readership(&[alice, bob], 1))
 			.unwrap()
@@ -407,7 +511,7 @@ mod tests {
 		let channel = channel();
 		let (alice, bob) = (device(), device());
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		sender
 			.set_readership(&channel, &readership(&[alice, bob], 1))
 			.unwrap();
@@ -426,7 +530,7 @@ mod tests {
 		let channel = channel();
 		let (alice, bob, carol) = (device(), device(), device());
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		sender
 			.set_readership(&channel, &readership(&[alice, bob, carol], 5))
 			.unwrap();
@@ -449,7 +553,7 @@ mod tests {
 		let channel = channel();
 		let devices: Vec<_> = (0..50).map(|_| device()).collect();
 
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		assert_eq!(sender.rotation_cost(&channel), 0);
 
 		sender
@@ -460,7 +564,119 @@ mod tests {
 
 	#[test]
 	fn encrypting_without_a_readership_fails_rather_than_sending_in_the_clear() {
-		let mut sender = MegolmProvider::new();
+		let mut sender = MegolmProvider::new(device());
 		assert!(sender.encrypt(&channel(), b"oops").is_err());
+	}
+
+	/// A restart must not cost a channel's history.
+	///
+	/// The session is the only thing that can read what was sent under it, so a
+	/// provider that came back empty would leave every Sealed message
+	/// permanently unreadable — and would rotate on every start, which is
+	/// `Σ(devices)` pairwise encryptions each time (§8.3).
+	#[test]
+	fn sessions_survive_being_saved_and_restored() {
+		let channel = channel();
+		let (reader, sender_address) = (device(), device());
+
+		let mut sender = MegolmProvider::new(sender_address);
+		let delivery = sender
+			.set_readership(&channel, &readership(&[reader], 1))
+			.unwrap()
+			.expect("establishing a channel produces a key")
+			.1;
+		let ciphertext = sender.encrypt(&channel, b"before the restart").unwrap();
+
+		// The reader takes the key, then is restarted.
+		let mut reader_provider = MegolmProvider::new(reader);
+		reader_provider
+			.accept_key(&channel, &sender_address, &delivery.payload)
+			.unwrap();
+
+		let restored = MegolmProvider::restore(reader_provider.save().unwrap(), reader).unwrap();
+		let mut restored = restored;
+
+		assert_eq!(
+			restored
+				.decrypt(&channel, &sender_address, &ciphertext)
+				.unwrap(),
+			b"before the restart",
+			"a restored provider must still read what it could before"
+		);
+	}
+
+	/// And the sender's side: after a restart it keeps sending on the same
+	/// session rather than silently establishing a new one nobody has the key
+	/// for.
+	#[test]
+	fn a_restored_sender_keeps_its_session() {
+		let channel = channel();
+		let (reader, sender_address) = (device(), device());
+
+		let mut sender = MegolmProvider::new(sender_address);
+		let delivery = sender
+			.set_readership(&channel, &readership(&[reader], 1))
+			.unwrap()
+			.unwrap()
+			.1;
+
+		let mut reader_provider = MegolmProvider::new(reader);
+		reader_provider
+			.accept_key(&channel, &sender_address, &delivery.payload)
+			.unwrap();
+
+		let mut sender = MegolmProvider::restore(sender.save().unwrap(), sender_address).unwrap();
+		let after = sender.encrypt(&channel, b"after the restart").unwrap();
+
+		assert_eq!(
+			reader_provider
+				.decrypt(&channel, &sender_address, &after)
+				.unwrap(),
+			b"after the restart",
+			"a restored sender must keep the session its readers already hold"
+		);
+	}
+
+	/// A sender must be able to read its own channel.
+	///
+	/// Megolm is one-way: an outbound session encrypts and never decrypts. The
+	/// host fans every message out to all members including the sender, so
+	/// without an inbound copy registered against ourselves at establishment,
+	/// everything we sent would come back unreadable to us.
+	#[test]
+	fn a_sender_can_read_its_own_messages() {
+		let channel = channel();
+		let me = device();
+
+		let mut provider = MegolmProvider::new(me);
+		provider
+			.set_readership(&channel, &readership(&[me, device()], 1))
+			.unwrap();
+
+		let ciphertext = provider.encrypt(&channel, b"my own message").unwrap();
+		assert_eq!(
+			provider.decrypt(&channel, &me, &ciphertext).unwrap(),
+			b"my own message"
+		);
+	}
+
+	/// And still can after a restart, which is the combination that actually
+	/// matters — the inbound copy has to be persisted like any other.
+	#[test]
+	fn a_sender_can_read_its_own_messages_after_a_restart() {
+		let channel = channel();
+		let me = device();
+
+		let mut provider = MegolmProvider::new(me);
+		provider
+			.set_readership(&channel, &readership(&[me], 1))
+			.unwrap();
+		let ciphertext = provider.encrypt(&channel, b"before").unwrap();
+
+		let mut restored = MegolmProvider::restore(provider.save().unwrap(), me).unwrap();
+		assert_eq!(
+			restored.decrypt(&channel, &me, &ciphertext).unwrap(),
+			b"before"
+		);
 	}
 }

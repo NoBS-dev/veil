@@ -329,6 +329,14 @@ pub enum ProtocolMessage {
 	},
 	/// Adds a signed policy record to the chain (§7.4).
 	SubmitPolicy(Box<community::SignedPolicy>),
+	/// Hands a channel's key material to one device (§8.4).
+	///
+	/// Routed by the host exactly like a DM and just as opaque to it: the
+	/// payload is Olm-encrypted to the recipient device, so a host that filed
+	/// or forwarded this cannot read the key and therefore cannot read the
+	/// channel. That is the whole basis of Sealed — read access is key
+	/// possession, not an ACL the host enforces.
+	ChannelKey(ChannelKey),
 	/// Host -> client: what became of a community request.
 	CommunityResult {
 		community: community::CommunityId,
@@ -348,6 +356,25 @@ pub struct CommunityView {
 	pub root: String,
 	pub policy_chain: Vec<String>,
 	pub members: Vec<UserId>,
+}
+
+/// A channel's key material, addressed to one device.
+///
+/// One of these per recipient device, which is Megolm's cost: `Σ(devices per
+/// member)` per rotation (§8.3). The interface in `groupkeys` exists so that
+/// cost stays an implementation detail — MLS would put a single commit here
+/// instead and address the group.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct ChannelKey {
+	pub community: community::CommunityId,
+	pub channel: String,
+	pub sender: DeviceAddress,
+	pub recipient: DeviceAddress,
+	pub sender_x25519: [u8; 32],
+	/// Olm ciphertext of the opaque payload `GroupKeyProvider` produced.
+	pub message_type: usize,
+	pub message: Vec<u8>,
 }
 
 /// A message sent to a channel.

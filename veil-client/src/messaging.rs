@@ -75,6 +75,89 @@ fn directory_base(url: &str, host: &str) -> String {
 	}
 }
 
+/// Opens an Olm session with a device, if we do not have one.
+///
+/// Extracted because channel key delivery (§8.4) needs exactly this and must not
+/// have a second, laxer copy of it. The checks here are the ones an earlier
+/// audit found missing: the prekey bundle comes from a host that is untrusted
+/// for identity (§4.3), so taking it at face value would let a malicious host
+/// hand over its *own* keys and sit in the middle. The device is checked against
+/// the peer's cross-signing chain first, and the bundle must then match what
+/// that chain vouches for.
+pub async fn ensure_session(
+	state: &mut State,
+	target: DeviceAddress,
+	directory: &str,
+) -> Result<()> {
+	if state.peers.contains_key(&target) {
+		return Ok(());
+	}
+
+	let (_, devices) = fetch_device_list(&target.user, directory).await?;
+
+	let device = devices
+		.iter()
+		.find(|d| d.device_id == target.device)
+		.ok_or_else(|| {
+			anyhow::anyhow!(
+				"{} is not in {}'s verified device list — the host may be inventing it",
+				target.device,
+				target.user
+			)
+		})?;
+
+	let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, directory).await?;
+
+	if their_ed25519 != device.ed25519 {
+		anyhow::bail!(
+			"the host served a signing key for {target} that its own device list does not \
+			 vouch for — refusing to open a session"
+		);
+	}
+	if their_x25519 != device.curve25519 {
+		anyhow::bail!(
+			"the host served an identity key for {target} that its own device list does not \
+			 vouch for — refusing to open a session"
+		);
+	}
+
+	// The device provably belongs to that user. Whether we know *who* that user
+	// is remains a separate question (§5.4).
+	if !state.is_verified(&target.user) {
+		eprintln!(
+			"warning: {} is not verified. The device is genuinely theirs, but nothing yet \
+			 confirms who they are — run `safety` to compare numbers.",
+			target.user
+		);
+	}
+
+	let session = state.account.create_outbound_session(
+		SessionConfig::version_2(),
+		their_x25519.into(),
+		otk.into(),
+	);
+
+	state.peers.insert(
+		target,
+		PeerSession {
+			x25519: their_x25519,
+			seen_head: MessageId::ROOT,
+			seen_ids: Default::default(),
+			sent_ids: Default::default(),
+			// Pinned here, and required to match on everything that arrives
+			// from this address afterwards.
+			ed25519: their_ed25519,
+			session,
+		},
+	);
+
+	if let Err(e) = state.save_to_keyring() {
+		eprintln!("Save state failed: {e:?}");
+	}
+
+	Ok(())
+}
+
 pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
 	print!("Enter target device (<user-id>/<device-id>[@host]): ");
 	io::stdout().flush()?;
@@ -89,74 +172,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	};
 	let directory = directory_base(url, &recipient_host);
 
-	if !state.peers.contains_key(&target) {
-		// The prekey bundle comes from the host, which is untrusted for identity
-		// (§4.3). Taking it at face value would let a malicious host hand over
-		// its *own* keys and sit in the middle of the session — so the device is
-		// checked against the peer's cross-signing chain first, and the bundle
-		// must then match what that chain vouches for.
-		let (_, devices) = fetch_device_list(&target.user, &directory).await?;
-
-		let device = devices
-			.iter()
-			.find(|d| d.device_id == target.device)
-			.ok_or_else(|| {
-				anyhow::anyhow!(
-					"{} is not in {}'s verified device list — the host may be inventing it",
-					target.device,
-					target.user
-				)
-			})?;
-
-		let (their_ed25519, their_x25519, otk) = fetch_prekey_bundle(&target, &directory).await?;
-
-		if their_ed25519 != device.ed25519 {
-			anyhow::bail!(
-				"the host served a signing key for {target} that its own device list does not \
-				 vouch for — refusing to open a session"
-			);
-		}
-		if their_x25519 != device.curve25519 {
-			anyhow::bail!(
-				"the host served an identity key for {target} that its own device list does not \
-				 vouch for — refusing to open a session"
-			);
-		}
-
-		// The device provably belongs to that user. Whether we know *who* that
-		// user is remains a separate question (§5.4).
-		if !state.is_verified(&target.user) {
-			eprintln!(
-				"warning: {} is not verified. The device is genuinely theirs, but nothing yet \
-				 confirms who they are — run `safety` to compare numbers.",
-				target.user
-			);
-		}
-
-		let session = state.account.create_outbound_session(
-			SessionConfig::version_2(),
-			their_x25519.into(),
-			otk.into(),
-		);
-
-		state.peers.insert(
-			target,
-			PeerSession {
-				x25519: their_x25519,
-				seen_head: MessageId::ROOT,
-				seen_ids: Default::default(),
-				sent_ids: Default::default(),
-				// Pinned here, and required to match on everything that arrives
-				// from this address afterwards.
-				ed25519: their_ed25519,
-				session,
-			},
-		);
-
-		if let Err(e) = state.save_to_keyring() {
-			eprintln!("Save state failed: {e:?}");
-		}
-	}
+	ensure_session(state, target, &directory).await?;
 
 	print!("Enter message: ");
 	io::stdout().flush()?;

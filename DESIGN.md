@@ -101,7 +101,7 @@ to.
 | Community roots, policy chain, mode binding | **[built]** `community.rs`, served over a transport |
 | Communities and channels on a host | **[built]** `veil-server/src/community.rs` — create, join, post, backfill, host-assigned ordering |
 | Moderation and reporting under Sealed | designed, §7.6 |
-| Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`; **not yet wired into the client**, so Sealed channels are refused rather than sent in the clear |
+| Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | designed, §8.5 |
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
@@ -138,12 +138,18 @@ Communities exist on a host: they can be founded, joined and posted to, and the
 host assigns every message a position in a hash chain (§10.1) so no member can
 claim one. Membership gates both writing and reading history.
 
-What remains is the part that makes a community *usable*. **Megolm is not wired
-into the client**, so a Sealed channel is refused rather than sent in the clear —
-the primitives are built and tested, but a sender needs the reader set from the
-policy chain and a device list per reader before it can encrypt to them. Beyond
-that, **roles and moderation** (§8.5, §7.6) and **channel administration** are
-designed but unbuilt, and **bots** are not designed at all.
+Sealed channels work end to end. A sender derives its readers from the
+community's *signed policy chain* — never from the host, since read access is
+key possession and a host that supplied the reader set could add itself — then
+delivers a Megolm session to each reader device over Olm and encrypts with it.
+A channel with no signed `ChannelReaders` record is refused rather than defaulted
+to the host's membership list, and a client that cannot encrypt refuses to post
+rather than falling back to plaintext.
+
+What remains is **roles and moderation** (§8.5, §7.6) and **channel
+administration**, which are designed but unbuilt, and **bots**, which are not
+designed. Key rotation on member removal works in the provider and is tested,
+but nothing yet drives it from a membership change.
 
 ---
 
