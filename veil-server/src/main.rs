@@ -47,6 +47,9 @@ const REQUESTS_PER_IP_PER_WINDOW: u32 = 30;
 const RATE_WINDOW_MS: u64 = 60_000;
 /// Tunnels one user may open per window (§3.2).
 const TUNNELS_PER_USER_PER_WINDOW: u32 = 20;
+/// Largest blob a host will store (§10.2). Bounded because the host cannot see
+/// what it is holding, so size is the only thing it can enforce.
+const MAX_BLOB: usize = 16 << 20;
 /// Deposits one server may make per window (§3.4). Generous — a busy server
 /// legitimately carries mail for many users — but bounded.
 const DEPOSITS_PER_SERVER_PER_WINDOW: u32 = 600;
@@ -682,6 +685,39 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::UploadBlob(bytes) => {
+				if bytes.len() > MAX_BLOB {
+					eprintln!("Refusing an oversized blob from {address}");
+					continue;
+				}
+
+				// The id is the hash of what arrived, computed here rather than
+				// taken from the client, so a client cannot claim an id that
+				// does not match its bytes — and cannot overwrite somebody
+				// else's blob by claiming theirs.
+				let id = veil_protocol::attachment::blob_id(&bytes);
+				let size = bytes.len() as u64;
+				let now = state.clock.read().await.now_ms();
+
+				match state.store.lock().await.put_blob(&id, &bytes, now) {
+					Ok(()) => {
+						reply(&state, &address, ProtocolMessage::BlobStored { id, size }).await
+					}
+					Err(e) => eprintln!("Could not store a blob for {address}: {e:#}"),
+				}
+			}
+			ProtocolMessage::FetchBlob(id) => {
+				let bytes = state.store.lock().await.blob(&id).ok().flatten();
+				reply(
+					&state,
+					&address,
+					ProtocolMessage::BlobContent {
+						id,
+						bytes: bytes.unwrap_or_default(),
+					},
+				)
+				.await;
+			}
 			ProtocolMessage::DeleteMessage {
 				community: id,
 				channel,
@@ -789,6 +825,8 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			// Host -> client only; a client sending one is confused or probing.
 			ProtocolMessage::CommunityState(_)
 			| ProtocolMessage::Delivery(_)
+			| ProtocolMessage::BlobStored { .. }
+			| ProtocolMessage::BlobContent { .. }
 			| ProtocolMessage::CommunityResult { .. } => {
 				eprintln!("Received a host-to-client community frame from {address}. Ignoring.")
 			}

@@ -1,3 +1,4 @@
+pub mod attachment;
 pub mod attestation;
 pub mod clock;
 pub mod community;
@@ -338,6 +339,25 @@ pub enum ProtocolMessage {
 		community: community::CommunityId,
 		channel: String,
 		sequence: u64,
+	},
+	/// Stores an opaque blob and returns its id (§10.2).
+	///
+	/// The host never learns what a blob is. In a Sealed community the client
+	/// encrypts before uploading, so these are bytes the host cannot read; in an
+	/// Open one they are the file itself, which is what lets the host thumbnail
+	/// and transcode. Encryption follows the *container's* tier and is never a
+	/// per-file choice — see [`attachment`].
+	UploadBlob(Vec<u8>),
+	/// Host -> client: where the blob landed.
+	BlobStored {
+		id: [u8; 32],
+		size: u64,
+	},
+	FetchBlob([u8; 32]),
+	/// Host -> client: the blob, or nothing if it is gone.
+	BlobContent {
+		id: [u8; 32],
+		bytes: Vec<u8>,
 	},
 	/// Asks for a community's current root and policy chain.
 	///

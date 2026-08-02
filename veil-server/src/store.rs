@@ -171,6 +171,17 @@ impl Store {
 			     PRIMARY KEY (community_id, channel, sequence)
 			 );
 
+			 -- Opaque bytes (§10.2). In a Sealed community these are ciphertext
+			 -- the host cannot read, which is why it can neither thumbnail nor
+			 -- transcode them. The id is their hash, so a host cannot serve
+			 -- different bytes under the same reference.
+			 CREATE TABLE IF NOT EXISTS blobs (
+			     blob_id    BLOB PRIMARY KEY,
+			     bytes      BLOB    NOT NULL,
+			     size       INTEGER NOT NULL,
+			     created_at INTEGER NOT NULL
+			 );
+
 			 CREATE TABLE IF NOT EXISTS server_identity (
 			     id      INTEGER PRIMARY KEY CHECK (id = 1),
 			     pickle  TEXT NOT NULL
@@ -726,6 +737,41 @@ impl Store {
 		)?;
 
 		Ok(rows.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	// ---- blobs (§10.2) ----------------------------------------------------
+
+	/// Stores a blob under the hash of its bytes, and reports its id.
+	///
+	/// Content-addressed, so storing the same bytes twice is a no-op rather than
+	/// a duplicate — which matters for an Open community and does nothing at all
+	/// for a Sealed one, where two identical files encrypt differently.
+	pub fn put_blob(&self, id: &[u8; 32], bytes: &[u8], now: u64) -> Result<()> {
+		self.db.execute(
+			"INSERT OR IGNORE INTO blobs (blob_id, bytes, size, created_at)
+			 VALUES (?1, ?2, ?3, ?4)",
+			params![id.as_slice(), bytes, bytes.len() as i64, now],
+		)?;
+		Ok(())
+	}
+
+	pub fn blob(&self, id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
+		Ok(self
+			.db
+			.query_row(
+				"SELECT bytes FROM blobs WHERE blob_id = ?1",
+				params![id.as_slice()],
+				|r| r.get(0),
+			)
+			.optional()?)
+	}
+
+	/// Total bytes held, for quota reporting. Opaque sizes are all a host needs
+	/// (§10.2) — it cannot tell a video from a novel either way.
+	pub fn blob_bytes_held(&self) -> Result<i64> {
+		Ok(self
+			.db
+			.query_row("SELECT COALESCE(SUM(size), 0) FROM blobs", [], |r| r.get(0))?)
 	}
 
 	// ---- the server's own identity ----------------------------------------

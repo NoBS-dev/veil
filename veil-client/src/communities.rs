@@ -29,7 +29,7 @@ use std::{
 use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
-	ChannelKey, ChannelPost, Envelope, ProtocolMessage,
+	ChannelKey, ChannelPost, Envelope, ProtocolMessage, attachment,
 	community::{CommunityId, CommunityRoot, Mode, PolicyRecord, Role, SignedPolicy},
 	groupkeys::{ChannelId, GroupKeyProvider, Readership},
 	identity::DeviceAddress,
@@ -279,6 +279,81 @@ async fn deliver_key(
 			sender_x25519: state.account.curve25519_key().to_bytes(),
 			message_type,
 			message,
+		}),
+	)
+	.await
+}
+
+/// Posts a file to a channel (§10.2).
+///
+/// **Encryption follows the community's tier and is not offered as a choice.**
+/// A per-file toggle would be a silent downgrade that one member makes for
+/// everyone: somebody posts something sensitive relying on Sealed, and somebody
+/// else uploads a screenshot of it in the clear because that was faster. The
+/// person bearing the cost is not the person choosing.
+pub async fn attach(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let channel = ask("Channel: ")?;
+	let path = ask("File path: ")?;
+
+	let contents = std::fs::read(&path)?;
+	let filename = std::path::Path::new(&path)
+		.file_name()
+		.map(|n| n.to_string_lossy().into_owned())
+		.unwrap_or_else(|| "attachment".to_owned());
+
+	let (attachment, stored) = match state.community_mode(&id) {
+		Some(Mode::Sealed) => {
+			let (attachment, ciphertext) = attachment::seal(&filename, &contents)?;
+			(attachment, ciphertext)
+		}
+		Some(Mode::Open) => (
+			attachment::open_tier(&filename, &contents),
+			contents.clone(),
+		),
+		None => anyhow::bail!(
+			"this device has not verified {id}. Join it first — uploading before the mode \
+			 is known risks handing a Sealed community's host a readable file."
+		),
+	};
+
+	// The blob first, so the message never references something that is not
+	// there. A reference to a missing blob is a broken message; a blob nobody
+	// references is garbage the host can collect.
+	send(write, state, ProtocolMessage::UploadBlob(stored)).await?;
+	println!(
+		"Uploading {filename} ({} bytes{}).",
+		attachment.size,
+		if attachment.key.is_some() {
+			", encrypted"
+		} else {
+			", readable by the host"
+		}
+	);
+
+	// The reference travels in the message body, so in a Sealed community the
+	// key is inside the Megolm envelope and never reaches the host.
+	let body = serde_json::to_vec(&attachment)?;
+	let body = match state.community_mode(&id) {
+		Some(Mode::Sealed) => {
+			seal_for_channel(write, state, directory, &id, &channel, &body).await?
+		}
+		_ => body,
+	};
+
+	send(
+		write,
+		state,
+		ProtocolMessage::Post(ChannelPost {
+			community: id,
+			channel,
+			body,
+			nonce: veil_protocol::message::random_nonce(),
+			origin_ts: veil_protocol::now_ms()?,
 		}),
 	)
 	.await

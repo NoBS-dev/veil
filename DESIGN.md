@@ -105,7 +105,7 @@ to.
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
-| Attachments and media | designed, §10.2 |
+| Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
 | Presence, typing, read state | designed, §10.3 |
 | Search (client-side index) | designed, §10.4 |
 | Deletion, tombstoning | **[built]** author or moderator; chain survives |
@@ -187,9 +187,19 @@ store still found a deleted message. A checkpoint after tombstoning is what
 actually removes them, and §10.5's claim that the host's copy is "not
 recoverable from the server" was false until that was added.
 
-What remains is **reporting under Sealed** (§7.6) and **channel
-administration**, which are designed but unbuilt, and **bots**, which are not
-designed.
+Attachments follow the container's tier (§10.2). A Sealed community encrypts
+client-side with a fresh key per file and carries the key inside the Megolm body,
+so the host holds bytes it cannot read; an Open one stores the file, which is
+what lets a host thumbnail and transcode. The per-file toggle is deliberately
+absent — it would be a silent downgrade one member makes for everyone. Blobs are
+content-addressed and the recipient checks the hash, so a host cannot serve
+different bytes under the same reference.
+
+What remains is **reporting under Sealed** (§7.6), **channel administration**,
+**presence and read state** (§10.3), **search** (§10.4) and **discovery**
+(§11.4–11.6), all designed but unbuilt; **calls** (§9), which need a media stack
+this has not begun; and **bots**, which are not designed. The client split
+(§17) is validated by a spike and remains the largest structural piece.
 
 ---
 

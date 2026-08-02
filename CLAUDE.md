@@ -131,7 +131,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`, `delete`.
+`history`, `attach`, `delete`.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
 can be sent to it — `readers` writes one. Without it `say` refuses, because
@@ -271,7 +271,12 @@ explicitly — each one closes a specific attack.
     after tombstoning is what removes them, and without it §10.5's "not
     recoverable from the server" is untrue. This was found by grepping the store
     in a test, not by reading the code.
-24. **Never send plaintext under a Sealed id.** The mode is inside the community
+24. **Attachment encryption follows the container's tier, never a per-file
+    choice.** A toggle is a silent downgrade one member makes for everyone —
+    somebody posts something sensitive relying on Sealed and somebody else
+    uploads a screenshot of it in the clear. §10.2 rejects it explicitly; do not
+    reintroduce it as a convenience.
+25. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

@@ -359,6 +359,23 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 		_ => String::from_utf8_lossy(&delivery.body).into_owned(),
 	};
 
+	// An attachment reference is shown as one rather than as the JSON it is on
+	// the wire. The blob is not fetched here: downloading every file that
+	// arrives is a decision for whoever is reading, not for the client.
+	let body = match serde_json::from_str::<veil_protocol::attachment::Attachment>(&body) {
+		Ok(attachment) => format!(
+			"<file {} — {} bytes, {}>",
+			attachment.filename,
+			attachment.size,
+			if attachment.key.is_some() {
+				"encrypted"
+			} else {
+				"stored in the clear"
+			}
+		),
+		Err(_) => body,
+	};
+
 	// Position and chain come from the host (§10.1), and are shown so a
 	// discrepancy is visible to a person rather than silently absorbed.
 	println!(
@@ -506,6 +523,10 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
+		ProtocolMessage::UploadBlob(_) => "blob upload",
+		ProtocolMessage::BlobStored { .. } => "blob stored",
+		ProtocolMessage::FetchBlob(_) => "blob fetch",
+		ProtocolMessage::BlobContent { .. } => "blob content",
 		ProtocolMessage::ChannelKey(_) => "channel key",
 		ProtocolMessage::CommunityResult { .. } => "community result",
 	}

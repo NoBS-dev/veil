@@ -443,6 +443,58 @@ async fn a_connected_member_learns_of_a_removal_without_reconnecting() {
 	sealed.fixture.stop().await;
 }
 
+/// §10.2: an attachment in a Sealed community is encrypted client-side, and the
+/// key travels inside the Megolm-encrypted body — so it never reaches the host.
+#[tokio::test]
+async fn a_sealed_attachment_keeps_its_key_away_from_the_host() {
+	let sealed = Sealed::arrange().await;
+	sealed.grant_readers().await;
+
+	let secret = b"the contents of a private document";
+	let path = std::env::temp_dir().join(format!("veil-attach-{}.txt", std::process::id()));
+	std::fs::write(&path, secret).unwrap();
+
+	let alice = sealed
+		.fixture
+		.run_client_lingering(
+			&format!(
+				"alice\nattach\n{}\ngeneral\n{}\n",
+				sealed.community,
+				path.display()
+			),
+			LINGER,
+		)
+		.await;
+	assert!(
+		alice.contains("encrypted"),
+		"a Sealed attachment must be encrypted before upload: {alice}"
+	);
+
+	// Bob sees it as an attachment, which means the reference decrypted.
+	let bob = sealed.bob_reads().await;
+	assert!(
+		bob.contains("<file") && bob.contains("encrypted"),
+		"bob should see an attachment reference: {bob}"
+	);
+
+	// The host holds neither the file nor its key.
+	let mut raw = std::fs::read(sealed.fixture.db_path()).unwrap();
+	if let Ok(wal) = std::fs::read(format!("{}-wal", sealed.fixture.db_path())) {
+		raw.extend_from_slice(&wal);
+	}
+	assert!(
+		!raw.windows(secret.len()).any(|w| w == secret),
+		"the host must not hold a Sealed attachment's contents"
+	);
+	assert!(
+		!raw.windows(b"\"key\"".len()).any(|w| w == b"\"key\""),
+		"nor the reference carrying its key, which travels inside the Megolm body"
+	);
+
+	let _ = std::fs::remove_file(&path);
+	sealed.fixture.stop().await;
+}
+
 /// A community this device has not verified might be Sealed. Guessing Open
 /// would send plaintext under an id that promised otherwise, so not knowing has
 /// to be its own answer.

@@ -105,6 +105,11 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"attach" => {
+				if let Err(e) = communities::attach(&write, &mut state, url).await {
+					eprintln!("Could not attach: {e:#}");
+				}
+			}
 			"delete" => {
 				if let Err(e) = communities::delete(&write, &state).await {
 					eprintln!("Could not delete: {e:#}");
