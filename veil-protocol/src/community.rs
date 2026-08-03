@@ -270,6 +270,13 @@ pub enum PolicyRecord {
 		channel: String,
 		readers: Vec<UserId>,
 	},
+	/// The channels this community has, and what they are for.
+	///
+	/// Signed like everything else, so a host cannot invent a channel or
+	/// quietly rename one. A community that has never declared any accepts
+	/// posts to whatever name a member uses — declaring the set is what turns
+	/// that from a default into a decision.
+	Channels { channels: Vec<ChannelSpec> },
 	/// What a member may do (§8.5).
 	///
 	/// In the signed chain rather than a host-side table, so there is one source
@@ -279,6 +286,14 @@ pub enum PolicyRecord {
 	/// moderation, and — worse — a role that carried read access would let it
 	/// add itself to a reader set every sender then encrypts to.
 	MemberRole { user: UserId, role: Role },
+}
+
+/// One channel: its name, and a line about what it is for.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq, Ser, De)]
+#[rkyv(attr(derive(Debug)))]
+pub struct ChannelSpec {
+	pub name: String,
+	pub topic: String,
 }
 
 /// What a member may do, in increasing order of authority.
@@ -374,6 +389,16 @@ fn policy_input(community: &CommunityId, sequence: u64, record: &PolicyRecord) -
 			buffer.extend_from_slice(&(new_host.len() as u32).to_le_bytes());
 			buffer.extend_from_slice(new_host.as_bytes());
 		}
+		PolicyRecord::Channels { channels } => {
+			buffer.push(5);
+			buffer.extend_from_slice(&(channels.len() as u32).to_le_bytes());
+			for channel in channels {
+				buffer.extend_from_slice(&(channel.name.len() as u32).to_le_bytes());
+				buffer.extend_from_slice(channel.name.as_bytes());
+				buffer.extend_from_slice(&(channel.topic.len() as u32).to_le_bytes());
+				buffer.extend_from_slice(channel.topic.as_bytes());
+			}
+		}
 		PolicyRecord::MemberRole { user, role } => {
 			buffer.push(4);
 			buffer.extend_from_slice(user.as_bytes());
@@ -431,6 +456,9 @@ pub struct CommunityState {
 	pub channel_readers: std::collections::HashMap<String, Vec<UserId>>,
 	/// Roles, as the chain has assigned them. Absent means [`Role::Member`].
 	pub roles: std::collections::HashMap<UserId, Role>,
+	/// The declared channels. Empty means none have been declared, which is not
+	/// the same as none existing.
+	pub channels: Vec<ChannelSpec>,
 	/// Highest sequence applied. Records at or below this are refused.
 	pub sequence: u64,
 	/// Rolling hash of every record applied, in order.
@@ -463,6 +491,7 @@ impl CommunityState {
 			host: None,
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
+			channels: Vec::new(),
 			sequence: 0,
 			// An empty chain starts from the community's own id, so two
 			// communities with no policy do not share a head.
@@ -488,6 +517,7 @@ impl CommunityState {
 			host: None,
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
+			channels: Vec::new(),
 			sequence: 0,
 			head_hash: root.id().as_chain_start(),
 			root,
@@ -534,6 +564,9 @@ impl CommunityState {
 			}
 			PolicyRecord::Migration { new_host } => {
 				self.host = Some(new_host.clone());
+			}
+			PolicyRecord::Channels { channels } => {
+				self.channels = channels.clone();
 			}
 			PolicyRecord::MemberRole { user, role } => {
 				self.roles.insert(*user, *role);
@@ -619,6 +652,15 @@ impl CommunityState {
 	/// [`Self::head_hash`].
 	pub fn chain_head(&self) -> (u64, [u8; 32]) {
 		(self.sequence, self.head_hash)
+	}
+
+	/// Whether a channel may be posted to.
+	///
+	/// A community that has declared no channels accepts any name — otherwise a
+	/// new community would be unusable until somebody remembered to declare
+	/// `general`. Once a set is declared, it is the set.
+	pub fn accepts_channel(&self, name: &str) -> bool {
+		self.channels.is_empty() || self.channels.iter().any(|c| c.name == name)
 	}
 
 	/// A member's role. Anyone unmentioned is an ordinary member.

@@ -693,6 +693,9 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::Ephemeral(event) => {
+				community::ephemeral(&state, &address, event).await;
+			}
 			ProtocolMessage::Report(report) => {
 				let response = community::report(&state, &address, *report).await;
 				reply(&state, &address, response.into_message()).await;

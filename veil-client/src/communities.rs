@@ -341,6 +341,78 @@ async fn deliver_key(
 	.await
 }
 
+/// Declares the community's channels, as a signed policy record.
+///
+/// Signed rather than host-side so a host cannot invent a channel or rename one
+/// — the same reasoning as readership (§8.5), applied to the shape of the
+/// community rather than to who can read it.
+pub async fn channels(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+
+	if let Ok(community) = state.community_state(&id) {
+		if community.channels.is_empty() {
+			println!("No channels declared yet — any name is currently accepted.");
+		} else {
+			for channel in &community.channels {
+				println!("  #{} — {}", channel.name, channel.topic);
+			}
+		}
+	}
+
+	let mut channels = Vec::new();
+	loop {
+		let name = ask("Channel name (blank when done): ")?;
+		if name.is_empty() {
+			break;
+		}
+		let topic = ask("  topic: ")?;
+		channels.push(veil_protocol::community::ChannelSpec { name, topic });
+	}
+
+	if channels.is_empty() {
+		anyhow::bail!("declaring an empty set would leave the community with no channels");
+	}
+
+	let sequence = state
+		.community_state(&id)
+		.map(|community| community.sequence + 1)
+		.unwrap_or(1);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::SubmitPolicy(Box::new(SignedPolicy::sign(
+			id,
+			sequence,
+			PolicyRecord::Channels { channels },
+			&[(0, state.cross_signing().master_secret())],
+		))),
+	)
+	.await
+}
+
+/// Says this device is here and watching (§10.3).
+///
+/// Membership of the subscription *is* the presence signal — there is no
+/// separate status to set, and none of it enters the log.
+pub async fn watch(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let id = CommunityId::parse(&ask("Community id: ")?)?;
+
+	send(
+		write,
+		state,
+		ProtocolMessage::Ephemeral(veil_protocol::Ephemeral {
+			community: id,
+			channel: String::new(),
+			event: veil_protocol::EphemeralEvent::Watching,
+			// Stamped by the host from the authenticated connection; whatever is
+			// put here is ignored.
+			who: None,
+		}),
+	)
+	.await
+}
+
 /// Reports a message to the community's moderators (§7.6).
 ///
 /// The host cannot read a Sealed community's content, so what it receives is

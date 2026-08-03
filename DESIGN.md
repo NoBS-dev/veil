@@ -106,7 +106,7 @@ to.
 | Calls and real-time media | designed, §9 |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
-| Presence, typing, read state | designed, §10.3 |
+| Presence, typing, read state | **[built]** ephemeral, per-community, never logged |
 | Search (client-side index) | designed, §10.4 |
 | Deletion, tombstoning | **[built]** author or moderator; chain survives |
 | Attestations, standing | **[built]** `attestation.rs` |
@@ -217,7 +217,17 @@ review — requiring proof would cost the reporter more privacy than the report 
 worth, since a Megolm session exported at one message's index decrypts everything
 from there forward.
 
-What remains is **channel administration**,
+Channels are declared in the signed chain, with a topic each. A community that
+has declared none accepts any name — otherwise a new one would be unusable until
+somebody remembered to declare `general` — and once a set exists it is enforced.
+
+Presence, typing and read state are ephemeral (§10.3): no sequence, no chain, no
+row, and nothing in the store. Scoped to one community, because that is where the
+answer already exists — one community, one host, one subscriber list. There is
+deliberately no cross-community presence, since "is Alice online somewhere" would
+need a global view no component has.
+
+What remains is
 **presence and read state** (§10.3), **search** (§10.4) and **discovery**
 (§11.4–11.6), all designed but unbuilt; **calls** (§9), which need a media stack
 this has not begun; and **bots**, which are not designed. The client split

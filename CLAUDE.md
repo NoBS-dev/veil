@@ -131,7 +131,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`, `attach`, `delete`, `report`, `queue`.
+`history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
 can be sent to it — `readers` writes one. Without it `say` refuses, because
@@ -281,7 +281,12 @@ explicitly — each one closes a specific attack.
     somebody posts something sensitive relying on Sealed and somebody else
     uploads a screenshot of it in the clear. §10.2 rejects it explicitly; do not
     reintroduce it as a convenience.
-27. **Never send plaintext under a Sealed id.** The mode is inside the community
+27. **Ephemeral events never enter the log.** Presence, typing and read state
+    have no sequence, no chain and no row — chaining them would carry
+    keystroke-level noise in history forever. They are scoped to one community
+    on purpose; there is no cross-community presence, and adding one would need
+    the global view §1.3 exists to avoid.
+28. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

@@ -110,6 +110,31 @@ pub async fn listener(
 					ProtocolMessage::ChannelKey(key) => {
 						accept_channel_key(state.clone(), opened.sender, key).await;
 					}
+					ProtocolMessage::Ephemeral(event) => {
+						let who = event
+							.who
+							.map(|user| user.to_string())
+							.unwrap_or_else(|| "somebody".to_owned());
+
+						match event.event {
+							veil_protocol::EphemeralEvent::Watching => {
+								println!("[{}] {who} is here.", event.community)
+							}
+							veil_protocol::EphemeralEvent::Away => {
+								println!("[{}] {who} left.", event.community)
+							}
+							veil_protocol::EphemeralEvent::Typing => {
+								println!(
+									"[{}#{}] {who} is typing...",
+									event.community, event.channel
+								)
+							}
+							veil_protocol::EphemeralEvent::Read { sequence } => println!(
+								"[{}#{}] {who} has read up to {sequence}.",
+								event.community, event.channel
+							),
+						}
+					}
 					ProtocolMessage::ReportQueue { community, entries } => {
 						if entries.is_empty() {
 							println!("[{community}] no reports waiting.");
@@ -561,6 +586,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
+		ProtocolMessage::Ephemeral(_) => "ephemeral event",
 		ProtocolMessage::Report(_) => "report",
 		ProtocolMessage::FetchReports(_) => "report fetch",
 		ProtocolMessage::ReportQueue { .. } => "report queue",

@@ -33,7 +33,7 @@
 use crate::{CLIENTS, ServerState, route_to};
 use anyhow::{Result, bail};
 use veil_protocol::{
-	ChannelDelivery, ChannelPost, CommunityView, Envelope, ProtocolMessage, Report,
+	ChannelDelivery, ChannelPost, CommunityView, Envelope, Ephemeral, ProtocolMessage, Report,
 	community::{CommunityId, CommunityRoot, CommunityState, SignedPolicy},
 	identity::{DeviceAddress, UserId},
 };
@@ -185,6 +185,19 @@ pub async fn post(state: &ServerState, sender: &DeviceAddress, post: ChannelPost
 		return Response::refused(post.community, "channel name is out of range");
 	}
 
+	// The channel set comes from the signed chain, so a host cannot invent a
+	// channel or accept a post to one that was never declared.
+	match policy(state, &post.community).await {
+		Ok(community) if community.accepts_channel(&post.channel) => {}
+		Ok(_) => {
+			return Response::refused(
+				post.community,
+				&format!("{} is not a channel of that community", post.channel),
+			);
+		}
+		Err(e) => return Response::refused(post.community, &format!("policy: {e}")),
+	}
+
 	let now = state.clock.read().await.now_ms();
 
 	let (delivery, members) = {
@@ -266,6 +279,57 @@ async fn fan_out(state: &ServerState, delivery: &ChannelDelivery, members: &[Use
 		clients
 			.keys()
 			.filter(|address| members.contains(&address.user))
+			.copied()
+			.collect()
+	};
+
+	for address in addresses {
+		let _ = route_to(&address, framed.clone()).await;
+	}
+}
+
+/// Passes an ephemeral event to the other members watching (§10.3).
+///
+/// **Nothing here is stored.** No sequence, no chain, no row — these events are
+/// transient by definition and putting them in the log would mean carrying
+/// keystroke noise in history forever. The subscriber list lives in the routing
+/// map and disappears with the connection, which is why "Away" needs no
+/// bookkeeping: a client that vanishes is simply no longer in it.
+///
+/// Scoped to one community, because that is where the answer already exists.
+/// There is deliberately no cross-community presence.
+pub async fn ephemeral(state: &ServerState, sender: &DeviceAddress, mut event: Ephemeral) {
+	let members = {
+		let store = state.store.lock().await;
+		match store.is_member(&event.community, &sender.user) {
+			Ok(true) => store.members(&event.community).unwrap_or_default(),
+			// Silently dropped rather than answered. A non-member learning
+			// *that they are not a member* from a presence probe is a small
+			// leak, and there is nothing useful to say back.
+			_ => return,
+		}
+	};
+
+	// Stamped by the host from the authenticated connection, never taken from
+	// the message (invariant 1) — otherwise anyone could claim to be anyone.
+	event.who = Some(sender.user);
+
+	let framed = {
+		let account = state.server_account.lock().await;
+		match Envelope::seal(&ProtocolMessage::Ephemeral(event), &account) {
+			Ok(framed) => framed.to_vec(),
+			Err(e) => {
+				eprintln!("Could not seal an ephemeral event: {e:#}");
+				return;
+			}
+		}
+	};
+
+	let addresses: Vec<DeviceAddress> = {
+		let clients = CLIENTS.read().await;
+		clients
+			.keys()
+			.filter(|address| members.contains(&address.user) && *address != sender)
 			.copied()
 			.collect()
 	};

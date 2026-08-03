@@ -342,6 +342,18 @@ pub enum ProtocolMessage {
 		channel: String,
 		sequence: u64,
 	},
+	/// Ephemeral state: who is here, and who is typing (§10.3).
+	///
+	/// **Never enters the log.** No sequence, no previous hash, no place in the
+	/// chain (§10.1) — these are transient by definition, and chaining them
+	/// would mean carrying keystroke-level noise in history forever.
+	///
+	/// Presence is scoped to one community, because that is where the answer
+	/// already exists: one community, one host, one subscriber list. "Is Alice
+	/// online *somewhere*" would need a global view no component has, and
+	/// building one would mean exactly the central infrastructure §1.3 exists to
+	/// avoid.
+	Ephemeral(Ephemeral),
 	/// Reports a message to the community's moderators (§7.6).
 	Report(Box<Report>),
 	/// Moderator -> host: what is waiting for review.
@@ -408,6 +420,36 @@ pub struct CommunityView {
 	pub root: String,
 	pub policy_chain: Vec<String>,
 	pub members: Vec<UserId>,
+}
+
+/// Transient state about a community. See [`ProtocolMessage::Ephemeral`].
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct Ephemeral {
+	pub community: community::CommunityId,
+	/// Empty for community-wide presence.
+	pub channel: String,
+	pub event: EphemeralEvent,
+	/// Filled in by the host on the way out; ignored on the way in, for the same
+	/// reason a message's sender is (invariant 1).
+	pub who: Option<identity::UserId>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
+#[rkyv(attr(derive(Debug)))]
+pub enum EphemeralEvent {
+	/// Here and watching. Membership of the subscription *is* the presence
+	/// signal (§10.3) — there is no separate "set my status".
+	Watching,
+	/// Gone. Also implied by the connection closing, which is the case that
+	/// actually happens.
+	Away,
+	Typing,
+	/// Read up to this position. Ephemeral because it is a hint for other
+	/// people, not a fact about the log.
+	Read {
+		sequence: u64,
+	},
 }
 
 /// A report of something said in a channel (§7.6).

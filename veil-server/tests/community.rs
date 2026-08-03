@@ -847,6 +847,73 @@ async fn only_a_moderator_can_read_the_report_queue() {
 	server.stop().await;
 }
 
+/// Channels come from the signed chain, so a host cannot invent one — and a
+/// community that has declared a set is held to it.
+#[tokio::test]
+async fn a_declared_channel_set_is_enforced() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+	let id = found(&mut alice, Mode::Open).await;
+
+	// Before anything is declared, any name works — otherwise a new community
+	// is unusable until somebody remembers to declare `general`.
+	alice
+		.send(&post(id, "anything", b"undeclared is fine at first"))
+		.await
+		.unwrap();
+	assert!(
+		expect_result(&mut alice).await.1,
+		"an undeclared channel should be accepted before a set exists"
+	);
+
+	// Declare a set.
+	alice
+		.send(&ProtocolMessage::SubmitPolicy(Box::new(
+			SignedPolicy::sign(
+				id,
+				1,
+				PolicyRecord::Channels {
+					channels: vec![veil_protocol::community::ChannelSpec {
+						name: "general".into(),
+						topic: "everything else".into(),
+					}],
+				},
+				&[(0, alice.cross_signing.master_secret())],
+			),
+		)))
+		.await
+		.unwrap();
+	assert!(expect_result(&mut alice).await.1);
+	tokio::time::sleep(BEAT).await;
+
+	// Now the set is the set.
+	alice
+		.send(&post(id, "anything", b"no longer allowed"))
+		.await
+		.unwrap();
+	let (_, ok, detail) = expect_result(&mut alice).await;
+	assert!(
+		!ok,
+		"an undeclared channel must be refused once a set exists"
+	);
+	assert!(detail.contains("not a channel"), "got: {detail}");
+
+	// The control: a declared one still works.
+	alice
+		.send(&post(id, "general", b"this one is declared"))
+		.await
+		.unwrap();
+	assert!(
+		expect_result(&mut alice).await.1,
+		"a declared channel must still accept posts"
+	);
+
+	server.stop().await;
+}
+
 /// Everything in a channel, oldest first.
 ///
 /// Drains first: posting fans the message straight back to the sender, so those

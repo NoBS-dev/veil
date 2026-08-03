@@ -105,6 +105,16 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"channels" => {
+				if let Err(e) = communities::channels(&write, &state).await {
+					eprintln!("Could not declare channels: {e:#}");
+				}
+			}
+			"watch" => {
+				if let Err(e) = communities::watch(&write, &state).await {
+					eprintln!("Could not announce presence: {e:#}");
+				}
+			}
 			"queue" => {
 				if let Err(e) = communities::queue(&write, &state).await {
 					eprintln!("Could not read the queue: {e:#}");
