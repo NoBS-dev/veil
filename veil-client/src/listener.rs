@@ -1,5 +1,6 @@
 use crate::{
 	ReadStream, WriteStream,
+	events::{ChannelContent, ClientEvent, ReportEntry},
 	state::{PeerSession, State},
 };
 use futures_util::SinkExt;
@@ -14,11 +15,36 @@ use veil_protocol::{
 };
 use vodozemac::olm::OlmMessage;
 
+/// Where events go.
+///
+/// Unbounded on purpose: dropping one would be worse than the memory, because
+/// these are the only record of what arrived and a client that silently loses a
+/// message because a renderer was slow cannot be trusted. The renderer is a
+/// `println!`, so it is never the bottleneck.
+pub type Events = tokio::sync::mpsc::UnboundedSender<ClientEvent>;
+
+/// Something a person should know about that has no richer shape.
+///
+/// Takes the same arguments `eprintln!` would, so the protocol code reads the
+/// same while no longer deciding where its output goes (§17).
+macro_rules! notice {
+	($events:expr, $($arg:tt)*) => {{
+		let _ = $events.send(ClientEvent::warn(format!($($arg)*)));
+	}};
+}
+
+macro_rules! say {
+	($events:expr, $($arg:tt)*) => {{
+		let _ = $events.send(ClientEvent::info(format!($($arg)*)));
+	}};
+}
+
 pub async fn listener(
 	mut read: ReadStream,
 	write: Arc<Mutex<WriteStream>>,
 	state: Arc<Mutex<State>>,
 	server_identity: [u8; 32],
+	events: Events,
 ) {
 	let mut replay_guard = ReplayGuard::default();
 
@@ -28,20 +54,25 @@ pub async fn listener(
 				let opened = match open_envelope(&protocol_message) {
 					Ok(opened) => opened,
 					Err(e) => {
-						eprintln!("[Notification] Discarding an unverifiable envelope: {e:#}");
+						notice!(events, "Discarding an unverifiable envelope: {e:#}");
 						continue;
 					}
 				};
 
 				if let Err(e) = replay_guard.check(opened.timestamp_ms, opened.nonce) {
-					eprintln!("[Notification] Discarding a replayed envelope: {e:#}");
+					notice!(events, "Discarding a replayed envelope: {e:#}");
 					continue;
 				}
 
 				match opened.message {
 					ProtocolMessage::EncryptedMessage(encrypted_message) => {
-						process_encrypted_message(state.clone(), opened.sender, encrypted_message)
-							.await;
+						process_encrypted_message(
+							state.clone(),
+							opened.sender,
+							encrypted_message,
+							&events,
+						)
+						.await;
 					}
 
 					// Mail queued while we were away. Only the server can
@@ -49,8 +80,9 @@ pub async fn listener(
 					// trusted — it carries its own sender's signature.
 					ProtocolMessage::Mail(mail) => {
 						if opened.sender != server_identity {
-							eprintln!(
-								"[Notification] Ignoring queued mail offered by {}, which is not the server.",
+							notice!(
+								events,
+								"Ignoring queued mail offered by {}, which is not the server.",
 								display_key(&opened.sender)
 							);
 							continue;
@@ -65,27 +97,34 @@ pub async fn listener(
 							// a channel it had been given access to.
 							Ok(inner) => match inner.message {
 								ProtocolMessage::EncryptedMessage(msg) => {
-									process_encrypted_message(state.clone(), inner.sender, msg)
-										.await;
+									process_encrypted_message(
+										state.clone(),
+										inner.sender,
+										msg,
+										&events,
+									)
+									.await;
 								}
 								ProtocolMessage::ChannelKey(key) => {
-									accept_channel_key(state.clone(), inner.sender, key).await;
+									accept_channel_key(state.clone(), inner.sender, key, &events)
+										.await;
 								}
-								other => eprintln!(
-									"[Notification] Queued mail was a {}, which is not \
+								other => notice!(
+									events,
+									"Queued mail was a {}, which is not \
 									 something a device can be sent.",
 									frame_name(&other)
 								),
 							},
 							Err(e) => {
-								eprintln!("[Notification] Queued mail is unverifiable: {e:#}")
+								notice!(events, "Queued mail is unverifiable: {e:#}")
 							}
 						}
 
 						// Acknowledged after processing, not on receipt: if we
 						// die in between, the server still holds it (§12.2).
 						if let Err(e) = acknowledge(&write, &state, mail.id).await {
-							eprintln!("[Notification] Could not acknowledge mail: {e:#}");
+							notice!(events, "Could not acknowledge mail: {e:#}");
 						}
 					}
 					ProtocolMessage::RemainingOneTimeKeys(remaining_otks) => {
@@ -93,73 +132,58 @@ pub async fn listener(
 						// claiming to report on it is trying to talk us into
 						// regenerating keys.
 						if opened.sender != server_identity {
-							eprintln!(
-								"[Notification] Ignoring an OTK count from {}, which is not the server.",
+							notice!(
+								events,
+								"Ignoring an OTK count from {}, which is not the server.",
 								display_key(&opened.sender)
 							);
 							continue;
 						}
 
-						println!("We have {remaining_otks} OTKs left.");
+						let _ = events.send(ClientEvent::OneTimeKeys {
+							remaining: remaining_otks,
+						});
 
 						// If we have less than half OTKs in our pool, regen some more
 					}
 					ProtocolMessage::Delivery(delivery) => {
-						show_delivery(state.clone(), *delivery).await;
+						show_delivery(state.clone(), *delivery, &events).await;
 					}
 					ProtocolMessage::ChannelKey(key) => {
-						accept_channel_key(state.clone(), opened.sender, key).await;
+						accept_channel_key(state.clone(), opened.sender, key, &events).await;
 					}
 					ProtocolMessage::Ephemeral(event) => {
-						let who = event
-							.who
-							.map(|user| user.to_string())
-							.unwrap_or_else(|| "somebody".to_owned());
-
-						match event.event {
-							veil_protocol::EphemeralEvent::Watching => {
-								println!("[{}] {who} is here.", event.community)
-							}
-							veil_protocol::EphemeralEvent::Away => {
-								println!("[{}] {who} left.", event.community)
-							}
-							veil_protocol::EphemeralEvent::Typing => {
-								println!(
-									"[{}#{}] {who} is typing...",
-									event.community, event.channel
-								)
-							}
-							veil_protocol::EphemeralEvent::Read { sequence } => println!(
-								"[{}#{}] {who} has read up to {sequence}.",
-								event.community, event.channel
-							),
-						}
+						let _ = events.send(ClientEvent::Ephemeral {
+							community: event.community,
+							channel: event.channel,
+							who: event.who,
+							event: event.event,
+						});
 					}
 					ProtocolMessage::ReportQueue { community, entries } => {
-						if entries.is_empty() {
-							println!("[{community}] no reports waiting.");
-						}
-						for (channel, sequence, reason, attributed) in entries {
-							println!(
-								"[{community}#{channel} {sequence}] reported: {reason}{}",
-								if attributed {
-									" (with attribution)"
-								} else {
-									" (unattributed — signal, not proof)"
-								}
-							);
-						}
+						let _ = events.send(ClientEvent::ReportQueue {
+							community,
+							entries: entries
+								.into_iter()
+								.map(|(channel, sequence, reason, attributed)| ReportEntry {
+									channel,
+									sequence,
+									reason,
+									attributed,
+								})
+								.collect(),
+						});
 					}
 					ProtocolMessage::CommunityResult {
 						community,
 						ok,
 						detail,
 					} => {
-						if ok {
-							println!("[{community}] {detail}");
-						} else {
-							eprintln!("[{community}] refused: {detail}");
-						}
+						let _ = events.send(ClientEvent::CommunityResult {
+							community,
+							ok,
+							detail,
+						});
 					}
 					ProtocolMessage::CommunityState(view) => {
 						let mut state = state.lock().await;
@@ -178,31 +202,33 @@ pub async fn listener(
 								.map(|()| id)
 						}) {
 							Ok(id) => {
-								println!(
-									"[{id}] verified: {} member(s), {} policy record(s)",
-									view.members.len(),
-									view.policy_chain.len()
-								);
+								let _ = events.send(ClientEvent::CommunityVerified {
+									community: id,
+									members: view.members.len(),
+									policy_records: view.policy_chain.len(),
+								});
 								if let Err(e) = state.save_to_keyring() {
-									eprintln!("[Notification] Save state failed: {e:#}");
+									notice!(events, "Save state failed: {e:#}");
 								}
 							}
-							Err(e) => eprintln!(
-								"[Notification] Refusing a community the host could not \
+							Err(e) => notice!(
+								events,
+								"Refusing a community the host could not \
 								 justify: {e:#}"
 							),
 						}
 					}
 					protocol_message => {
-						println!(
+						say!(
+							events,
 							"Received a protocol message that we don't usually handle: {:?}",
 							protocol_message
 						);
 					}
 				}
 			}
-			Ok(_) => println!("[Notification] Received something of unknown type."),
-			Err(e) => println!("[Notification] Error: {e}"),
+			Ok(_) => notice!(events, "Received something of unknown type."),
+			Err(e) => notice!(events, "Error: {e}"),
 		}
 	}
 }
@@ -211,11 +237,12 @@ async fn process_encrypted_message(
 	state: Arc<Mutex<State>>,
 	signing_device_key: [u8; 32],
 	message: EncryptedMessage,
+	events: &Events,
 ) {
 	let olm_message = match OlmMessage::from_parts(message.message_type, &message.message) {
 		Ok(olm_message) => olm_message,
 		Err(_) => {
-			eprintln!("Invalid message recieved.");
+			notice!(events, "Invalid message recieved.");
 			return;
 		}
 	};
@@ -227,7 +254,8 @@ async fn process_encrypted_message(
 	let sender = message.sender;
 
 	if message.recipient != state.address() {
-		eprintln!(
+		notice!(
+			events,
 			"Dropping a message addressed to {} — this device is {}.",
 			message.recipient,
 			state.address()
@@ -241,7 +269,8 @@ async fn process_encrypted_message(
 	if let Some(peer) = state.peers.get(&sender)
 		&& peer.ed25519 != signing_device_key
 	{
-		eprintln!(
+		notice!(
+			events,
 			"Dropping a message claiming to be {sender}: signed by a different device key \
 			 than the one pinned for that address."
 		);
@@ -258,7 +287,7 @@ async fn process_encrypted_message(
 	if let Some(peer) = state.peers.get(&sender)
 		&& peer.seen_ids.contains(&id)
 	{
-		eprintln!("Ignoring a duplicate of {id} from {sender}.");
+		notice!(events, "Ignoring a duplicate of {id} from {sender}.");
 		return;
 	}
 
@@ -269,7 +298,8 @@ async fn process_encrypted_message(
 		&& let Some(peer) = state.peers.get(&sender)
 		&& !peer.sent_ids.contains(&message.seen_head)
 	{
-		eprintln!(
+		notice!(
+			events,
 			"note: {sender} references {} as last seen, which we have no record of sending.",
 			message.seen_head
 		);
@@ -278,13 +308,16 @@ async fn process_encrypted_message(
 	match olm_message {
 		OlmMessage::PreKey(prekey_msg) => {
 			if !state.peers.contains_key(&sender) {
-				println!("New session from {sender}.");
+				let _ = events.send(ClientEvent::SessionOpened { from: sender });
 				match state
 					.account
 					.create_inbound_session(prekey_msg.identity_key(), &prekey_msg)
 				{
 					Ok(session) => {
-						println!("Message: {}", String::from_utf8_lossy(&session.plaintext));
+						let _ = events.send(ClientEvent::DirectMessage {
+							from: sender,
+							text: String::from_utf8_lossy(&session.plaintext).into_owned(),
+						});
 
 						let mut peer = PeerSession {
 							x25519: message.sender_x25519,
@@ -297,15 +330,18 @@ async fn process_encrypted_message(
 						peer.observe(id);
 						state.peers.insert(sender, peer);
 					}
-					Err(e) => eprintln!("Prekey parsing error: {e:#}"),
+					Err(e) => notice!(events, "Prekey parsing error: {e:#}"),
 				}
 			} else if let Some(peer) = state.peers.get_mut(&sender) {
 				match peer.session.decrypt(&prekey_msg.into()) {
 					Ok(pt) => {
 						peer.observe(id);
-						println!("{sender}: {}", String::from_utf8_lossy(&pt));
+						let _ = events.send(ClientEvent::DirectMessage {
+							from: sender,
+							text: String::from_utf8_lossy(&pt).into_owned(),
+						});
 					}
-					Err(e) => eprintln!("Decrypt failed: {e:?}"),
+					Err(e) => notice!(events, "Decrypt failed: {e:?}"),
 				}
 			}
 		}
@@ -315,20 +351,26 @@ async fn process_encrypted_message(
 				match peer.session.decrypt(&normal_msg.into()) {
 					Ok(pt) => {
 						peer.observe(id);
-						println!("{sender}: {}", String::from_utf8_lossy(&pt));
+						let _ = events.send(ClientEvent::DirectMessage {
+							from: sender,
+							text: String::from_utf8_lossy(&pt).into_owned(),
+						});
 					}
-					Err(e) => eprintln!("Decrypt failed: {e:?}"),
+					Err(e) => notice!(events, "Decrypt failed: {e:?}"),
 				}
 			} else {
-				eprintln!("Message from {sender} but no session for that device; dropping.");
+				notice!(
+					events,
+					"Message from {sender} but no session for that device; dropping."
+				);
 			}
 		}
 	}
 
 	if let Err(e) = state.save_to_keyring() {
-		eprintln!("Save state failed: {e:?}");
+		notice!(events, "Save state failed: {e:?}");
 	} else {
-		eprintln!("Saved!");
+		notice!(events, "Saved!");
 	}
 }
 
@@ -352,7 +394,11 @@ async fn acknowledge(
 }
 
 /// Prints a channel message, decrypting it first if the channel is Sealed.
-async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::ChannelDelivery) {
+async fn show_delivery(
+	state: Arc<Mutex<State>>,
+	delivery: veil_protocol::ChannelDelivery,
+	events: &Events,
+) {
 	use veil_protocol::{
 		community::Mode,
 		groupkeys::{ChannelId, GroupKeyProvider},
@@ -365,10 +411,12 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 	// a gap rather than hidden, so history stays legible: something was here,
 	// and its place in the chain is intact.
 	if delivery.tombstoned {
-		println!(
-			"[{}#{} {}] <deleted>",
-			delivery.community, delivery.channel, delivery.sequence
-		);
+		let _ = events.send(ClientEvent::ChannelMessage {
+			community: delivery.community,
+			channel: delivery.channel,
+			sequence: delivery.sequence,
+			body: ChannelContent::Deleted,
+		});
 		return;
 	}
 
@@ -377,7 +425,7 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 			let mut provider = match state.megolm() {
 				Ok(provider) => provider,
 				Err(e) => {
-					eprintln!("[Notification] Could not load group keys: {e:#}");
+					notice!(events, "Could not load group keys: {e:#}");
 					return;
 				}
 			};
@@ -393,7 +441,17 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 				// Not an error worth hiding: it usually means the key for this
 				// session never arrived, which is what a reader added after the
 				// fact looks like (§8.3 — joiners cannot read earlier history).
-				Err(e) => format!("<unreadable: {e}>"),
+				Err(e) => {
+					let _ = events.send(ClientEvent::ChannelMessage {
+						community: delivery.community,
+						channel: delivery.channel,
+						sequence: delivery.sequence,
+						body: ChannelContent::Unreadable {
+							why: format!("{e}"),
+						},
+					});
+					return;
+				}
 			}
 		}
 		_ => String::from_utf8_lossy(&delivery.body).into_owned(),
@@ -402,7 +460,7 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 	// The body states the sender's view of policy. Comparing it against ours is
 	// what turns a host withholding a policy record into something visible
 	// (§8.5) — so this is reported to the person rather than only logged.
-	let body = match veil_protocol::channelbody::ChannelBody::decode(body.as_bytes()) {
+	let content = match veil_protocol::channelbody::ChannelBody::decode(body.as_bytes()) {
 		Ok(inner) => {
 			let ours = state
 				.community_state(&delivery.community)
@@ -411,8 +469,9 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 
 			let comparison = inner.compare(ours);
 			if comparison.is_notable() {
-				eprintln!(
-					"warning: {}#{} — {}",
+				notice!(
+					events,
+					"{}#{} — {}",
 					delivery.community,
 					delivery.channel,
 					comparison.explain()
@@ -420,31 +479,28 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 			}
 
 			match inner.content {
-				veil_protocol::channelbody::Content::Text(text) => text,
+				veil_protocol::channelbody::Content::Text(text) => ChannelContent::Text(text),
 				// The blob is not fetched here: downloading every file that
 				// arrives is a decision for whoever is reading.
-				veil_protocol::channelbody::Content::File(attachment) => format!(
-					"<file {} — {} bytes, {}>",
-					attachment.filename,
-					attachment.size,
-					if attachment.key.is_some() {
-						"encrypted"
-					} else {
-						"stored in the clear"
-					}
-				),
+				veil_protocol::channelbody::Content::File(attachment) => ChannelContent::File {
+					filename: attachment.filename,
+					size: attachment.size,
+					encrypted: attachment.key.is_some(),
+				},
 			}
 		}
 		// A body from before this existed, or from another implementation.
-		Err(_) => body,
+		Err(_) => ChannelContent::Text(body),
 	};
 
-	// Position and chain come from the host (§10.1), and are shown so a
-	// discrepancy is visible to a person rather than silently absorbed.
-	println!(
-		"[{}#{} {}] {body}",
-		delivery.community, delivery.channel, delivery.sequence
-	);
+	// Position and chain come from the host (§10.1), and travel with the event
+	// so a discrepancy is visible rather than silently absorbed.
+	let _ = events.send(ClientEvent::ChannelMessage {
+		community: delivery.community,
+		channel: delivery.channel,
+		sequence: delivery.sequence,
+		body: content,
+	});
 }
 
 /// Takes a Megolm session key a peer sent us.
@@ -456,14 +512,16 @@ async fn accept_channel_key(
 	state: Arc<Mutex<State>>,
 	envelope_signer: [u8; 32],
 	key: veil_protocol::ChannelKey,
+	events: &Events,
 ) {
 	use veil_protocol::groupkeys::{ChannelId, GroupKeyProvider};
 
 	let mut state = state.lock().await;
 
 	if key.recipient != state.address() {
-		eprintln!(
-			"[Notification] Discarding a channel key addressed to {}",
+		notice!(
+			events,
+			"Discarding a channel key addressed to {}",
 			key.recipient
 		);
 		return;
@@ -474,8 +532,9 @@ async fn accept_channel_key(
 	match state.peers.get(&key.sender) {
 		Some(peer) if peer.ed25519 == envelope_signer => {}
 		Some(_) => {
-			eprintln!(
-				"[Notification] Discarding a channel key from {}: signed by a different key \
+			notice!(
+				events,
+				"Discarding a channel key from {}: signed by a different key \
 				 than the session we hold with it",
 				key.sender
 			);
@@ -489,8 +548,9 @@ async fn accept_channel_key(
 	let plaintext = match decrypt_channel_key(&mut state, &key, envelope_signer) {
 		Ok(plaintext) => plaintext,
 		Err(e) => {
-			eprintln!(
-				"[Notification] Could not open a channel key from {}: {e:#}",
+			notice!(
+				events,
+				"Could not open a channel key from {}: {e:#}",
 				key.sender
 			);
 			return;
@@ -501,7 +561,7 @@ async fn accept_channel_key(
 	let mut provider = match state.megolm() {
 		Ok(provider) => provider,
 		Err(e) => {
-			eprintln!("[Notification] Could not load group keys: {e:#}");
+			notice!(events, "Could not load group keys: {e:#}");
 			return;
 		}
 	};
@@ -509,13 +569,17 @@ async fn accept_channel_key(
 	match provider.accept_key(&channel, &key.sender, &plaintext) {
 		Ok(()) => {
 			if let Err(e) = state.store_megolm(&provider) {
-				eprintln!("[Notification] Could not store group keys: {e:#}");
+				notice!(events, "Could not store group keys: {e:#}");
 				return;
 			}
 			let _ = state.save_to_keyring();
-			println!("[{channel}] key accepted from {}.", key.sender);
+			let _ = events.send(ClientEvent::ChannelKeyAccepted {
+				community: key.community,
+				channel: key.channel.clone(),
+				from: key.sender,
+			});
 		}
-		Err(e) => eprintln!("[Notification] Refusing a channel key: {e:#}"),
+		Err(e) => notice!(events, "Refusing a channel key: {e:#}"),
 	}
 }
 

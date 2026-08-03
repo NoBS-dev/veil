@@ -1,5 +1,6 @@
 mod cli;
 mod communities;
+mod events;
 mod listener;
 mod messaging;
 mod state;
@@ -183,11 +184,27 @@ async fn main() -> anyhow::Result<()> {
 	let state = Arc::new(Mutex::new(state));
 	// Shared so the listener can acknowledge mail without waiting on the CLI.
 	let write = Arc::new(Mutex::new(write));
+	// The seam (§17): the protocol code emits events and something else decides
+	// what they look like. Replacing this task with a socket write is what turns
+	// this client into the daemon a Qt front end talks to — nothing else in the
+	// client changes, which was the point of doing it now rather than later.
+	let (events, mut incoming) = tokio::sync::mpsc::unbounded_channel::<events::ClientEvent>();
+	tokio::spawn(async move {
+		while let Some(event) = incoming.recv().await {
+			if event.is_diagnostic() {
+				eprintln!("{}", event.render());
+			} else {
+				println!("{}", event.render());
+			}
+		}
+	});
+
 	tokio::spawn(listener::listener(
 		read,
 		write.clone(),
 		state.clone(),
 		server_identity,
+		events,
 	));
 	// Wait for those refreshes before accepting a command. Sending to a Sealed
 	// channel derives readership from the chain, so entering the prompt first

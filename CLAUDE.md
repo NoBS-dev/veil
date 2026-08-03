@@ -363,6 +363,23 @@ the rate limiter, user/device identity (§5.1-5.3), cross-signing (§5.4) and th
 message model (§10).
 Extend them when touching those paths.
 
+## The client seam (§17)
+
+`veil-client/src/events.rs` holds `ClientEvent`, and the inbound path emits those
+rather than printing. `main` renders them; that renderer is the only place in the
+client that decides how anything *looks*.
+
+**Do not print from the protocol path.** A `println!` in the middle of a decrypt
+cannot be rendered by a Qt view, tested without capturing stdout, or translated —
+which is what made the split hard to start. Use the `notice!` / `say!` macros in
+`listener.rs` for output with no richer shape, and add a variant for anything a
+view would need to act on. Events carry values, never formatted strings: a
+variant holding `"3 members"` puts the formatting decision back inside.
+
+The outbound half — `cli.rs` and `communities.rs` prompts — still prints
+directly. That is command output rather than an event stream, and it is the
+remaining piece of §17.
+
 ## Working agreements
 
 - The user wants direct technical assessment, including disagreement. Give a
