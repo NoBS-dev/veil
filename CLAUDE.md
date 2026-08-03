@@ -250,33 +250,38 @@ explicitly — each one closes a specific attack.
     more than that.
 20. **A removal must bind every sender, not just the remover.** Rotation only
     helps if other senders have the new chain, so the host pushes policy to all
-    connected members and clients refresh on connect before encrypting. A host
-    can still *withhold* the newest record — sequences stop a rewind, so hiding
-    the tip is its only move — and that is a known, unclosed gap (§8.5), not
-    something to describe as solved.
-21. **Only *read* is enforced cryptographically** (§8.5). Posting, joining,
+    connected members and clients refresh on connect before encrypting.
+21. **Every message carries its sender's policy head, inside the encryption.**
+    That is what makes a withheld policy record detectable: a host can hide the
+    tip of the chain, and without this nobody would learn it had. Recipients
+    compare heads and are told when they disagree. Do not move this outside the
+    encrypted body, where a host could strip it.
+22. **An invite carries the host's identity key, and it is checked at the first
+    handshake.** Pinning protects every connection after the first; the invite
+    is what protects the first. Checking it after connecting is too late.
+23. **Only *read* is enforced cryptographically** (§8.5). Posting, joining,
     backfill and moderation are actions a host can refuse, so they are ordinary
     ACLs — but they read from the *signed chain*, never a host-side table, or a
     host could grant itself moderation. Reading is key possession and lives
     entirely in the client. Do not add a second, host-authored source of role
     truth.
-22. **A ban is not a revocation of read access.** A banned member keeps every
+24. **A ban is not a revocation of read access.** A banned member keeps every
     Megolm key they already hold; that cannot be taken back. Dropping them from
     a reader list rotates the session and is the expensive operation. Keep the
     two separate and say which is which — conflating them promises something
     the design cannot deliver.
-23. **Deleting is tombstoning, and the bytes must actually go.** The chain links
+25. **Deleting is tombstoning, and the bytes must actually go.** The chain links
     message ids, so blanking a body keeps history verifying — but blanking the
     row leaves the original bytes in SQLite's write-ahead log. A checkpoint
     after tombstoning is what removes them, and without it §10.5's "not
     recoverable from the server" is untrue. This was found by grepping the store
     in a test, not by reading the code.
-24. **Attachment encryption follows the container's tier, never a per-file
+26. **Attachment encryption follows the container's tier, never a per-file
     choice.** A toggle is a silent downgrade one member makes for everyone —
     somebody posts something sensitive relying on Sealed and somebody else
     uploads a screenshot of it in the clear. §10.2 rejects it explicitly; do not
     reintroduce it as a convenience.
-25. **Never send plaintext under a Sealed id.** The mode is inside the community
+27. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

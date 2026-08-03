@@ -139,6 +139,14 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// The identity an invite said this host would present (§3.2).
+	///
+	/// Checked once, at the first connection, because that is the only moment
+	/// pinning has nothing of its own to compare against. `None` means the host
+	/// was reached without an invite, which is a weaker position and the client
+	/// says so.
+	#[serde(default)]
+	pub expected_server_identity: Option<[u8; 32]>,
 	/// Communities this device knows the mode of (§7).
 	///
 	/// Kept because the mode cannot be recovered from an id — the id is a hash
@@ -218,6 +226,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			expected_server_identity: None,
 			known_communities: HashMap::new(),
 			community_roots: HashMap::new(),
 			community_chains: HashMap::new(),

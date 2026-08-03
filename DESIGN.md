@@ -153,11 +153,26 @@ have kept a copy. That binds *every* sender, not only the controller who signed
 the removal: the host pushes the new chain to all connected members, and a
 client refreshes on connect before it will encrypt anything.
 
-**A host can still withhold the newest policy record**, and a member cannot tell.
-Sequence numbers stop the chain being rewound, so hiding the tip is the host's
-only move — but a host that does it can keep a sender encrypting to a device
-that has since been removed. This is the residual cost of host-served policy and
-is not closed; detecting it needs members to compare chains out of band. Worth
+**A host withholding the newest policy record is now detectable.** It was not,
+and the fix is worth stating because it cost nothing structural. Sequence numbers
+already stopped the chain being rewound but not truncated, so a host could hide
+the tip and leave a sender encrypting to a device already removed.
+
+Every message now carries its sender's **policy head** — the highest sequence
+they had applied, and a rolling hash of everything applied to reach it — inside
+the encrypted body, where the host can neither read nor strip it. A recipient
+compares it with their own:
+
+| Sender's head | Means |
+| --- | --- |
+| Ahead of ours | our chain is short: we are behind, or our host is withholding |
+| Behind ours | the sender used stale policy, so this may have reached somebody since removed |
+| Same sequence, different hash | the host has served two different chains. Not lag |
+
+This does not *prevent* withholding, and nothing served by a single host could.
+It converts a silent failure into a visible one, which is the same bargain §10.1
+strikes for history — and it is what makes the residual risk something a person
+can act on rather than something nobody learns about. Worth
 weighing against the alternative, which is replicating policy between servers and
 bringing back everything §3.3 exists to avoid.
 
@@ -321,10 +336,22 @@ key vouch for it.
 self-signed, so "validate against a CA" and "anyone can host a community" cannot
 both hold. Binding to the identity key needs no authority at all, and inherits
 the trust-on-first-use property the identity key already has (invariant 6) —
-no more and no less. The residual limitation is the usual one for TOFU: on a
-*first* connection through a relay, nothing yet distinguishes the intended host
-from another genuine Veil host the relay chose. Invite links carry the identity
-key, which is what closes that in practice.
+no more and no less. The residual limitation used to be the usual one for TOFU: on a *first*
+connection, nothing distinguished the intended host from another genuine Veil
+host something in the path had chosen — and because that host is real, every
+check afterwards would pass against the wrong server.
+
+**Invites close it, and are now the primary way to reach a host.** An invite is
+`veil:<community>:<host-key>:<host>` and carries the identity key the host must
+present, checked at the first handshake rather than after connecting — by the
+time a client has pinned, there is nothing left to protect. Connecting without
+one still works, because §3.5 wants a stranded user to have a way through, but
+the client names it as a blind pin rather than letting the two look equivalent.
+
+The trust does not vanish; it moves to whoever shared the link, which is where a
+person can reason about it. A forged invite is still a forged invite. What it
+stops is the *relay* — which the user never chose to trust with this — making
+the decision.
 
 Note this narrows the blindness above slightly and deliberately: the relay learns
 framing and volume, never content. For **Open** communities that distinction

@@ -69,18 +69,34 @@ async fn main() -> anyhow::Result<()> {
 					"No prior state found in keyring: {e:#}. Generating a new profile..."
 				);
 
-				print!("Enter server (IP:PORT, or wss://IP:PORT for TLS): ");
+				print!("Enter server (IP:PORT, wss://IP:PORT for TLS, or an invite): ");
 				io::stdout().flush()?;
 
-				let mut ip_and_port = String::new();
-				io::stdin().read_line(&mut ip_and_port)?;
+				let mut entered = String::new();
+				io::stdin().read_line(&mut entered)?;
+
+				// An invite names the host *and* the key it must present. Taken
+				// here rather than after connecting, because the check it exists
+				// for happens at the first handshake — by the time a client has
+				// connected and pinned, there is nothing left to protect (§3.2).
+				let (address, expected) = match veil_protocol::invite::Invite::parse(&entered) {
+					Ok(invite) => {
+						println!(
+							"Invite for community {} on {}.",
+							invite.community, invite.host
+						);
+						(invite.host, Some(invite.host_key))
+					}
+					Err(_) => (entered.trim().to_owned(), None),
+				};
 
 				print!("Enter relay to tunnel through (blank for a direct connection): ");
 				io::stdout().flush()?;
 				let mut relay = String::new();
 				io::stdin().read_line(&mut relay)?;
 
-				let mut state = State::new(ip_and_port.trim(), profile)?;
+				let mut state = State::new(&address, profile)?;
+				state.expected_server_identity = expected;
 				if !relay.trim().is_empty() {
 					state.relay = Some(relay.trim().into());
 				}
@@ -350,7 +366,34 @@ async fn handshake(
 		),
 		Some(_) => {}
 		None => {
-			println!("Pinning server identity {}", display_key(&opened.sender));
+			// First contact, and the one moment trust-on-first-use has nothing
+			// to compare against. An invite carries the host's key precisely so
+			// this is not a blind pin (§3.2) — a relay could otherwise send a
+			// newcomer to a different genuine Veil host, and every check
+			// afterwards would pass against the wrong server.
+			if let Some(expected) = state.expected_server_identity
+				&& expected != opened.sender
+			{
+				anyhow::bail!(
+					"this host signs as {}, but the invite named {}. Refusing to \
+					 continue — something between here and the host chose a different \
+					 destination.",
+					display_key(&opened.sender),
+					display_key(&expected)
+				);
+			}
+
+			match state.expected_server_identity {
+				Some(_) => println!(
+					"Host identity {} matches the invite.",
+					display_key(&opened.sender)
+				),
+				None => println!(
+					"Pinning server identity {} on trust — nothing yet vouches for it. An \
+					 invite would have.",
+					display_key(&opened.sender)
+				),
+			}
 			state.server_identity = Some(opened.sender);
 		}
 	}

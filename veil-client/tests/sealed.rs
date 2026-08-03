@@ -495,6 +495,53 @@ async fn a_sealed_attachment_keeps_its_key_away_from_the_host() {
 	sealed.fixture.stop().await;
 }
 
+/// The gap §8.5 left open, now visible: a sender working from stale policy is
+/// reported to whoever reads the message.
+///
+/// A host can decline to serve the newest policy record — sequence numbers stop
+/// the chain being rewound, not truncated — so a sender could keep encrypting to
+/// a device a controller had already removed. Nothing served by one host can
+/// prevent that. What every message now carries is the sender's view of policy,
+/// inside the encryption where the host cannot strip it, so the discrepancy
+/// surfaces instead of passing silently.
+#[tokio::test]
+async fn a_message_carries_the_senders_view_of_policy() {
+	let sealed = Sealed::arrange().await;
+	sealed.grant_readers().await;
+
+	// Alice and Bob agree on policy here, so nothing should be flagged. This is
+	// the control: a warning that fires always would say nothing.
+	sealed.alice_says("while we agree").await;
+	let quiet = sealed.bob_reads().await;
+	assert!(
+		quiet.contains("while we agree"),
+		"the message should arrive: {quiet}"
+	);
+	assert!(
+		!quiet.contains("withholding") && !quiet.contains("since removed"),
+		"agreeing peers must not be warned about anything: {quiet}"
+	);
+
+	// Now policy advances *after* that message was written. Reading it back, Bob
+	// is ahead of the head it carries — which is precisely what he would see
+	// from a sender whose host had withheld the newest record.
+	sealed
+		.set_readers_to(&[sealed.alice_user.clone(), sealed.bob_user.clone()])
+		.await;
+
+	let bob = sealed.bob_reads().await;
+	assert!(
+		bob.contains("while we agree"),
+		"the message should still arrive: {bob}"
+	);
+	assert!(
+		bob.contains("since removed"),
+		"a message written under older policy must be flagged, not passed silently: {bob}"
+	);
+
+	sealed.fixture.stop().await;
+}
+
 /// A community this device has not verified might be Sealed. Guessing Open
 /// would send plaintext under an id that promised otherwise, so not knowing has
 /// to be its own answer.

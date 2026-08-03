@@ -374,20 +374,43 @@ async fn show_delivery(state: Arc<Mutex<State>>, delivery: veil_protocol::Channe
 		_ => String::from_utf8_lossy(&delivery.body).into_owned(),
 	};
 
-	// An attachment reference is shown as one rather than as the JSON it is on
-	// the wire. The blob is not fetched here: downloading every file that
-	// arrives is a decision for whoever is reading, not for the client.
-	let body = match serde_json::from_str::<veil_protocol::attachment::Attachment>(&body) {
-		Ok(attachment) => format!(
-			"<file {} — {} bytes, {}>",
-			attachment.filename,
-			attachment.size,
-			if attachment.key.is_some() {
-				"encrypted"
-			} else {
-				"stored in the clear"
+	// The body states the sender's view of policy. Comparing it against ours is
+	// what turns a host withholding a policy record into something visible
+	// (§8.5) — so this is reported to the person rather than only logged.
+	let body = match veil_protocol::channelbody::ChannelBody::decode(body.as_bytes()) {
+		Ok(inner) => {
+			let ours = state
+				.community_state(&delivery.community)
+				.map(|community| community.chain_head())
+				.unwrap_or((0, [0u8; 32]));
+
+			let comparison = inner.compare(ours);
+			if comparison.is_notable() {
+				eprintln!(
+					"warning: {}#{} — {}",
+					delivery.community,
+					delivery.channel,
+					comparison.explain()
+				);
 			}
-		),
+
+			match inner.content {
+				veil_protocol::channelbody::Content::Text(text) => text,
+				// The blob is not fetched here: downloading every file that
+				// arrives is a decision for whoever is reading.
+				veil_protocol::channelbody::Content::File(attachment) => format!(
+					"<file {} — {} bytes, {}>",
+					attachment.filename,
+					attachment.size,
+					if attachment.key.is_some() {
+						"encrypted"
+					} else {
+						"stored in the clear"
+					}
+				),
+			}
+		}
+		// A body from before this existed, or from another implementation.
 		Err(_) => body,
 	};
 

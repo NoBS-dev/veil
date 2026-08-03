@@ -1,10 +1,12 @@
 pub mod attachment;
 pub mod attestation;
+pub mod channelbody;
 pub mod clock;
 pub mod community;
 pub mod crosssign;
 pub mod groupkeys;
 pub mod identity;
+pub mod invite;
 pub mod keybackup;
 pub mod message;
 pub mod version;

@@ -77,6 +77,16 @@ impl CommunityId {
 		})?))
 	}
 
+	/// The id widened to 32 bytes, for use as a hash-chain starting value.
+	///
+	/// Zero-extended rather than re-hashed: the id is already a hash, and
+	/// hashing it again would only obscure where the value came from.
+	pub fn as_chain_start(&self) -> [u8; 32] {
+		let mut padded = [0u8; 32];
+		padded[..COMMUNITY_ID_LEN].copy_from_slice(&self.0);
+		padded
+	}
+
 	pub fn as_bytes(&self) -> &[u8; COMMUNITY_ID_LEN] {
 		&self.0
 	}
@@ -423,6 +433,21 @@ pub struct CommunityState {
 	pub roles: std::collections::HashMap<UserId, Role>,
 	/// Highest sequence applied. Records at or below this are refused.
 	pub sequence: u64,
+	/// Rolling hash of every record applied, in order.
+	///
+	/// **This is what makes a withheld policy record detectable.** A host serves
+	/// the chain and can decline to serve its newest entry — sequence numbers
+	/// stop it being rewound, but not truncated — so a sender could keep
+	/// encrypting to a device a controller had already removed.
+	///
+	/// Every message carries its sender's head (§8.5), inside the encryption
+	/// where the host cannot strip it. A recipient whose own head is behind that
+	/// one knows its chain is short and can go and ask; a recipient whose head is
+	/// *ahead* knows the sender was working from stale policy. Neither prevents
+	/// withholding, and nothing served by a single host could — but it turns a
+	/// silent failure into one somebody notices, which is the same bargain §10.1
+	/// makes for history.
+	head_hash: [u8; 32],
 	root: CommunityRoot,
 }
 
@@ -439,6 +464,9 @@ impl CommunityState {
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
 			sequence: 0,
+			// An empty chain starts from the community's own id, so two
+			// communities with no policy do not share a head.
+			head_hash: root.id().as_chain_start(),
 			root,
 		})
 	}
@@ -461,6 +489,7 @@ impl CommunityState {
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
 			sequence: 0,
+			head_hash: root.id().as_chain_start(),
 			root,
 		})
 	}
@@ -516,6 +545,20 @@ impl CommunityState {
 		}
 
 		self.sequence = policy.sequence;
+
+		// Folded in after the record is known good, so the head only ever
+		// covers records that actually applied.
+		let mut hasher = Sha256::new();
+		hasher.update(b"veil-policy-head-v1");
+		hasher.update(self.head_hash);
+		hasher.update(policy.sequence.to_le_bytes());
+		hasher.update(policy_input(
+			&policy.community,
+			policy.sequence,
+			&policy.record,
+		));
+		self.head_hash = hasher.finalize().into();
+
 		Ok(())
 	}
 
@@ -567,6 +610,15 @@ impl CommunityState {
 			self.apply(policy)?;
 		}
 		Ok(())
+	}
+
+	/// Where this chain has got to: the highest sequence applied, and a hash of
+	/// everything applied to reach it.
+	///
+	/// Carried on every message so peers can tell whether they agree — see
+	/// [`Self::head_hash`].
+	pub fn chain_head(&self) -> (u64, [u8; 32]) {
+		(self.sequence, self.head_hash)
 	}
 
 	/// A member's role. Anyone unmentioned is an ordinary member.

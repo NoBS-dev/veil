@@ -30,9 +30,12 @@ use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
 	ChannelKey, ChannelPost, Envelope, ProtocolMessage, attachment,
+	channelbody::ChannelBody,
 	community::{CommunityId, CommunityRoot, Mode, PolicyRecord, Role, SignedPolicy},
+	display_key,
 	groupkeys::{ChannelId, GroupKeyProvider, Readership},
 	identity::DeviceAddress,
+	invite::Invite,
 };
 
 fn ask(question: &str) -> Result<String> {
@@ -94,7 +97,10 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 	)?;
 
 	println!("Community id: {}", root.id());
-	println!("Share that, with this host's address, as an invite.");
+	match invite(state, root.id()) {
+		Ok(invite) => println!("Invite: {invite}"),
+		Err(e) => eprintln!("Could not build an invite: {e:#}"),
+	}
 
 	// Recorded *and persisted* before it is sent: we built this root, so we know
 	// its mode without having to ask the host. Keeping it only in memory meant
@@ -111,9 +117,51 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 	.await
 }
 
+/// Joins by community id, or by an invite.
+///
+/// An invite is the stronger of the two, and the difference is only visible on a
+/// *first* connection to a host: it names the identity key that host must
+/// present, so a relay cannot quietly send a newcomer somewhere else (§3.2).
+/// Joining by bare id on a host already pinned is equivalent; joining by bare id
+/// on a new host is a blind pin, and the client says so when it happens.
 pub async fn join(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
+	let entered = ask("Community id, or an invite: ")?;
+
+	let id = match Invite::parse(&entered) {
+		Ok(invite) => {
+			if invite.host_key != state.server_identity.unwrap_or(invite.host_key) {
+				anyhow::bail!(
+					"that invite is for a host signing as {}, but this client is connected \
+					 to one signing as {}. Connect to {} instead.",
+					display_key(&invite.host_key),
+					display_key(&state.server_identity.unwrap_or_default()),
+					invite.host
+				);
+			}
+			invite.community
+		}
+		// Not an invite, so treat it as a bare id.
+		Err(_) => CommunityId::parse(&entered)?,
+	};
+
 	send(write, state, ProtocolMessage::JoinCommunity(id)).await
+}
+
+/// Prints an invite for a community on this host.
+///
+/// Carries the host's identity key, which is what makes it worth more than the
+/// community id alone.
+pub fn invite(state: &State, id: CommunityId) -> Result<String> {
+	let host_key = state.server_identity.ok_or_else(|| {
+		anyhow::anyhow!("this client has not yet pinned a host identity to put in an invite")
+	})?;
+
+	Ok(Invite {
+		community: id,
+		host: state.ip_and_port.to_string(),
+		host_key,
+	}
+	.encode())
 }
 
 pub async fn say(
@@ -128,11 +176,20 @@ pub async fn say(
 	// The mode is not asked for and not taken from the host: it is inside the
 	// id. Whatever the host says about this community, it cannot make an id mean
 	// a mode its root did not.
+	// Every message states the sender's view of policy, inside the encryption
+	// where a host cannot strip it. That is what makes a withheld policy record
+	// detectable rather than silent (§8.5).
+	let head = state
+		.community_state(&id)
+		.map(|community| community.chain_head())
+		.unwrap_or((0, [0u8; 32]));
+	let body = ChannelBody::text(head, body).encode()?;
+
 	let body = match state.community_mode(&id) {
 		Some(Mode::Sealed) => {
-			seal_for_channel(write, state, directory, &id, &channel, body.as_bytes()).await?
+			seal_for_channel(write, state, directory, &id, &channel, &body).await?
 		}
-		Some(Mode::Open) => body.into_bytes(),
+		Some(Mode::Open) => body,
 		// Not knowing is not the same as Open. A community we have not verified
 		// might be Sealed, and guessing wrong sends plaintext under an id that
 		// promised otherwise.
@@ -379,7 +436,11 @@ pub async fn attach(
 
 	// The reference travels in the message body, so in a Sealed community the
 	// key is inside the Megolm envelope and never reaches the host.
-	let body = serde_json::to_vec(&attachment)?;
+	let head = state
+		.community_state(&id)
+		.map(|community| community.chain_head())
+		.unwrap_or((0, [0u8; 32]));
+	let body = ChannelBody::file(head, attachment.clone()).encode()?;
 	let body = match state.community_mode(&id) {
 		Some(Mode::Sealed) => {
 			seal_for_channel(write, state, directory, &id, &channel, &body).await?
