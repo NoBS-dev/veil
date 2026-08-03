@@ -2,7 +2,7 @@ use anyhow::Result;
 use keyring::Entry;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::serde_as;
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 use veil_protocol::{
 	community::{CommunityId, CommunityRoot, CommunityState, Mode, SignedPolicy},
 	crosssign::{CrossSigningPublic, CrossSigningSecrets},
@@ -11,6 +11,38 @@ use veil_protocol::{
 	message::{MessageId, SeenWindow},
 };
 use vodozemac::olm::{Account, AccountPickle, Session, SessionPickle};
+
+/// A fresh key, for a profile written before history existed.
+fn random_key() -> [u8; 32] {
+	let mut key = [0u8; 32];
+	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut key);
+	key
+}
+
+/// Where this profile's history lives.
+///
+/// Beside the profile when `VEIL_STATE_DIR` is set, and in the OS data
+/// directory otherwise — never in the keyring, which holds only the key.
+pub fn history_path(profile: &str) -> PathBuf {
+	let safe: String = profile
+		.chars()
+		.map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+		.collect();
+
+	match std::env::var("VEIL_STATE_DIR") {
+		Ok(dir) => PathBuf::from(dir).join(format!("history-{safe}.db")),
+		Err(_) => data_directory().join(format!("history-{safe}.db")),
+	}
+}
+
+fn data_directory() -> PathBuf {
+	std::env::var("XDG_DATA_HOME")
+		.map(PathBuf::from)
+		.unwrap_or_else(|_| {
+			PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".local/share")
+		})
+		.join("veil")
+}
 
 /// An empty provider's state, for profiles written before Megolm was stored.
 fn empty_provider() -> ProviderState {
@@ -139,6 +171,13 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// The key that opens this profile's history store (§10.4).
+	///
+	/// Thirty-two bytes here, and the history itself in a file. The keyring is
+	/// for small secrets; a history blob written back in full on every message
+	/// is what this avoids.
+	#[serde(default = "random_key")]
+	pub history_key: [u8; 32],
 	/// The identity an invite said this host would present (§3.2).
 	///
 	/// Checked once, at the first connection, because that is the only moment
@@ -226,6 +265,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			history_key: random_key(),
 			expected_server_identity: None,
 			known_communities: HashMap::new(),
 			community_roots: HashMap::new(),

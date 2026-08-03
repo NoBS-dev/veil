@@ -449,6 +449,45 @@ pub async fn report(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()
 	.await
 }
 
+/// Searches this device's own history (§10.4).
+///
+/// **Client-side only, and there is no middle setting.** Giving a host the keys
+/// to build an index does not make search a bit less private — it makes the
+/// community Open while still being labelled Sealed, which §7.3 forbids because
+/// it is invisible to members.
+///
+/// The limits are real and worth stating: a device searches what it has, and a
+/// new device is blank until it restores. That is a permanent gap versus Open,
+/// and one of the better honest arguments for choosing Open.
+pub fn search(state: &State) -> Result<()> {
+	let query = ask("Search for: ")?;
+	if query.is_empty() {
+		anyhow::bail!("nothing to search for");
+	}
+
+	let history = crate::history::History::open(
+		&crate::state::history_path(&state.profile),
+		&state.history_key,
+	)?;
+
+	let hits = history.search(&query, 20)?;
+	if hits.is_empty() {
+		println!("Nothing found. This device searches only what it has received.");
+		return Ok(());
+	}
+
+	for hit in hits {
+		match (hit.community, hit.sequence) {
+			(Some(community), Some(sequence)) => {
+				println!("[{community}#{} {sequence}] {}", hit.channel, hit.text)
+			}
+			_ => println!("[{}] {}", hit.sender, hit.text),
+		}
+	}
+
+	Ok(())
+}
+
 /// Reads the moderation queue (§7.6).
 pub async fn queue(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
 	let id = CommunityId::parse(&ask("Community id: ")?)?;

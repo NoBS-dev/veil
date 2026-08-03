@@ -3465,6 +3465,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rkyv",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

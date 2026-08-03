@@ -411,6 +411,12 @@ async fn show_delivery(
 	// a gap rather than hidden, so history stays legible: something was here,
 	// and its place in the chain is intact.
 	if delivery.tombstoned {
+		// The local copy is searchable, so leaving it would make "deleted" mean
+		// noticeably less than it says (§10.5).
+		if let Ok(history) = open_history(&state) {
+			let _ = history.forget(&delivery.community, &delivery.channel, delivery.sequence);
+		}
+
 		let _ = events.send(ClientEvent::ChannelMessage {
 			community: delivery.community,
 			channel: delivery.channel,
@@ -492,6 +498,23 @@ async fn show_delivery(
 		// A body from before this existed, or from another implementation.
 		Err(_) => ChannelContent::Text(body),
 	};
+
+	// Indexed at decrypt time rather than on demand (§10.4), so search is never
+	// "building…" and the cost lands in work already happening.
+	if let ChannelContent::Text(ref text) = content {
+		record_locally(
+			&state,
+			crate::history::Entry {
+				community: Some(delivery.community),
+				channel: delivery.channel.clone(),
+				sender: delivery.sender.to_string(),
+				sequence: Some(delivery.sequence),
+				text: text.clone(),
+				at: delivery.origin_ts,
+			},
+			events,
+		);
+	}
 
 	// Position and chain come from the host (§10.1), and travel with the event
 	// so a discrepancy is visible rather than silently absorbed.
@@ -660,5 +683,31 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::BlobContent { .. } => "blob content",
 		ProtocolMessage::ChannelKey(_) => "channel key",
 		ProtocolMessage::CommunityResult { .. } => "community result",
+	}
+}
+
+/// Opens this profile's history store.
+///
+/// Opened per use rather than held: these arrive one at a time and the cost is a
+/// file open, whereas a long-lived handle would have to be threaded through
+/// every path that might record something.
+fn open_history(state: &State) -> anyhow::Result<crate::history::History> {
+	crate::history::History::open(
+		&crate::state::history_path(&state.profile),
+		&state.history_key,
+	)
+}
+
+/// Records a message locally, saying so if it could not.
+///
+/// Failure is reported rather than swallowed: a client that quietly stops
+/// indexing looks fine until somebody searches for something they can see on
+/// screen and finds nothing.
+fn record_locally(state: &State, entry: crate::history::Entry, events: &Events) {
+	match open_history(state).and_then(|history| history.record(&entry)) {
+		Ok(()) => {}
+		Err(e) => {
+			notice!(events, "Could not record a message for search: {e:#}");
+		}
 	}
 }

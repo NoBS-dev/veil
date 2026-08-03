@@ -28,6 +28,9 @@ serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_with = "3"
 keyring = "2"
+# SQLCipher rather than plain SQLite: the search index lives inside the database,
+# and §10.4 requires the index on disk to be encrypted rather than only its backup.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }
 base64 = "0.2"
 
 [dev-dependencies]

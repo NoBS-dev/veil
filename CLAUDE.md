@@ -131,7 +131,13 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`.
+`history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`, `search`.
+
+Local history is an **SQLCipher database beside the profile**, opened with a key
+held in the profile itself (§10.4). The keyring holds the key, never the data —
+`State` is already rewritten in full on every save, and history in there would
+rewrite everything per message. The FTS index lives inside that database, which
+is how the index-on-disk gets encrypted without wrapping a search engine.
 
 A **Sealed** community needs a signed `ChannelReaders` record before anything
 can be sent to it — `readers` writes one. Without it `say` refuses, because

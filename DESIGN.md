@@ -107,7 +107,7 @@ to.
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
 | Presence, typing, read state | **[built]** ephemeral, per-community, never logged |
-| Search (client-side index) | designed, §10.4 |
+| Search (client-side index) | **[built]** encrypted store, FTS index inside it; Tantivy still the answer at scale |
 | Deletion, tombstoning | **[built]** author or moderator; chain survives |
 | Attestations, standing | **[built]** `attestation.rs` |
 | Reputation, discovery, finding people | designed, §11.4–11.6 |

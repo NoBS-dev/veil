@@ -105,6 +105,11 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"search" => {
+				if let Err(e) = communities::search(&state) {
+					eprintln!("Could not search: {e:#}");
+				}
+			}
 			"channels" => {
 				if let Err(e) = communities::channels(&write, &state).await {
 					eprintln!("Could not declare channels: {e:#}");

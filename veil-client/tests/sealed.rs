@@ -542,6 +542,103 @@ async fn a_message_carries_the_senders_view_of_policy() {
 	sealed.fixture.stop().await;
 }
 
+/// §10.4: a Sealed message is indexed on the device that decrypted it, and the
+/// index lives inside an encrypted database.
+///
+/// The point of client-side search is that the host cannot do it — so the test
+/// checks both halves: the reader can find the message, and neither the host nor
+/// the local store holds anything readable.
+#[tokio::test]
+async fn a_sealed_message_is_searchable_locally_but_not_by_the_host() {
+	let sealed = Sealed::arrange().await;
+	sealed.grant_readers().await;
+	sealed.alice_says("the pangolin has landed").await;
+
+	// Bob receives and indexes it as it decrypts.
+	let bob = sealed.bob_reads().await;
+	assert!(bob.contains("the pangolin has landed"));
+
+	let found = sealed
+		.fixture
+		.run_client_lingering("bob\nsearch\npangolin\n", LINGER)
+		.await;
+	assert!(
+		found.contains("the pangolin has landed"),
+		"the message should be searchable on the device that decrypted it: {found}"
+	);
+
+	// Alice never received it as a delivery she decrypted from someone else, but
+	// she sent it — the sender indexes its own channel too.
+	let alice = sealed
+		.fixture
+		.run_client_lingering("alice\nsearch\npangolin\n", LINGER)
+		.await;
+	assert!(
+		alice.contains("the pangolin has landed"),
+		"a sender should be able to search its own channel: {alice}"
+	);
+
+	// The host holds nothing readable, which is the whole point.
+	let mut raw = std::fs::read(sealed.fixture.db_path()).unwrap();
+	if let Ok(wal) = std::fs::read(format!("{}-wal", sealed.fixture.db_path())) {
+		raw.extend_from_slice(&wal);
+	}
+	assert!(
+		!raw.windows(b"pangolin".len()).any(|w| w == b"pangolin"),
+		"the host must not be able to index what it cannot read"
+	);
+
+	sealed.fixture.stop().await;
+}
+
+/// A deletion has to reach the local index, not only the host (§10.5).
+///
+/// The local copy is searchable, so a client that kept it would make "deleted"
+/// mean noticeably less than it says — the message would vanish from the channel
+/// and still be found by typing a word from it.
+#[tokio::test]
+async fn deleting_a_message_removes_it_from_local_search() {
+	let sealed = Sealed::arrange().await;
+	sealed.grant_readers().await;
+	sealed.alice_says("the regrettable remark").await;
+
+	// Bob receives and indexes it.
+	assert!(sealed.bob_reads().await.contains("the regrettable remark"));
+	let before = sealed
+		.fixture
+		.run_client_lingering("bob\nsearch\nregrettable\n", LINGER)
+		.await;
+	assert!(
+		before.contains("the regrettable remark"),
+		"it should be searchable before deletion: {before}"
+	);
+
+	// Alice deletes it, and Bob sees the tombstone.
+	sealed
+		.fixture
+		.run_client_lingering(
+			&format!("alice\ndelete\n{}\ngeneral\n1\n", sealed.community),
+			LINGER,
+		)
+		.await;
+	let after_read = sealed.bob_reads().await;
+	assert!(
+		after_read.contains("<deleted>"),
+		"bob should see the tombstone: {after_read}"
+	);
+
+	let after = sealed
+		.fixture
+		.run_client_lingering("bob\nsearch\nregrettable\n", LINGER)
+		.await;
+	assert!(
+		!after.contains("the regrettable remark"),
+		"a deleted message must not remain searchable locally: {after}"
+	);
+
+	sealed.fixture.stop().await;
+}
+
 /// A community this device has not verified might be Sealed. Guessing Open
 /// would send plaintext under an id that promised otherwise, so not knowing has
 /// to be its own answer.

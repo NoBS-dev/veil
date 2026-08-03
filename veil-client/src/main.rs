@@ -1,6 +1,7 @@
 mod cli;
 mod communities;
 mod events;
+mod history;
 mod listener;
 mod messaging;
 mod state;
