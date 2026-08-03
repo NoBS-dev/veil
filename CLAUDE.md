@@ -131,7 +131,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
-`history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`, `search`.
+`history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`, `search`, `alias`, `contact`, `lookup`.
 
 Local history is an **SQLCipher database beside the profile**, opened with a key
 held in the profile itself (§10.4). The keyring holds the key, never the data —
@@ -292,7 +292,12 @@ explicitly — each one closes a specific attack.
     keystroke-level noise in history forever. They are scoped to one community
     on purpose; there is no cross-community presence, and adding one would need
     the global view §1.3 exists to avoid.
-28. **Never send plaintext under a Sealed id.** The mode is inside the community
+28. **The alias is never the identity** (§11.6). Clients pin the `UserId` an
+    alias resolved to and report a change rather than following it — a
+    reassignment and an impersonation are indistinguishable from the client. A
+    contact link carries the whole identity and consults no directory, which is
+    why it is the path to prefer; resolution exists for somebody typing a name.
+29. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

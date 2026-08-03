@@ -342,6 +342,13 @@ pub enum ProtocolMessage {
 		channel: String,
 		sequence: u64,
 	},
+	/// Claims a human-usable name on this host (§11.6).
+	///
+	/// The alias is **never** the identity. It is server-controlled and
+	/// re-assignable — an operator can hand `alice@` to somebody else after
+	/// Alice leaves — which is why clients pin the `UserId` behind it and warn
+	/// when one resolves differently than before.
+	ClaimAlias(String),
 	/// Ephemeral state: who is here, and who is typing (§10.3).
 	///
 	/// **Never enters the log.** No sequence, no previous hash, no place in the

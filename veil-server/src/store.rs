@@ -197,6 +197,16 @@ impl Store {
 			     received_at  INTEGER NOT NULL
 			 );
 
+			 -- Human-usable names (§11.6). Server-controlled and re-assignable
+			 -- by design: an operator can hand `alice@` to somebody else after
+			 -- Alice leaves. That is exactly why clients pin the UserId and
+			 -- never the alias.
+			 CREATE TABLE IF NOT EXISTS aliases (
+			     alias      TEXT PRIMARY KEY,
+			     user_id    BLOB NOT NULL,
+			     claimed_at INTEGER NOT NULL
+			 );
+
 			 CREATE TABLE IF NOT EXISTS server_identity (
 			     id      INTEGER PRIMARY KEY CHECK (id = 1),
 			     pickle  TEXT NOT NULL
@@ -752,6 +762,36 @@ impl Store {
 		)?;
 
 		Ok(rows.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	// ---- aliases (§11.6) --------------------------------------------------
+
+	/// Claims an alias for a user, if nobody else holds it.
+	///
+	/// First come, first served, and not transferable by the claimant — an
+	/// operator reassigning one is a deliberate act, not something a race can
+	/// achieve.
+	pub fn claim_alias(&self, alias: &str, user: &UserId, now: u64) -> Result<bool> {
+		let claimed = self.db.execute(
+			"INSERT OR IGNORE INTO aliases (alias, user_id, claimed_at) VALUES (?1, ?2, ?3)",
+			params![alias, user.as_bytes().as_slice(), now],
+		)?;
+
+		// Already ours is success; already somebody else's is not.
+		Ok(claimed == 1 || self.resolve_alias(alias)?.as_ref() == Some(user))
+	}
+
+	pub fn resolve_alias(&self, alias: &str) -> Result<Option<UserId>> {
+		let row: Option<Vec<u8>> = self
+			.db
+			.query_row(
+				"SELECT user_id FROM aliases WHERE alias = ?1",
+				params![alias],
+				|r| r.get(0),
+			)
+			.optional()?;
+
+		Ok(row.and_then(|bytes| bytes.as_slice().try_into().ok().map(UserId::from_bytes)))
 	}
 
 	// ---- blobs (§10.2) ----------------------------------------------------

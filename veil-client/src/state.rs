@@ -171,6 +171,17 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// Identities we have seen behind an alias (§11.6).
+	///
+	/// **The alias is never the identity.** Aliases are server-controlled and
+	/// re-assignable — an operator can hand `alice@` to somebody else after
+	/// Alice leaves — so what is pinned is the `UserId` the alias resolved to.
+	/// That is what keeps §5.1's portability real: Alice changes hosts, her
+	/// alias changes, and every contact and verification survives because none
+	/// of them were pinned to the name.
+	#[serde_as(as = "Vec<(_, _)>")]
+	#[serde(default)]
+	pub pinned_aliases: HashMap<String, UserId>,
 	/// The key that opens this profile's history store (§10.4).
 	///
 	/// Thirty-two bytes here, and the history itself in a file. The keyring is
@@ -265,6 +276,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			pinned_aliases: HashMap::new(),
 			history_key: random_key(),
 			expected_server_identity: None,
 			known_communities: HashMap::new(),
@@ -344,6 +356,29 @@ impl State {
 	///
 	/// `None` means "not known", not "Open". A caller deciding whether it is
 	/// safe to send plaintext must treat the two differently.
+	/// Records what an alias resolved to, or refuses if it has moved.
+	///
+	/// The same mechanic as server-identity pinning (§6.2), and for the same
+	/// reason: anything a server tells you, that server can lie about. A
+	/// changed answer is not necessarily an attack — an operator may genuinely
+	/// have reassigned the name — but it is never something to absorb silently,
+	/// because the safe interpretation and the dangerous one look identical.
+	pub fn pin_alias(&mut self, alias: &str, resolved: UserId) -> Result<()> {
+		match self.pinned_aliases.get(alias) {
+			Some(pinned) if *pinned != resolved => anyhow::bail!(
+				"{alias} used to be {pinned} and now resolves to {resolved}. Either its \
+				 operator reassigned it, or something is impersonating them — the alias is \
+				 not the identity, so treat the person you knew as unchanged and verify \
+				 this one before trusting it."
+			),
+			Some(_) => Ok(()),
+			None => {
+				self.pinned_aliases.insert(alias.to_owned(), resolved);
+				Ok(())
+			}
+		}
+	}
+
 	pub fn community_mode(&self, id: &CommunityId) -> Option<Mode> {
 		self.known_communities.get(id).copied()
 	}
@@ -624,5 +659,63 @@ pub fn default_store() -> Result<Box<dyn SecretStore>> {
 			Ok(Box::new(FileStore::new(dir)?))
 		}
 		_ => Ok(Box::new(Keyring)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use veil_protocol::crosssign::CrossSigningSecrets;
+
+	fn state() -> State {
+		State::new("127.0.0.1:9876", "test").unwrap()
+	}
+
+	/// First sight of an alias is trust on first use, and pins what it resolved
+	/// to (§11.6).
+	#[test]
+	fn an_alias_pins_on_first_sight() {
+		let mut state = state();
+		let alice = CrossSigningSecrets::new().user_id();
+
+		assert!(state.pin_alias("alice@veil.example", alice).is_ok());
+		assert_eq!(state.pinned_aliases.get("alice@veil.example"), Some(&alice));
+
+		// The same answer again is not a change.
+		assert!(state.pin_alias("alice@veil.example", alice).is_ok());
+	}
+
+	/// The case the pin exists for. An operator reassigning a name and somebody
+	/// impersonating look identical from here, so neither is absorbed silently.
+	#[test]
+	fn an_alias_resolving_elsewhere_is_refused() {
+		let mut state = state();
+		let alice = CrossSigningSecrets::new().user_id();
+		let somebody_else = CrossSigningSecrets::new().user_id();
+
+		state.pin_alias("alice@veil.example", alice).unwrap();
+
+		let error = state
+			.pin_alias("alice@veil.example", somebody_else)
+			.unwrap_err();
+		let message = format!("{error}");
+
+		assert!(message.contains("used to be"), "got: {message}");
+		assert!(
+			message.contains("the alias is not the identity"),
+			"the warning has to say which of the two is real: {message}"
+		);
+	}
+
+	/// Two names are two pins. Aliases are per-address, so one moving says
+	/// nothing about another.
+	#[test]
+	fn aliases_pin_independently() {
+		let mut state = state();
+		let alice = CrossSigningSecrets::new().user_id();
+		let bob = CrossSigningSecrets::new().user_id();
+
+		state.pin_alias("alice@veil.example", alice).unwrap();
+		assert!(state.pin_alias("bob@veil.example", bob).is_ok());
 	}
 }

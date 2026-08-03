@@ -1,5 +1,6 @@
 mod cli;
 mod communities;
+mod contacts;
 mod events;
 mod history;
 mod listener;

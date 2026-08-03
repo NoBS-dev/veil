@@ -332,6 +332,7 @@ async fn main() -> Result<()> {
 			routing::get(get_prekey_bundle),
 		)
 		.route("/users/{user}/devices", routing::get(get_device_list))
+		.route("/aliases/{alias}", routing::get(resolve_alias))
 		.route("/relay", routing::any(relay))
 		.route("/s2s", routing::any(deposit_socket))
 		.route(
@@ -362,6 +363,26 @@ async fn main() -> Result<()> {
 
 async fn socket(socket: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
 	socket.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+/// Resolves a human-typed name to the identity behind it (§11.6).
+///
+/// **Trust on first use, and nothing more.** Anything a server says, that server
+/// can lie about — so a client pins what this returns and warns loudly if the
+/// same alias later resolves elsewhere. The safe path is a link or QR carrying
+/// the whole `UserId`, which consults no directory and so has nothing to
+/// substitute; this exists for somebody typing an address by hand.
+async fn resolve_alias(State(state): State<ServerState>, Path(alias): Path<String>) -> Response {
+	match state
+		.store
+		.lock()
+		.await
+		.resolve_alias(&alias.trim().to_lowercase())
+	{
+		Ok(Some(user)) => user.to_string().into_response(),
+		Ok(None) => (StatusCode::NOT_FOUND, "no such alias").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+	}
 }
 
 /// Looks a stranger up on their own home server, so the client does not have to
@@ -692,6 +713,33 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 			ProtocolMessage::Post(post) => {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
+			}
+			ProtocolMessage::ClaimAlias(alias) => {
+				let alias = alias.trim().to_lowercase();
+				let valid = !alias.is_empty()
+					&& alias.len() <= 64
+					&& alias
+						.chars()
+						.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+
+				let detail = if !valid {
+					"an alias is up to 64 characters of letters, digits, dot, dash or underscore"
+						.to_owned()
+				} else {
+					let now = state.clock.read().await.now_ms();
+					match state
+						.store
+						.lock()
+						.await
+						.claim_alias(&alias, &address.user, now)
+					{
+						Ok(true) => format!("{alias} is yours"),
+						Ok(false) => format!("{alias} is already taken"),
+						Err(e) => format!("could not claim it: {e}"),
+					}
+				};
+
+				eprintln!("Alias claim from {address}: {detail}");
 			}
 			ProtocolMessage::Ephemeral(event) => {
 				community::ephemeral(&state, &address, event).await;

@@ -105,6 +105,21 @@ pub async fn cli(
 					eprintln!("Could not set readers: {e:#}");
 				}
 			}
+			"alias" => {
+				if let Err(e) = communities::alias(&write, &state).await {
+					eprintln!("Could not claim an alias: {e:#}");
+				}
+			}
+			"contact" => {
+				if let Err(e) = communities::contact(&state) {
+					eprintln!("Could not build a contact link: {e:#}");
+				}
+			}
+			"lookup" => {
+				if let Err(e) = communities::lookup(&mut state).await {
+					eprintln!("Could not look that up: {e:#}");
+				}
+			}
 			"search" => {
 				if let Err(e) = communities::search(&state) {
 					eprintln!("Could not search: {e:#}");

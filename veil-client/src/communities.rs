@@ -449,6 +449,69 @@ pub async fn report(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()
 	.await
 }
 
+/// Claims a human-usable name on this host (§11.6).
+pub async fn alias(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
+	let name = ask("Alias to claim: ")?;
+
+	println!(
+		"An alias is server-controlled and re-assignable. It is a convenience, not \
+		 your identity — share the contact link instead when it matters."
+	);
+
+	send(write, state, ProtocolMessage::ClaimAlias(name)).await
+}
+
+/// Prints this device's contact link.
+///
+/// The safe way to be found: it carries the whole identity, so nothing is looked
+/// up and nothing can be substituted (§11.6).
+pub fn contact(state: &State) -> Result<()> {
+	println!(
+		"{}",
+		crate::contacts::Contact {
+			user: state.user_id,
+			host: state.ip_and_port.to_string(),
+		}
+		.encode()
+	);
+	Ok(())
+}
+
+/// Takes a contact link, or resolves `name@host`.
+///
+/// The two are not equivalent and the client says which it did. A link carries
+/// the identity, so nothing is looked up and nothing can be substituted. A typed
+/// address is answered by a server, and anything a server tells you it can lie
+/// about — so that answer is pinned, and safety numbers remain the real
+/// verification (§11.6).
+pub async fn lookup(state: &mut State) -> Result<()> {
+	let entered = ask("Contact link, or an address (name@host): ")?;
+
+	let contact = match crate::contacts::Contact::parse(&entered) {
+		Ok(contact) => {
+			println!(
+				"{} — from the link itself, so no server was asked and none could \
+				 have answered wrongly.",
+				contact.user
+			);
+			contact
+		}
+		Err(_) => {
+			let contact = crate::contacts::resolve(state, &entered).await?;
+			println!("{entered} is {}", contact.user);
+			println!(
+				"Resolved by that host and pinned. Verify with `safety` before trusting \
+				 it — a name is not an identity."
+			);
+			contact
+		}
+	};
+
+	println!("Their mail goes to {}.", contact.host);
+	state.save_to_keyring()?;
+	Ok(())
+}
+
 /// Searches this device's own history (§10.4).
 ///
 /// **Client-side only, and there is no middle setting.** Giving a host the keys

@@ -110,7 +110,8 @@ to.
 | Search (client-side index) | **[built]** encrypted store, FTS index inside it; Tantivy still the answer at scale |
 | Deletion, tombstoning | **[built]** author or moderator; chain survives |
 | Attestations, standing | **[built]** `attestation.rs` |
-| Reputation, discovery, finding people | designed, §11.4–11.6 |
+| Finding people: aliases, contact links, pinning | **[built]** §11.6 |
+| Reputation and server discovery | designed, §11.4–11.5 |
 | Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
 | Message store, push | designed, §12.1–12.2 |
 | Backups, succession, migration | designed, §12.3–12.4 |
