@@ -458,6 +458,71 @@ pub async fn report(
 	)])
 }
 
+/// Places a call to a device (§9).
+///
+/// Relayed by default, which is what keeps a call from handing your address to
+/// whoever you are talking to. The offer goes over the Olm session — that is the
+/// whole of the security, because the SDP carries the DTLS fingerprint and
+/// WebRTC does the rest.
+pub async fn call(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+	calls: &crate::media::Calls,
+	target: &str,
+) -> Result<Vec<ClientEvent>> {
+	let mut reported = Vec::new();
+	let recipient = crate::messaging::parse_target(target)?;
+
+	// A session with the device first: the offer has to travel authenticated or
+	// the fingerprint inside it means nothing.
+	messaging::ensure_session(state, recipient, directory, &mut reported).await?;
+
+	let session = crate::media::Session::new(state.relay.as_deref()).await?;
+	session.open_channel("audio").await?;
+	session.offer().await?;
+	let sdp = session.local_description_when_gathered().await?;
+
+	let mut call = [0u8; 16];
+	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut call);
+
+	let (message_type, message) = {
+		let peer = state
+			.peers
+			.get_mut(&recipient)
+			.ok_or_else(|| anyhow::anyhow!("no session with {recipient}"))?;
+		peer.session.encrypt(sdp.as_bytes()).to_parts()
+	};
+
+	send(
+		write,
+		state,
+		ProtocolMessage::CallSignal(veil_protocol::CallSignal {
+			call,
+			sender: state.address(),
+			recipient,
+			sender_x25519: state.account.curve25519_key().to_bytes(),
+			message_type,
+			message,
+		}),
+	)
+	.await?;
+
+	calls.lock().await.insert(call, session);
+	state.save_to_keyring()?;
+
+	reported.push(ClientEvent::info(format!(
+		"Calling {recipient}{}. Media is relayed unless both of you choose otherwise.",
+		if state.relay.is_some() {
+			""
+		} else {
+			" directly — no relay is configured, so they will see this address"
+		}
+	)));
+
+	Ok(reported)
+}
+
 /// Claims a human-usable name on this host (§11.6).
 pub async fn alias(
 	write: &Arc<Mutex<WriteStream>>,

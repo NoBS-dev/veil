@@ -103,7 +103,9 @@ to.
 | Moderation and reporting under Sealed | **[built]** reports held for a moderator; unattributed accepted |
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
-| Calls: signalling and transport consent | **[built]** `call.rs`, `CallSignal` — 1:1 needs nothing further |
+| Calls: 1:1 signalling and negotiation | **[built]** `media.rs` — real WebRTC, offer/answer over the Olm session |
+| Calls: jitter buffering and pacing | **[built]** tested; not wired until audio tracks exist |
+| Calls: audio capture and playback | not begun — needs devices |
 | Calls: mesh for small groups | designed, §9 — same primitives |
 | Calls: SFU and SFrame for large groups | designed, §9 — the only place new crypto appears |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
@@ -122,7 +124,8 @@ to.
 | Time synchronisation | **[built]** `clock.rs`, server-side |
 | Client architecture (seam, Qt, mobile) | designed, §17 |
 | Client split: Rust daemon + C++/Qt over a socket | **validated by spike**, §17.3 |
-| Channel roles, moderation, bots | **not designed** |
+| Channel roles and moderation | **[built]** |
+| Bots | **[built]** §18 — an account, marked as automated |
 
 §4 (threat model), §6 (trust establishment), §14 (metadata) and §15 (sequencing)
 are analysis rather than subsystems and carry no build status of their own.
@@ -1016,6 +1019,31 @@ rate, not participant count.
 encrypted channel, always. Route SDP through a plaintext or server-mediated path
 and the fingerprint can be swapped in flight, which undoes every layer above it.
 That is where the guarantee lives.
+
+### 9.0 Where the performance is
+
+Not in the encryption, and it is worth being concrete because the assumption is
+common. SRTP is AES-GCM over a ~160-byte payload: tens of nanoseconds against a
+20 ms packet interval, so roughly a millionth of the budget. An encrypted call
+and a plaintext one differ by nothing a person could hear.
+
+What people hear is latency and jitter, which come from four places:
+
+1. **The jitter buffer**, the largest lever. Every millisecond held is a
+   millisecond added to the conversation; every millisecond not held is a chance
+   to run dry. Veil's adapts to observed arrival spread rather than picking a
+   constant, because the right depth on a wired connection and on a train differ
+   by an order of magnitude and a constant chosen for the worst case makes every
+   good connection feel bad. Floor of two packets, ceiling of twenty-five —
+   past about half a second people talk over each other, so dropping audio
+   becomes the better failure.
+2. **Packet loss concealment.** A gap must play as silence of the right length
+   rather than a skipped instant, or speech runs fast and the pitch wanders.
+3. **Allocation.** Fifty packets a second per stream means a per-packet
+   allocation is fifty pointless trips to the allocator every second; the buffer
+   reuses its storage.
+4. **The relay hop**, which is the one the user can trade away — with both
+   parties' consent, per call (§9.1).
 
 ### 9.1 Transport: relayed by default, P2P by choice
 
@@ -2457,3 +2485,68 @@ IDE-style floating windows — a much smaller problem.
 | v1 | Fixed layout | none |
 | v2 | Rearrangeable panels, persisted | `QDockWidget`, or QML `SplitView` |
 | v3 | Floating windows, tab groups | KDDockWidgets |
+
+---
+
+## 18. Bots
+
+**A bot is an ordinary account.** It has a `UserId` derived from a master key,
+devices, cross-signing, and a place in the member list. Every rule that applies
+to a person applies to it unchanged: it holds a role, it can be banned, it is
+subject to the channel set, and it appears in the reader list or does not.
+
+That is a decision, not an omission. The alternative — a distinct principal type
+with its own rules — would mean every check in the system growing a second case,
+and the second case is where the bugs live. Matrix reached the same conclusion,
+and it is why nothing in `veil-protocol` branches on whether a member is
+automated.
+
+### 18.1 What a bot can read in a Sealed community
+
+This is the only question about bots that is a security decision rather than an
+interface one, and the existing design already answers it.
+
+In Sealed, read access **is** key possession (§8.5). A bot reads a channel if and
+only if a signed `ChannelReaders` record names it, and senders consult that
+record when deciding who receives Megolm keys. So:
+
+- A bot with read access is **visible in signed policy**. Anyone can see it is
+  there, and only controllers can put it there.
+- A bot without it receives no keys, and no sender encrypts to it. It can still
+  be a member, be mentioned, and post — it simply cannot read.
+- A host cannot add one. The reader list is signed, which is the whole reason
+  §8.5 put it in the chain rather than leaving it to the host.
+
+**So "is a bot reading this?" is already answered by "who is in the reader
+list?"** — and that list was made trustworthy for exactly this class of reason.
+No new mechanism is needed, and adding one would create a second answer to a
+question that already has one.
+
+Worth stating plainly for the interface: **a bot in a Sealed channel reads
+everything in that channel.** There is no partial key, and a design that promised
+one would be lying — Megolm keys decrypt a session, not a subset of it. A
+community wanting a bot that reads less should give it its own channel.
+
+### 18.2 The automated marker
+
+`PolicyRecord::Automated` marks a member as a bot. It is signed like any other
+policy, so a host can neither invent one nor conceal one.
+
+**It is a label and nothing else.** Nothing enforces it and nothing depends on
+it, because a bot that lied about being one would still be bound by every rule
+above. It exists so a member list can say which participants are automated,
+which is honesty in the interface rather than a security control. Treating it as
+the latter would be a mistake — the security comes from the reader list and the
+role, both of which are already signed.
+
+### 18.3 What a bot needs that a person does not
+
+Nothing, at the protocol level, which is the point. Operationally it wants:
+
+- **An unattended identity.** The recovery key (§12.5) is the mechanism; a bot
+  keeps its cross-signing secrets in whatever the operator uses for secrets.
+- **A stable alias** (§11.6), so people can address it by name. Server-controlled
+  and re-assignable like any other, and clients pin the identity behind it.
+- **Not to be a moderator by default.** A bot that can ban is a bot whose
+  compromise can empty a community, and the role system already makes that an
+  explicit grant rather than a default.

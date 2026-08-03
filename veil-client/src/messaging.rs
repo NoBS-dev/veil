@@ -159,6 +159,11 @@ pub async fn ensure_session(
 	Ok(())
 }
 
+/// Parses a bare `<user-id>/<device-id>` target.
+pub fn parse_target(input: &str) -> Result<DeviceAddress> {
+	Ok(parse_address(input)?.address)
+}
+
 pub async fn send(
 	write: &mut WriteStream,
 	state: &mut State,

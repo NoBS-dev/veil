@@ -302,7 +302,12 @@ explicitly — each one closes a specific attack.
     preference that carried into the next call would be a security failure in
     §9.1's own words. A withdrawal is final for that call. `call.rs` holds the
     rules; the media stack does not exist.
-30. **Never send plaintext under a Sealed id.** The mode is inside the community
+30. **A bot is an ordinary account** (§18). It holds a role, can be banned, and
+    reads a Sealed channel only if signed policy names it as a reader — so "is a
+    bot reading this" is already answered by the reader list. The `Automated`
+    marker is a label for the interface; nothing enforces it and nothing should
+    branch on it.
+31. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

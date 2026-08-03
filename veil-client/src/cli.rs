@@ -50,6 +50,7 @@ pub async fn cli(
 	url: &str,
 	write: Arc<Mutex<WriteStream>>,
 	state: Arc<Mutex<State>>,
+	calls: crate::media::Calls,
 ) -> Result<()> {
 	loop {
 		print!("{prompt}");
@@ -187,6 +188,12 @@ pub async fn cli(
 					Err(e) => eprintln!("{e:#}"),
 				},
 				_ => eprintln!("Could not read that."),
+			},
+			"call" => match ask("Enter target device (<user-id>/<device-id>): ") {
+				Ok(target) => {
+					show(communities::call(&write, &mut state, url, &calls, &target).await)
+				}
+				Err(e) => eprintln!("{e:#}"),
 			},
 			"alias" => match ask("Alias to claim: ") {
 				Ok(name) => show(communities::alias(&write, &state, &name).await),

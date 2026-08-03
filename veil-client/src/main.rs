@@ -4,6 +4,7 @@ mod contacts;
 mod events;
 mod history;
 mod listener;
+mod media;
 mod messaging;
 mod state;
 mod tunnel;
@@ -201,12 +202,14 @@ async fn main() -> anyhow::Result<()> {
 		}
 	});
 
+	let calls = media::calls();
 	tokio::spawn(listener::listener(
 		read,
 		write.clone(),
 		state.clone(),
 		server_identity,
 		events,
+		calls.clone(),
 	));
 	// Wait for those refreshes before accepting a command. Sending to a Sealed
 	// channel derives readership from the chain, so entering the prompt first
@@ -235,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
 		}
 	}
 
-	cli(&prompt, &url, write, state).await?;
+	cli(&prompt, &url, write, state, calls).await?;
 
 	Ok(())
 }

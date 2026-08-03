@@ -277,6 +277,20 @@ pub enum PolicyRecord {
 	/// posts to whatever name a member uses — declaring the set is what turns
 	/// that from a default into a decision.
 	Channels { channels: Vec<ChannelSpec> },
+	/// Marks a member as automated (§18).
+	///
+	/// **A bot is an ordinary account.** It has a `UserId`, devices and
+	/// cross-signing like anybody else, and every rule that applies to a person
+	/// applies to it unchanged — it can be banned, it holds a role, and in a
+	/// Sealed community it reads only if a signed `ChannelReaders` record says
+	/// so.
+	///
+	/// This record exists for one reason: so a client can *say* which members
+	/// are automated. Nothing enforces it and nothing depends on it, because a
+	/// bot that lied about being one would still be bound by everything above.
+	/// It is honesty in the interface rather than a security control, and
+	/// treating it as the latter would be a mistake.
+	Automated { user: UserId, is_bot: bool },
 	/// What a member may do (§8.5).
 	///
 	/// In the signed chain rather than a host-side table, so there is one source
@@ -389,6 +403,11 @@ fn policy_input(community: &CommunityId, sequence: u64, record: &PolicyRecord) -
 			buffer.extend_from_slice(&(new_host.len() as u32).to_le_bytes());
 			buffer.extend_from_slice(new_host.as_bytes());
 		}
+		PolicyRecord::Automated { user, is_bot } => {
+			buffer.push(6);
+			buffer.extend_from_slice(user.as_bytes());
+			buffer.push(u8::from(*is_bot));
+		}
 		PolicyRecord::Channels { channels } => {
 			buffer.push(5);
 			buffer.extend_from_slice(&(channels.len() as u32).to_le_bytes());
@@ -459,6 +478,8 @@ pub struct CommunityState {
 	/// The declared channels. Empty means none have been declared, which is not
 	/// the same as none existing.
 	pub channels: Vec<ChannelSpec>,
+	/// Members declared automated (§18). A label, not a permission.
+	pub automated: std::collections::HashSet<UserId>,
 	/// Highest sequence applied. Records at or below this are refused.
 	pub sequence: u64,
 	/// Rolling hash of every record applied, in order.
@@ -492,6 +513,7 @@ impl CommunityState {
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
 			channels: Vec::new(),
+			automated: std::collections::HashSet::new(),
 			sequence: 0,
 			// An empty chain starts from the community's own id, so two
 			// communities with no policy do not share a head.
@@ -518,6 +540,7 @@ impl CommunityState {
 			channel_readers: std::collections::HashMap::new(),
 			roles: std::collections::HashMap::new(),
 			channels: Vec::new(),
+			automated: std::collections::HashSet::new(),
 			sequence: 0,
 			head_hash: root.id().as_chain_start(),
 			root,
@@ -564,6 +587,13 @@ impl CommunityState {
 			}
 			PolicyRecord::Migration { new_host } => {
 				self.host = Some(new_host.clone());
+			}
+			PolicyRecord::Automated { user, is_bot } => {
+				if *is_bot {
+					self.automated.insert(*user);
+				} else {
+					self.automated.remove(user);
+				}
 			}
 			PolicyRecord::Channels { channels } => {
 				self.channels = channels.clone();
@@ -652,6 +682,14 @@ impl CommunityState {
 	/// [`Self::head_hash`].
 	pub fn chain_head(&self) -> (u64, [u8; 32]) {
 		(self.sequence, self.head_hash)
+	}
+
+	/// Whether a member is declared automated.
+	///
+	/// Display only. A bot is subject to exactly the rules a person is, so
+	/// nothing in this crate branches on it — and nothing should.
+	pub fn is_automated(&self, user: &UserId) -> bool {
+		self.automated.contains(user)
 	}
 
 	/// Whether a channel may be posted to.
@@ -1165,5 +1203,99 @@ mod tests {
 		let community = CommunityState::from_root(root, founder.public_key().as_bytes()).unwrap();
 
 		(community, controller, founder_id)
+	}
+
+	/// §18: a bot is an account, so being one grants and costs nothing.
+	#[test]
+	fn being_automated_is_a_label_and_not_a_permission() {
+		let (mut community, controller, _) = community();
+		let bot = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+
+		community
+			.apply(&SignedPolicy::sign(
+				community.id,
+				1,
+				PolicyRecord::Automated {
+					user: bot,
+					is_bot: true,
+				},
+				&[(0, &controller)],
+			))
+			.unwrap();
+
+		assert!(community.is_automated(&bot));
+		assert_eq!(
+			community.role(&bot),
+			Role::Member,
+			"declaring a member automated must not change what it may do"
+		);
+		assert!(community.may_post(&bot));
+	}
+
+	/// And it is bound by everything a person is — including a ban.
+	#[test]
+	fn a_bot_can_be_banned_like_anybody_else() {
+		let (mut community, controller, _) = community();
+		let bot = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+
+		for (sequence, record) in [
+			(
+				1,
+				PolicyRecord::Automated {
+					user: bot,
+					is_bot: true,
+				},
+			),
+			(
+				2,
+				PolicyRecord::MemberRole {
+					user: bot,
+					role: Role::Banned,
+				},
+			),
+		] {
+			community
+				.apply(&SignedPolicy::sign(
+					community.id,
+					sequence,
+					record,
+					&[(0, &controller)],
+				))
+				.unwrap();
+		}
+
+		assert!(
+			!community.may_post(&bot),
+			"a bot is banned like anyone else"
+		);
+		assert!(
+			community.is_automated(&bot),
+			"and is still known to be automated, which is what a member list shows"
+		);
+	}
+
+	/// The label is signed, so a host cannot decide who looks like a bot — nor
+	/// hide that one is present.
+	#[test]
+	fn the_label_is_signed_like_any_other_policy() {
+		let (mut community, _, _) = community();
+		let impostor = Ed25519SecretKey::new();
+		let bot = UserId::from_master_key(&Ed25519SecretKey::new().public_key());
+
+		assert!(
+			community
+				.apply(&SignedPolicy::sign(
+					community.id,
+					1,
+					PolicyRecord::Automated {
+						user: bot,
+						is_bot: true,
+					},
+					&[(0, &impostor)],
+				))
+				.is_err(),
+			"a non-controller must not be able to label anyone"
+		);
+		assert!(!community.is_automated(&bot));
 	}
 }

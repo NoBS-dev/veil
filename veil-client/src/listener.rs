@@ -45,6 +45,7 @@ pub async fn listener(
 	state: Arc<Mutex<State>>,
 	server_identity: [u8; 32],
 	events: Events,
+	calls: crate::media::Calls,
 ) {
 	let mut replay_guard = ReplayGuard::default();
 
@@ -105,6 +106,17 @@ pub async fn listener(
 									)
 									.await;
 								}
+								ProtocolMessage::CallSignal(signal) => {
+									answer_call(
+										state.clone(),
+										&write,
+										&calls,
+										opened.sender,
+										signal,
+										&events,
+									)
+									.await;
+								}
 								ProtocolMessage::ChannelKey(key) => {
 									accept_channel_key(state.clone(), inner.sender, key, &events)
 										.await;
@@ -148,6 +160,17 @@ pub async fn listener(
 					}
 					ProtocolMessage::Delivery(delivery) => {
 						show_delivery(state.clone(), *delivery, &events).await;
+					}
+					ProtocolMessage::CallSignal(signal) => {
+						answer_call(
+							state.clone(),
+							&write,
+							&calls,
+							opened.sender,
+							signal,
+							&events,
+						)
+						.await;
 					}
 					ProtocolMessage::ChannelKey(key) => {
 						accept_channel_key(state.clone(), opened.sender, key, &events).await;
@@ -712,4 +735,170 @@ fn record_locally(state: &State, entry: crate::history::Entry, events: &Events) 
 			notice!(events, "Could not record a message for search: {e:#}");
 		}
 	}
+}
+
+/// Answers an incoming call offer, or completes one we placed (§9).
+///
+/// The SDP arrives inside an Olm session with a device we have a pinned key for,
+/// which is what authenticates the DTLS fingerprint it carries. Nothing here
+/// adds to the media path — WebRTC encrypts it — so the only job is to be sure
+/// the SDP came from who it says.
+async fn answer_call(
+	state: Arc<Mutex<State>>,
+	write: &Arc<Mutex<WriteStream>>,
+	calls: &crate::media::Calls,
+	envelope_signer: [u8; 32],
+	signal: veil_protocol::CallSignal,
+	events: &Events,
+) {
+	let mut state = state.lock().await;
+
+	if signal.recipient != state.address() {
+		notice!(
+			events,
+			"Discarding a call signal addressed to {}",
+			signal.recipient
+		);
+		return;
+	}
+
+	// The same rule as a channel key: the envelope's signer is the identity, and
+	// a session we hold must have been established with that key.
+	match state.peers.get(&signal.sender) {
+		Some(peer) if peer.ed25519 == envelope_signer => {}
+		Some(_) => {
+			notice!(
+				events,
+				"Discarding a call signal from {}: signed by a different key than the \
+				 session we hold with it",
+				signal.sender
+			);
+			return;
+		}
+		None => {}
+	}
+
+	let sdp = match decrypt_signal(&mut state, &signal, envelope_signer) {
+		Ok(sdp) => sdp,
+		Err(e) => {
+			notice!(
+				events,
+				"Could not open a call signal from {}: {e:#}",
+				signal.sender
+			);
+			return;
+		}
+	};
+
+	// An answer completes a call we placed; anything else is an offer.
+	if let Some(session) = calls.lock().await.get(&signal.call) {
+		match session.accept_answer(&sdp).await {
+			Ok(()) => say!(events, "{} answered.", signal.sender),
+			Err(e) => notice!(
+				events,
+				"Could not accept an answer from {}: {e:#}",
+				signal.sender
+			),
+		}
+		return;
+	}
+
+	let session = match crate::media::Session::new(state.relay.as_deref()).await {
+		Ok(session) => session,
+		Err(e) => {
+			notice!(events, "Could not open a media session: {e:#}");
+			return;
+		}
+	};
+
+	let answer = match session.answer(&sdp).await {
+		Ok(_) => match session.local_description_when_gathered().await {
+			Ok(answer) => answer,
+			Err(e) => {
+				notice!(events, "Could not gather candidates: {e:#}");
+				return;
+			}
+		},
+		Err(e) => {
+			notice!(
+				events,
+				"Could not answer a call from {}: {e:#}",
+				signal.sender
+			);
+			return;
+		}
+	};
+
+	let framed = {
+		let Some(peer) = state.peers.get_mut(&signal.sender) else {
+			notice!(events, "No session with {} to answer over", signal.sender);
+			return;
+		};
+		peer.session.encrypt(answer.as_bytes()).to_parts()
+	};
+
+	let reply = ProtocolMessage::CallSignal(veil_protocol::CallSignal {
+		call: signal.call,
+		sender: state.address(),
+		recipient: signal.sender,
+		sender_x25519: state.account.curve25519_key().to_bytes(),
+		message_type: framed.0,
+		message: framed.1,
+	});
+
+	match Envelope::seal(&reply, &state.account) {
+		Ok(sealed) => {
+			let _ = write
+				.lock()
+				.await
+				.send(Message::Binary(Bytes::copy_from_slice(&sealed)))
+				.await;
+			calls.lock().await.insert(signal.call, session);
+			say!(events, "Answered a call from {}.", signal.sender);
+		}
+		Err(e) => notice!(events, "Could not seal an answer: {e:#}"),
+	}
+
+	let _ = state.save_to_keyring();
+}
+
+/// Olm-decrypts a call signal, opening an inbound session if this is the first
+/// thing that device has sent us.
+fn decrypt_signal(
+	state: &mut State,
+	signal: &veil_protocol::CallSignal,
+	envelope_signer: [u8; 32],
+) -> anyhow::Result<String> {
+	use vodozemac::olm::OlmMessage;
+
+	let olm = OlmMessage::from_parts(signal.message_type, &signal.message)?;
+
+	if let Some(peer) = state.peers.get_mut(&signal.sender) {
+		return Ok(String::from_utf8(peer.session.decrypt(&olm)?)?);
+	}
+
+	let OlmMessage::PreKey(prekey) = olm else {
+		anyhow::bail!(
+			"no session with {} and this is not a prekey message",
+			signal.sender
+		);
+	};
+
+	let opened = state
+		.account
+		.create_inbound_session(prekey.identity_key(), &prekey)?;
+
+	state.peers.insert(
+		signal.sender,
+		PeerSession {
+			x25519: signal.sender_x25519,
+			ed25519: envelope_signer,
+			seen_head: veil_protocol::message::MessageId::ROOT,
+			seen_ids: Default::default(),
+			sent_ids: Default::default(),
+			session: opened.session,
+		},
+	);
+
+	Ok(String::from_utf8(opened.plaintext)?)
 }
