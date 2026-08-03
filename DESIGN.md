@@ -103,8 +103,9 @@ to.
 | Moderation and reporting under Sealed | **[built]** reports held for a moderator; unattributed accepted |
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
-| Calls: transport consent rules | **[built]** `call.rs` — negotiation only |
-| Calls: media, SRTP, SFU, MLS | designed, §9 — not begun |
+| Calls: signalling and transport consent | **[built]** `call.rs`, `CallSignal` — 1:1 needs nothing further |
+| Calls: mesh for small groups | designed, §9 — same primitives |
+| Calls: SFU and SFrame for large groups | designed, §9 — the only place new crypto appears |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
 | Presence, typing, read state | **[built]** ephemeral, per-community, never logged |
@@ -973,13 +974,48 @@ keys.
 
 ## 9. Calls and real-time media
 
-A separate cryptographic path, not a reuse of the messaging stack. Olm/Megolm is
-store-and-forward; real-time media needs SRTP with per-frame keying and
-participants joining and leaving mid-call. Above two or three participants it
-needs an SFU forwarding streams it cannot decrypt.
+**Revised after implementation.** An earlier draft of this section said calls
+need SRTP with per-frame keying, an SFU forwarding streams it cannot decrypt, and
+that "MLS is effectively unavoidable" — and concluded they were foundational work
+rather than a feature. That is true of the *large* case and was wrongly applied
+to all of them. Sizing every call by the hardest one put a second cryptographic
+protocol on the critical path for a two-person voice call, which needs none of
+it.
 
-**This is where MLS is effectively unavoidable**, even if text stays on Megolm.
-Budget calls as foundational work, not a feature riding on messaging.
+Three tiers, and only the first is needed for calls to exist.
+
+| Participants | Transport | New cryptography |
+| --- | --- | --- |
+| **2** | direct or relayed, stock WebRTC | **none** |
+| **3–5** | full mesh | **none** |
+| **many** | SFU + SFrame | a group key — Megolm first, MLS if churn demands it |
+
+**A 1:1 call needs nothing new.** WebRTC's DTLS-SRTP is already end-to-end
+between two peers. What makes that MITM-able is unauthenticated signalling — and
+Veil already has an authenticated channel, because an Olm session runs to a
+device verified through cross-signing (§5.4). The SDP carries the DTLS
+fingerprint, so sending it over that session authenticates the media keys with no
+new PKI. This is how Signal handles 1:1, and it is the load-bearing simplification.
+
+**Small groups are the same primitives, meshed.** Every participant holds a
+session with every other. There is no SFU, so there is nothing in the middle to
+keep out of the trust set — mesh is *more* private than an SFU, it simply does
+not scale. §9.1's own figures make the case: voice is 50–64 kbps and most
+participants are muted, so a four-way voice mesh is around 200 kbps upstream.
+Video mesh dies at about four people, and that is the honest limit.
+
+**MLS is an optimisation, not a prerequisite.** When an SFU does land it needs a
+group key for SFrame, and `GroupKeyProvider` (§8.4) already provides one — that
+boundary exists so the implementation can change without the stack changing.
+Megolm rekeys in O(n) pairwise encryptions, which for a fifty-person call is
+fifty Olm operations and takes milliseconds. MLS earns its place when churn is
+high enough that O(log n) matters, and the trigger for reconsidering is churn
+rate, not participant count.
+
+**What must not be simplified.** Signalling travels over the authenticated
+encrypted channel, always. Route SDP through a plaintext or server-mediated path
+and the fingerprint can be swapped in flight, which undoes every layer above it.
+That is where the guarantee lives.
 
 ### 9.1 Transport: relayed by default, P2P by choice
 

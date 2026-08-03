@@ -479,6 +479,23 @@ impl TestClient {
 
 	/// Reads what the server offers without acknowledging any of it, so a test
 	/// can prove unacknowledged mail is retained.
+	/// Every queued frame, whatever it holds.
+	///
+	/// `peek_mail` filters to messages, so it cannot see something that was
+	/// queued but should not have been — which is exactly what a test about
+	/// *not* queueing needs to look at.
+	pub async fn mail_frames(&mut self, within: Duration) -> Vec<ProtocolMessage> {
+		let mut out = Vec::new();
+		while let Some(message) = self.recv(within).await {
+			if let ProtocolMessage::Mail(Mail { frame, .. }) = message
+				&& let Ok(inner) = open_envelope(&frame)
+			{
+				out.push(inner.message);
+			}
+		}
+		out
+	}
+
 	pub async fn peek_mail(&mut self, within: Duration) -> Vec<String> {
 		let mut out = Vec::new();
 		while let Some(message) = self.recv(within).await {

@@ -343,6 +343,16 @@ pub enum ProtocolMessage {
 		channel: String,
 		sequence: u64,
 	},
+	/// Call setup, carried to one device (§9).
+	///
+	/// Routed by the host exactly like a DM and just as opaque to it: the
+	/// payload is Olm-encrypted to the recipient device. **That is the whole of
+	/// a 1:1 call's security.** WebRTC's DTLS-SRTP already encrypts the media
+	/// end to end; what makes it forgeable is unauthenticated signalling, and
+	/// the SDP inside here carries the DTLS fingerprint. Sent over a session
+	/// with a cross-signed device, the media keys are authenticated with no new
+	/// PKI — so a two-person call needs no new cryptography at all.
+	CallSignal(CallSignal),
 	/// Claims a human-usable name on this host (§11.6).
 	///
 	/// The alias is **never** the identity. It is server-controlled and
@@ -485,6 +495,22 @@ pub struct Report {
 	/// report is accepted too and treated as signal for human review rather than
 	/// proof — which is what mainstream platforms do with reports regardless.
 	pub attribution: Option<String>,
+}
+
+/// One step of call setup, addressed to a device.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct CallSignal {
+	pub call: [u8; 16],
+	pub sender: DeviceAddress,
+	pub recipient: DeviceAddress,
+	pub sender_x25519: [u8; 32],
+	/// Olm ciphertext of the signalling payload — an SDP offer or answer, an
+	/// ICE candidate, or a hang-up. Opaque here on purpose: the host routes it
+	/// without learning what is being negotiated, and the shape of that
+	/// negotiation is WebRTC's business rather than the protocol's.
+	pub message_type: usize,
+	pub message: Vec<u8>,
 }
 
 /// A channel's key material, addressed to one device.

@@ -714,6 +714,27 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				let response = community::post(&state, &address, post).await;
 				reply(&state, &address, response.into_message()).await;
 			}
+			ProtocolMessage::CallSignal(signal) => {
+				// Routed, not read — the same treatment as a channel key, and
+				// for the same reason: this host carries a call's setup without
+				// being able to join it.
+				if signal.sender != address {
+					eprintln!(
+						"Discarding a call signal claiming to be from {}",
+						signal.sender
+					);
+					continue;
+				}
+
+				let recipient = signal.recipient;
+				if let Err(e) = route_to(&recipient, bytes.to_vec()).await {
+					// Deliberately *not* queued. Signalling is only meaningful
+					// while both parties are present: a stored offer delivered
+					// an hour later is an invitation to a call nobody is on, and
+					// worse, it would ring.
+					eprintln!("Dropping a call signal for {recipient}, who is {e}");
+				}
+			}
 			ProtocolMessage::ClaimAlias(alias) => {
 				let alias = alias.trim().to_lowercase();
 				let valid = !alias.is_empty()

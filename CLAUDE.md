@@ -361,6 +361,19 @@ was using. The server's `Listening on <addr>` line is both the authoritative
 port and the readiness signal — and its stdout must keep being drained
 afterwards, or the server dies on its next `println!`.
 
+**Assert a mutation applied before believing it passed.** `cargo fmt` reflows
+code, so a scripted find-and-replace written against the pre-format source
+silently matches nothing — and a test that "passes" against an unmutated binary
+says nothing at all. This happened three times here. Compare the file before and
+after and fail loudly if it did not change.
+
+**A mutation that survives usually means the assertion is too weak, not that the
+code is fine.** Two here checked that something did *not* arrive with a zero
+timeout, which passes whether or not it was sent. Assert on *order* — the honest
+message must arrive first — or on a count of what was queued. And check the
+assertion can see the thing it is about: `peek_mail` filtered to messages, so a
+wrongly-queued call signal was invisible to it.
+
 **Verify before committing, by reading the test list and not the summary.** I
 have committed on a failing suite twice in this repo, both times after reading a
 line that said "ok" for one binary. Run the whole thing, grep for `FAILED`, and

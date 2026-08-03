@@ -673,6 +673,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::SubmitPolicy(_) => "policy record",
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
+		ProtocolMessage::CallSignal(_) => "call signal",
 		ProtocolMessage::ClaimAlias(_) => "alias claim",
 		ProtocolMessage::Ephemeral(_) => "ephemeral event",
 		ProtocolMessage::Report(_) => "report",
