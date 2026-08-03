@@ -1,5 +1,6 @@
 pub mod attachment;
 pub mod attestation;
+pub mod call;
 pub mod channelbody;
 pub mod clock;
 pub mod community;

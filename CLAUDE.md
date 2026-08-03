@@ -297,7 +297,12 @@ explicitly — each one closes a specific attack.
     reassignment and an impersonation are indistinguishable from the client. A
     contact link carries the whole identity and consults no directory, which is
     why it is the path to prefer; resolution exists for somebody typing a name.
-29. **Never send plaintext under a Sealed id.** The mode is inside the community
+29. **Call transport needs both parties, and consent is per call** (§9.1). P2P
+    exposes both addresses, so one side cannot trade the other's away, and a
+    preference that carried into the next call would be a security failure in
+    §9.1's own words. A withdrawal is final for that call. `call.rs` holds the
+    rules; the media stack does not exist.
+30. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

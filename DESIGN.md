@@ -103,7 +103,8 @@ to.
 | Moderation and reporting under Sealed | **[built]** reports held for a moderator; unattributed accepted |
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
-| Calls and real-time media | designed, §9 |
+| Calls: transport consent rules | **[built]** `call.rs` — negotiation only |
+| Calls: media, SRTP, SFU, MLS | designed, §9 — not begun |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
 | Presence, typing, read state | **[built]** ephemeral, per-community, never logged |
