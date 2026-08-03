@@ -20,6 +20,14 @@ use veil_protocol::{
 };
 
 const BEAT: Duration = Duration::from_millis(1500);
+/// How long to wait for something that *should* arrive.
+///
+/// Generous on purpose. These tests run alongside every other test binary, each
+/// spawning its own servers and clients, so a fixed short wait is a guess about
+/// machine load rather than about the protocol — and it was wrong often enough
+/// to make the suite flaky. Waiting for a condition with a deadline costs
+/// nothing when things are fast.
+const PATIENCE: Duration = Duration::from_secs(20);
 
 /// Founds a community on a host, returning its id.
 async fn found(founder: &mut TestClient, mode: Mode) -> CommunityId {
@@ -46,6 +54,8 @@ async fn found(founder: &mut TestClient, mode: Mode) -> CommunityId {
 
 /// Reads until the host reports the outcome of a community request.
 async fn expect_result(client: &mut TestClient) -> (CommunityId, bool, String) {
+	let deadline = tokio::time::Instant::now() + PATIENCE;
+
 	loop {
 		match client.recv(BEAT).await {
 			Some(ProtocolMessage::CommunityResult {
@@ -54,20 +64,38 @@ async fn expect_result(client: &mut TestClient) -> (CommunityId, bool, String) {
 				detail,
 			}) => return (community, ok, detail),
 			Some(_) => continue,
+			// Nothing yet is not nothing ever: keep waiting until the deadline,
+			// so a slow machine does not read as a broken server.
+			None if tokio::time::Instant::now() < deadline => continue,
 			None => panic!("the host said nothing about a community request"),
 		}
 	}
 }
 
-/// Reads until a channel delivery arrives, or gives up.
-async fn next_delivery(client: &mut TestClient) -> Option<veil_protocol::ChannelDelivery> {
+/// Reads until a channel delivery arrives, waiting up to `patience`.
+///
+/// Two callers with opposite needs: draining wants to give up quickly on
+/// nothing, and expecting wants to wait. Passing the limit in keeps them from
+/// being the same compromise.
+async fn delivery_within(
+	client: &mut TestClient,
+	patience: Duration,
+) -> Option<veil_protocol::ChannelDelivery> {
+	let deadline = tokio::time::Instant::now() + patience;
+
 	loop {
 		match client.recv(BEAT).await {
 			Some(ProtocolMessage::Delivery(delivery)) => return Some(*delivery),
 			Some(_) => continue,
+			None if tokio::time::Instant::now() < deadline => continue,
 			None => return None,
 		}
 	}
+}
+
+/// A delivery that is expected to arrive.
+async fn next_delivery(client: &mut TestClient) -> Option<veil_protocol::ChannelDelivery> {
+	delivery_within(client, PATIENCE).await
 }
 
 fn post(community: CommunityId, channel: &str, body: &[u8]) -> ProtocolMessage {
@@ -146,7 +174,7 @@ async fn a_stranger_cannot_post_to_a_channel() {
 		.await
 		.unwrap();
 	assert!(
-		next_delivery(&mut alice).await.is_none(),
+		delivery_within(&mut alice, Duration::ZERO).await.is_none(),
 		"the refused message must not have been filed"
 	);
 
@@ -825,7 +853,7 @@ async fn only_a_moderator_can_read_the_report_queue() {
 /// live deliveries are still queued and would otherwise be counted alongside the
 /// backfill — which read as six messages where three were sent.
 async fn history(client: &mut TestClient, id: CommunityId) -> Vec<veil_protocol::ChannelDelivery> {
-	while next_delivery(client).await.is_some() {}
+	while delivery_within(client, Duration::ZERO).await.is_some() {}
 
 	client
 		.send(&ProtocolMessage::Backfill {
@@ -837,8 +865,12 @@ async fn history(client: &mut TestClient, id: CommunityId) -> Vec<veil_protocol:
 		.unwrap();
 
 	let mut history = Vec::new();
-	while let Some(delivery) = next_delivery(client).await {
-		history.push(delivery);
+	// The first is worth waiting for; the rest follow immediately behind it.
+	if let Some(first) = next_delivery(client).await {
+		history.push(first);
+		while let Some(delivery) = delivery_within(client, Duration::ZERO).await {
+			history.push(delivery);
+		}
 	}
 	history
 }

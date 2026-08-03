@@ -331,6 +331,14 @@ feeds a client input in stages, which is what lets a test change policy *while*
 another member is connected — the only way to exercise the push, since a client
 that reconnects would refresh anyway.
 
+**Wait for conditions, do not sleep for guesses.** The whole suite runs many
+test binaries at once, each spawning its own servers and clients, so a fixed
+short wait is a guess about machine load rather than about the protocol. Three
+community tests passed alone and failed under full load for exactly that reason.
+Read with a deadline and keep going on an empty read; keep the impatient variant
+for assertions that something did *not* arrive, or every such test waits out the
+full deadline.
+
 **Rebuild the workspace before running client tests after touching the server.**
 `cargo test -p veil-client` does not rebuild `veil-server`, and the tests drive
 the binary on disk. A mutation check silently passed against a stale server
