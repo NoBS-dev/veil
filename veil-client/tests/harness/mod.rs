@@ -27,15 +27,21 @@ pub struct Fixture {
 
 impl Fixture {
 	pub async fn start() -> Self {
-		let port = free_port().await;
-		let dir =
-			std::env::temp_dir().join(format!("veil-client-test-{}-{port}", std::process::id()));
+		// A counter, not a thread id: threads are reused across tests, so two
+		// fixtures could land on the same directory — and the `remove_dir_all`
+		// below would then wipe the other one's profiles mid-run.
+		static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+		let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let dir = std::env::temp_dir().join(format!(
+			"veil-client-test-{}-{sequence}",
+			std::process::id()
+		));
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::create_dir_all(&dir).unwrap();
 
 		let mut server = Command::new(binary("veil-server"))
 			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
+			.stdout(Stdio::piped())
 			.stderr(Stdio::null())
 			.kill_on_drop(true)
 			.spawn()
@@ -44,33 +50,24 @@ impl Fixture {
 		let db = dir.join("server.db");
 		let mut stdin = server.stdin.take().unwrap();
 		stdin
-			.write_all(format!("127.0.0.1:{port}\n\n{}\n", db.display()).as_bytes())
+			.write_all(format!("127.0.0.1:0\n\n{}\n", db.display()).as_bytes())
 			.await
 			.unwrap();
 		stdin.flush().await.unwrap();
 		drop(stdin);
 
-		let fixture = Self {
+		// The port the OS gave it, read from its own output. Picking one here
+		// and handing it over cannot be made safe — the harness has to release
+		// it before the server can bind, and with every test binary running at
+		// once something else takes it in between often enough to matter.
+		let port = read_bound_port(&mut server).await;
+
+		Self {
 			server,
 			port,
 			dir,
 			extra: std::sync::Mutex::new(Vec::new()),
-		};
-		fixture.await_ready().await;
-		fixture
-	}
-
-	async fn await_ready(&self) {
-		for _ in 0..200 {
-			if tokio::net::TcpStream::connect(("127.0.0.1", self.port))
-				.await
-				.is_ok()
-			{
-				return;
-			}
-			tokio::time::sleep(Duration::from_millis(100)).await;
 		}
-		panic!("server never became ready");
 	}
 
 	/// Runs the client with the given stdin, returning everything it printed.
@@ -170,13 +167,14 @@ impl Fixture {
 	}
 
 	async fn spawn_server(&self, tls: Option<rcgen::CertifiedKey>) -> String {
-		let port = free_port().await;
-		let dir = self.dir.join(format!("server-{port}"));
+		static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+		let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let dir = self.dir.join(format!("server-{sequence}"));
 		std::fs::create_dir_all(&dir).unwrap();
 
 		let mut child = Command::new(binary("veil-server"))
 			.stdin(Stdio::piped())
-			.stdout(Stdio::null())
+			.stdout(Stdio::piped())
 			.stderr(Stdio::null())
 			.kill_on_drop(true)
 			.spawn()
@@ -184,14 +182,14 @@ impl Fixture {
 
 		let db = dir.join("store.db");
 		let answers = match &tls {
-			None => format!("127.0.0.1:{port}\n\n{}\n", db.display()),
+			None => format!("127.0.0.1:0\n\n{}\n", db.display()),
 			Some(certified) => {
 				let cert = dir.join("cert.pem");
 				let key = dir.join("key.pem");
 				std::fs::write(&cert, certified.cert.pem()).unwrap();
 				std::fs::write(&key, certified.key_pair.serialize_pem()).unwrap();
 				format!(
-					"127.0.0.1:{port}\n{}\n{}\n{}\n",
+					"127.0.0.1:0\n{}\n{}\n{}\n",
 					cert.display(),
 					key.display(),
 					db.display()
@@ -204,8 +202,8 @@ impl Fixture {
 		stdin.flush().await.unwrap();
 		drop(stdin);
 
+		let port = read_bound_port(&mut child).await;
 		self.extra.lock().unwrap().push(child);
-		await_port(port).await;
 		format!("127.0.0.1:{port}")
 	}
 
@@ -340,17 +338,32 @@ impl Fixture {
 	}
 }
 
-async fn await_port(port: u16) {
-	for _ in 0..200 {
-		if tokio::net::TcpStream::connect(("127.0.0.1", port))
-			.await
-			.is_ok()
+/// Reads the port the server actually bound, from its own output.
+///
+/// Both the authoritative port and a readiness signal, so this replaces a guess
+/// followed by polling to see whether anything took it.
+async fn read_bound_port(child: &mut Child) -> u16 {
+	use tokio::io::{AsyncBufReadExt, BufReader};
+
+	let stdout = child.stdout.take().expect("server stdout should be piped");
+	let mut lines = BufReader::new(stdout).lines();
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
+		if let Some(address) = line.strip_prefix("Listening on ")
+			&& let Some(port) = address.rsplit(':').next()
+			&& let Ok(port) = port.trim().parse()
 		{
-			return;
+			// Keep reading and discarding the rest. Dropping the reader would
+			// close the pipe, and the server's next `println!` would then fail
+			// on it — which killed the server partway through a test and
+			// surfaced as a reset connection.
+			tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+			return port;
 		}
-		tokio::time::sleep(Duration::from_millis(100)).await;
 	}
-	panic!("server on port {port} never became ready");
+
+	panic!("server never reported a bound port");
 }
 
 /// Small helper: feed stdin, wait, collect stdout and stderr together.

@@ -88,11 +88,19 @@ impl Server {
 		existing: Option<String>,
 		tls: Option<rcgen::CertifiedKey>,
 	) -> Self {
-		let port = match fixed_port {
-			Some(port) => port,
-			None => free_port().await,
-		};
-		let dir = std::env::temp_dir().join(format!("veil-test-{}-{port}", std::process::id()));
+		// Zero means "the OS picks", and the port is read back from the server
+		// once it has bound. Choosing one here and handing it over cannot be
+		// made safe: the harness has to release it before the server can take
+		// it, and with every test binary running at once another one grabs it in
+		// between often enough to matter. That was the cause of failures
+		// scattered across unrelated tests, all surfacing as a refused
+		// connection to a server somebody else was using.
+		let requested = fixed_port.unwrap_or(0);
+		// Named from the process and a counter rather than the port, which is
+		// not known until the server has bound.
+		static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+		let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		let dir = std::env::temp_dir().join(format!("veil-test-{}-{sequence}", std::process::id()));
 		std::fs::create_dir_all(&dir).unwrap();
 		let db = existing.unwrap_or_else(|| dir.join("store.db").to_string_lossy().into_owned());
 
@@ -107,14 +115,14 @@ impl Server {
 		// address, TLS cert (blank), database path
 		let mut stdin = child.stdin.take().unwrap();
 		let answers = match &tls {
-			None => format!("127.0.0.1:{port}\n\n{db}\n"),
+			None => format!("127.0.0.1:{requested}\n\n{db}\n"),
 			Some(certified) => {
 				let cert_path = dir.join("cert.pem");
 				let key_path = dir.join("key.pem");
 				std::fs::write(&cert_path, certified.cert.pem()).unwrap();
 				std::fs::write(&key_path, certified.key_pair.serialize_pem()).unwrap();
 				format!(
-					"127.0.0.1:{port}\n{}\n{}\n{db}\n",
+					"127.0.0.1:{requested}\n{}\n{}\n{db}\n",
 					cert_path.display(),
 					key_path.display()
 				)
@@ -123,6 +131,8 @@ impl Server {
 		stdin.write_all(answers.as_bytes()).await.unwrap();
 		stdin.flush().await.unwrap();
 		drop(stdin);
+
+		let port = read_bound_port(&mut child).await;
 
 		let server = Self {
 			child,
@@ -186,6 +196,36 @@ impl Server {
 	}
 }
 
+/// Reads the port the server actually bound, from its own output.
+///
+/// The server prints `Listening on <addr>` once it is up, which is both the
+/// authoritative port and a readiness signal — so this replaces guessing at a
+/// port and then polling to see whether anything took it.
+async fn read_bound_port(child: &mut Child) -> u16 {
+	use tokio::io::{AsyncBufReadExt, BufReader};
+
+	let stdout = child.stdout.take().expect("server stdout should be piped");
+	let mut lines = BufReader::new(stdout).lines();
+
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+	while let Ok(Ok(Some(line))) = tokio::time::timeout_at(deadline, lines.next_line()).await {
+		if let Some(address) = line.strip_prefix("Listening on ")
+			&& let Some(port) = address.rsplit(':').next()
+			&& let Ok(port) = port.trim().parse()
+		{
+			// Keep reading and discarding the rest. Dropping the reader would
+			// close the pipe, and the server's next `println!` would then fail
+			// on it — which killed the server partway through a test and
+			// surfaced as a reset connection.
+			tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+			return port;
+		}
+	}
+
+	panic!("server never reported a bound port");
+}
+
+#[allow(dead_code)]
 async fn free_port() -> u16 {
 	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
 	let port = listener.local_addr().unwrap().port();

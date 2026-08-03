@@ -331,6 +331,15 @@ feeds a client input in stages, which is what lets a test change policy *while*
 another member is connected — the only way to exercise the push, since a client
 that reconnects would refresh anyway.
 
+**The harness lets the OS pick ports and reads them back from the server's
+output.** Do not go back to choosing a port and handing it over: the harness has
+to release it before the server can bind, and with every test binary running at
+once something else takes it in between. That produced failures scattered across
+unrelated tests, all surfacing as a refused connection to a server another test
+was using. The server's `Listening on <addr>` line is both the authoritative
+port and the readiness signal — and its stdout must keep being drained
+afterwards, or the server dies on its next `println!`.
+
 **Wait for conditions, do not sleep for guesses.** The whole suite runs many
 test binaries at once, each spawning its own servers and clients, so a fixed
 short wait is a guess about machine load rather than about the protocol. Three
