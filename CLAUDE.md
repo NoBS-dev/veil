@@ -345,6 +345,12 @@ was using. The server's `Listening on <addr>` line is both the authoritative
 port and the readiness signal — and its stdout must keep being drained
 afterwards, or the server dies on its next `println!`.
 
+**Verify before committing, by reading the test list and not the summary.** I
+have committed on a failing suite twice in this repo, both times after reading a
+line that said "ok" for one binary. Run the whole thing, grep for `FAILED`, and
+for anything timing-sensitive run it several times — a suite that passes once
+has not been shown to be stable.
+
 **Wait for conditions, do not sleep for guesses.** The whole suite runs many
 test binaries at once, each spawning its own servers and clients, so a fixed
 short wait is a guess about machine load rather than about the protocol. Three

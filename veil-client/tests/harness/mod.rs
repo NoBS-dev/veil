@@ -280,19 +280,11 @@ impl Fixture {
 					let _ = ws.next().await; // Authenticate
 					let _ = ws.next().await; // the destination it asked for
 
-					// From here the client believes it is speaking TLS to the
-					// destination. It is speaking TLS to us.
-					let Ok(inner) = tokio_rustls::TlsAcceptor::from(tls_config)
-						.accept(WsBytes::new(ws))
-						.await
-					else {
-						return;
-					};
-					let Ok(mut client) = tokio_tungstenite::accept_async(inner).await else {
-						return;
-					};
-
-					// And we hold the real session with the destination.
+					// The real session with the destination, opened *before* the
+					// client's inner handshake rather than after it. Doing it
+					// after made the test race under load: the client would get
+					// an EOF while this connected, and fail for a reason other
+					// than the one under test.
 					let connector = tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
 						rustls::ClientConfig::builder()
 							.dangerous()
@@ -307,6 +299,18 @@ impl Fixture {
 					)
 					.await
 					else {
+						return;
+					};
+
+					// From here the client believes it is speaking TLS to the
+					// destination. It is speaking TLS to us.
+					let Ok(inner) = tokio_rustls::TlsAcceptor::from(tls_config)
+						.accept(WsBytes::new(ws))
+						.await
+					else {
+						return;
+					};
+					let Ok(mut client) = tokio_tungstenite::accept_async(inner).await else {
 						return;
 					};
 
