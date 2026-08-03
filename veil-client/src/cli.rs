@@ -6,7 +6,44 @@ use std::{
 	sync::Arc,
 };
 use tokio::sync::Mutex;
-use veil_protocol::{display_key, identity::UserId, safety_number};
+use veil_protocol::{
+	community::{CommunityId, Mode, Role},
+	display_key,
+	identity::UserId,
+	safety_number,
+};
+
+/// Asks a question on the terminal.
+///
+/// **Lives here rather than beside the commands**, which is the whole of the
+/// outbound §17 change: a command that reads stdin cannot be driven by a view,
+/// tested without a pipe, or translated. The commands take parameters; this is
+/// where a person is asked for them.
+fn ask(question: &str) -> Result<String> {
+	print!("{question}");
+	io::stdout().flush()?;
+	let mut input = String::new();
+	io::stdin().read_line(&mut input)?;
+	Ok(input.trim().to_owned())
+}
+
+/// Runs a command and renders whatever it reported.
+///
+/// The same rendering the receive path gets, because they are the same events.
+fn show(outcome: Result<Vec<crate::events::ClientEvent>>) {
+	match outcome {
+		Ok(events) => {
+			for event in events {
+				if event.is_diagnostic() {
+					eprintln!("{}", event.render());
+				} else {
+					println!("{}", event.render());
+				}
+			}
+		}
+		Err(e) => eprintln!("{e:#}"),
+	}
+}
 
 pub async fn cli(
 	prompt: &str,
@@ -54,8 +91,24 @@ pub async fn cli(
 			"msg" => {
 				println!("{:?}", list_clients(url).await?);
 
-				if let Err(e) = messaging::send(&mut *write.lock().await, &mut state, url).await {
-					eprintln!("Send message error: {e:#}");
+				match (
+					ask("Enter target device (<user-id>/<device-id>[@host]): "),
+					ask("Enter message: "),
+				) {
+					(Ok(target), Ok(text)) => {
+						let mut reported = Vec::new();
+						let outcome = messaging::send(
+							&mut *write.lock().await,
+							&mut state,
+							url,
+							&target,
+							&text,
+							&mut reported,
+						)
+						.await;
+						show(outcome.map(|()| reported));
+					}
+					_ => eprintln!("Could not read that."),
 				}
 			}
 			"devices" => {
@@ -86,85 +139,186 @@ pub async fn cli(
 			}
 			// ---- communities (§7, §8) ----------------------------------
 			"found" => {
-				if let Err(e) = communities::found(&write, &mut state).await {
-					eprintln!("Could not found a community: {e:#}");
+				let mode = match ask("Mode — (s)ealed end-to-end, or (o)pen server-readable: ")
+					.map(|m| m.to_lowercase())
+				{
+					Ok(m) if m == "s" || m == "sealed" => Some(Mode::Sealed),
+					Ok(m) if m == "o" || m == "open" => Some(Mode::Open),
+					_ => None,
+				};
+
+				match mode {
+					Some(mode) => show(communities::found(&write, &mut state, mode).await),
+					None => eprintln!("That is not a mode."),
 				}
 			}
-			"join" => {
-				if let Err(e) = communities::join(&write, &state).await {
-					eprintln!("Could not join: {e:#}");
+			"join" => match ask("Community id, or an invite: ") {
+				Ok(entered) => show(communities::join(&write, &state, &entered).await),
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"say" => match (ask("Community id: "), ask("Channel: "), ask("Message: ")) {
+				(Ok(id), Ok(channel), Ok(body)) => match CommunityId::parse(&id) {
+					Ok(id) => {
+						show(communities::say(&write, &mut state, url, id, &channel, &body).await)
+					}
+					Err(e) => eprintln!("{e:#}"),
+				},
+				_ => eprintln!("Could not read that."),
+			},
+			"readers" => match (ask("Community id: "), ask("Channel: ")) {
+				(Ok(id), Ok(channel)) => match CommunityId::parse(&id) {
+					Ok(id) => {
+						let mut readers = Vec::new();
+						loop {
+							match ask("Reader user id (blank when done): ") {
+								Ok(entry) if entry.is_empty() => break,
+								Ok(entry) => match UserId::parse(&entry) {
+									Ok(user) => readers.push(user),
+									Err(e) => eprintln!("{e:#}"),
+								},
+								Err(e) => {
+									eprintln!("{e:#}");
+									break;
+								}
+							}
+						}
+						show(communities::readers(&write, &state, id, &channel, readers).await);
+					}
+					Err(e) => eprintln!("{e:#}"),
+				},
+				_ => eprintln!("Could not read that."),
+			},
+			"alias" => match ask("Alias to claim: ") {
+				Ok(name) => show(communities::alias(&write, &state, &name).await),
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"contact" => show(communities::contact(&state)),
+			"lookup" => match ask("Contact link, or an address (name@host): ") {
+				Ok(entered) => show(communities::lookup(&mut state, &entered).await),
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"search" => match ask("Search for: ") {
+				Ok(query) => show(communities::search(&state, &query)),
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"channels" => match ask("Community id: ").and_then(|id| CommunityId::parse(&id)) {
+				Ok(id) => {
+					// Listing first: declaring replaces the set, so seeing what
+					// is there is part of deciding what to send.
+					for event in communities::list_channels(&state, id) {
+						println!("{}", event.render());
+					}
+
+					let mut channels = Vec::new();
+					loop {
+						match ask("Channel name (blank when done): ") {
+							Ok(name) if name.is_empty() => break,
+							Ok(name) => match ask("  topic: ") {
+								Ok(topic) => channels
+									.push(veil_protocol::community::ChannelSpec { name, topic }),
+								Err(e) => {
+									eprintln!("{e:#}");
+									break;
+								}
+							},
+							Err(e) => {
+								eprintln!("{e:#}");
+								break;
+							}
+						}
+					}
+
+					show(communities::declare_channels(&write, &state, id, channels).await);
 				}
-			}
-			"say" => {
-				if let Err(e) = communities::say(&write, &mut state, url).await {
-					eprintln!("Could not post: {e:#}");
-				}
-			}
-			"readers" => {
-				if let Err(e) = communities::readers(&write, &state).await {
-					eprintln!("Could not set readers: {e:#}");
-				}
-			}
-			"alias" => {
-				if let Err(e) = communities::alias(&write, &state).await {
-					eprintln!("Could not claim an alias: {e:#}");
-				}
-			}
-			"contact" => {
-				if let Err(e) = communities::contact(&state) {
-					eprintln!("Could not build a contact link: {e:#}");
-				}
-			}
-			"lookup" => {
-				if let Err(e) = communities::lookup(&mut state).await {
-					eprintln!("Could not look that up: {e:#}");
-				}
-			}
-			"search" => {
-				if let Err(e) = communities::search(&state) {
-					eprintln!("Could not search: {e:#}");
-				}
-			}
-			"channels" => {
-				if let Err(e) = communities::channels(&write, &state).await {
-					eprintln!("Could not declare channels: {e:#}");
-				}
-			}
-			"watch" => {
-				if let Err(e) = communities::watch(&write, &state).await {
-					eprintln!("Could not announce presence: {e:#}");
-				}
-			}
-			"queue" => {
-				if let Err(e) = communities::queue(&write, &state).await {
-					eprintln!("Could not read the queue: {e:#}");
-				}
-			}
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"watch" => match ask("Community id: ").and_then(|id| CommunityId::parse(&id)) {
+				Ok(id) => show(communities::watch(&write, &state, id).await),
+				Err(e) => eprintln!("{e:#}"),
+			},
+			"queue" => match ask("Community id: ").and_then(|id| CommunityId::parse(&id)) {
+				Ok(id) => show(communities::queue(&write, &state, id).await),
+				Err(e) => eprintln!("{e:#}"),
+			},
 			"report" => {
-				if let Err(e) = communities::report(&write, &state).await {
-					eprintln!("Could not report: {e:#}");
+				match (
+					ask("Community id: "),
+					ask("Channel: "),
+					ask("Message number: "),
+					ask("What was said: "),
+					ask("Why you are reporting it: "),
+				) {
+					(Ok(id), Ok(channel), Ok(sequence), Ok(quoted), Ok(reason)) => {
+						match (CommunityId::parse(&id), sequence.parse::<u64>()) {
+							(Ok(id), Ok(sequence)) => show(
+								communities::report(
+									&write, &state, id, &channel, sequence, &quoted, &reason,
+								)
+								.await,
+							),
+							_ => eprintln!("Could not read that."),
+						}
+					}
+					_ => eprintln!("Could not read that."),
 				}
 			}
-			"attach" => {
-				if let Err(e) = communities::attach(&write, &mut state, url).await {
-					eprintln!("Could not attach: {e:#}");
-				}
-			}
+			"attach" => match (ask("Community id: "), ask("Channel: "), ask("File path: ")) {
+				(Ok(id), Ok(channel), Ok(path)) => match CommunityId::parse(&id) {
+					Ok(id) => show(
+						communities::attach(&write, &mut state, url, id, &channel, &path).await,
+					),
+					Err(e) => eprintln!("{e:#}"),
+				},
+				_ => eprintln!("Could not read that."),
+			},
 			"delete" => {
-				if let Err(e) = communities::delete(&write, &state).await {
-					eprintln!("Could not delete: {e:#}");
+				match (
+					ask("Community id: "),
+					ask("Channel: "),
+					ask("Message number: "),
+				) {
+					(Ok(id), Ok(channel), Ok(sequence)) => {
+						match (CommunityId::parse(&id), sequence.parse::<u64>()) {
+							(Ok(id), Ok(sequence)) => show(
+								communities::delete(&write, &state, id, &channel, sequence).await,
+							),
+							_ => eprintln!("Could not read that."),
+						}
+					}
+					_ => eprintln!("Could not read that."),
 				}
 			}
 			"role" => {
-				if let Err(e) = communities::role(&write, &state).await {
-					eprintln!("Could not set a role: {e:#}");
+				match (
+					ask("Community id: "),
+					ask("User id: "),
+					ask("Role — (b)anned, (m)ember, (mod)erator: ").map(|r| r.to_lowercase()),
+				) {
+					(Ok(id), Ok(user), Ok(role)) => {
+						let role = match role.as_str() {
+							"b" | "banned" => Some(Role::Banned),
+							"m" | "member" => Some(Role::Member),
+							"mod" | "moderator" => Some(Role::Moderator),
+							_ => None,
+						};
+
+						match (CommunityId::parse(&id), UserId::parse(&user), role) {
+							(Ok(id), Ok(user), Some(role)) => {
+								show(communities::role(&write, &state, id, user, role).await)
+							}
+							_ => eprintln!("Could not read that."),
+						}
+					}
+					_ => eprintln!("Could not read that."),
 				}
 			}
-			"history" => {
-				if let Err(e) = communities::history(&write, &state).await {
-					eprintln!("Could not ask for history: {e:#}");
-				}
-			}
+			"history" => match (ask("Community id: "), ask("Channel: ")) {
+				(Ok(id), Ok(channel)) => match CommunityId::parse(&id) {
+					Ok(id) => show(communities::history(&write, &state, id, &channel).await),
+					Err(e) => eprintln!("{e:#}"),
+				},
+				_ => eprintln!("Could not read that."),
+			},
 			"safety" => {
 				if let Err(e) = show_safety_number(&mut state) {
 					eprintln!("Safety number error: {e:#}");
@@ -191,7 +345,11 @@ async fn show_devices(state: &mut State, url: &str) -> Result<()> {
 	io::stdin().read_line(&mut input)?;
 	let user = UserId::parse(input.trim())?;
 
-	let (keys, devices) = messaging::fetch_device_list(&user, url).await?;
+	let mut reported = Vec::new();
+	let (keys, devices) = messaging::fetch_device_list(&user, url, &mut reported).await?;
+	for event in &reported {
+		eprintln!("{}", event.render());
+	}
 
 	if devices.is_empty() {
 		println!("No devices for {user} survived verification.");

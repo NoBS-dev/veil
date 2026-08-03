@@ -398,9 +398,13 @@ which is what made the split hard to start. Use the `notice!` / `say!` macros in
 view would need to act on. Events carry values, never formatted strings: a
 variant holding `"3 members"` puts the formatting decision back inside.
 
-The outbound half — `cli.rs` and `communities.rs` prompts — still prints
-directly. That is command output rather than an event stream, and it is the
-remaining piece of §17.
+**Commands take parameters and return `Vec<ClientEvent>`.** They do not prompt
+and do not print — a function that reads stdin cannot be driven by a view, tested
+without a pipe, or translated. Every prompt lives in `cli.rs`, which is the
+interface and is allowed to print.
+
+Both directions use the same event type deliberately: a front end wants one
+timeline, not two streams to merge.
 
 ## Working agreements
 

@@ -83,6 +83,40 @@ pub enum ClientEvent {
 	/// How many one-time keys the host still holds for us.
 	OneTimeKeys { remaining: u16 },
 
+	/// A community was founded here, with the invite to share it.
+	Founded {
+		community: CommunityId,
+		invite: String,
+		/// Whether the host can read what is posted.
+		host_readable: bool,
+	},
+	/// This device's own contact link (§11.6).
+	ContactLink { link: String },
+	/// An identity was resolved, and how.
+	Resolved {
+		user: UserId,
+		host: String,
+		/// A link carries the identity, so nothing was asked and nothing could
+		/// have answered wrongly. A typed address was answered by a host.
+		from_link: bool,
+	},
+	/// What a local search found (§10.4).
+	SearchResults { hits: Vec<SearchHit> },
+	/// The channels a community has declared.
+	Channels { listing: Vec<(String, String)> },
+	/// A file was uploaded and posted.
+	Attached {
+		filename: String,
+		size: u64,
+		encrypted: bool,
+	},
+	/// Key material was distributed for a channel (§8.4).
+	KeysDistributed {
+		channel: String,
+		recipients: usize,
+		cause: String,
+	},
+
 	/// Something a person should know about but which is not a message.
 	///
 	/// Kept as a single variant rather than one per cause: these are for
@@ -106,6 +140,15 @@ pub enum ChannelContent {
 	Unreadable {
 		why: String,
 	},
+}
+
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+	pub community: Option<CommunityId>,
+	pub channel: String,
+	pub sender: String,
+	pub sequence: Option<u64>,
+	pub text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +267,89 @@ impl ClientEvent {
 			}
 
 			Self::OneTimeKeys { remaining } => format!("We have {remaining} OTKs left."),
+
+			Self::Founded {
+				community,
+				invite,
+				host_readable,
+			} => {
+				let mut lines = vec![
+					format!("Community id: {community}"),
+					format!("Invite: {invite}"),
+				];
+				if *host_readable {
+					lines.push(
+						"Open: the host can read everything sent here. That is what makes \
+						 search, moderation and bots possible, and it is the right default \
+						 for a large community — but say so plainly to anyone joining."
+							.to_owned(),
+					);
+				}
+				lines.join("\n")
+			}
+
+			Self::ContactLink { link } => link.clone(),
+
+			Self::Resolved {
+				user,
+				host,
+				from_link,
+			} => {
+				let how = if *from_link {
+					format!(
+						"{user} — from the link itself, so no server was asked and none \
+						 could have answered wrongly."
+					)
+				} else {
+					format!(
+						"{user}\nResolved by that host and pinned. Verify with `safety` \
+						 before trusting it — a name is not an identity."
+					)
+				};
+				format!("{how}\nTheir mail goes to {host}.")
+			}
+
+			Self::SearchResults { hits } if hits.is_empty() => {
+				"Nothing found. This device searches only what it has received.".to_owned()
+			}
+			Self::SearchResults { hits } => hits
+				.iter()
+				.map(|hit| match (hit.community, hit.sequence) {
+					(Some(community), Some(sequence)) => {
+						format!("[{community}#{} {sequence}] {}", hit.channel, hit.text)
+					}
+					_ => format!("[{}] {}", hit.sender, hit.text),
+				})
+				.collect::<Vec<_>>()
+				.join("\n"),
+
+			Self::Channels { listing } if listing.is_empty() => {
+				"No channels declared yet — any name is currently accepted.".to_owned()
+			}
+			Self::Channels { listing } => listing
+				.iter()
+				.map(|(name, topic)| format!("  #{name} — {topic}"))
+				.collect::<Vec<_>>()
+				.join("\n"),
+
+			Self::Attached {
+				filename,
+				size,
+				encrypted,
+			} => format!(
+				"Uploading {filename} ({size} bytes{}).",
+				if *encrypted {
+					", encrypted"
+				} else {
+					", readable by the host"
+				}
+			),
+
+			Self::KeysDistributed {
+				channel,
+				recipients,
+				cause,
+			} => format!("Distributing {channel} keys to {recipients} device(s) ({cause})."),
 
 			Self::Notice { severity, text } => match severity {
 				Severity::Info => text.clone(),

@@ -1,10 +1,10 @@
 use crate::{
 	WriteStream,
+	events::ClientEvent,
 	state::{PeerSession, State},
 };
 use anyhow::Result;
 use futures_util::SinkExt;
-use std::io::{self, Write};
 use tungstenite::{Bytes, Message};
 use veil_protocol::{
 	EncryptedMessage, Envelope, ProtocolMessage,
@@ -88,12 +88,13 @@ pub async fn ensure_session(
 	state: &mut State,
 	target: DeviceAddress,
 	directory: &str,
+	reported: &mut Vec<ClientEvent>,
 ) -> Result<()> {
 	if state.peers.contains_key(&target) {
 		return Ok(());
 	}
 
-	let (_, devices) = fetch_device_list(&target.user, directory).await?;
+	let (_, devices) = fetch_device_list(&target.user, directory, reported).await?;
 
 	let device = devices
 		.iter()
@@ -124,11 +125,11 @@ pub async fn ensure_session(
 	// The device provably belongs to that user. Whether we know *who* that user
 	// is remains a separate question (§5.4).
 	if !state.is_verified(&target.user) {
-		eprintln!(
-			"warning: {} is not verified. The device is genuinely theirs, but nothing yet \
+		reported.push(ClientEvent::warn(format!(
+			"{} is not verified. The device is genuinely theirs, but nothing yet \
 			 confirms who they are — run `safety` to compare numbers.",
 			target.user
-		);
+		)));
 	}
 
 	let session = state.account.create_outbound_session(
@@ -152,33 +153,29 @@ pub async fn ensure_session(
 	);
 
 	if let Err(e) = state.save_to_keyring() {
-		eprintln!("Save state failed: {e:?}");
+		reported.push(ClientEvent::warn(format!("Save state failed: {e:?}")));
 	}
 
 	Ok(())
 }
 
-pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Result<()> {
-	print!("Enter target device (<user-id>/<device-id>[@host]): ");
-	io::stdout().flush()?;
-
+pub async fn send(
+	write: &mut WriteStream,
+	state: &mut State,
+	url: &str,
+	entered: &str,
+	text: &str,
+	reported: &mut Vec<ClientEvent>,
+) -> Result<()> {
 	let Target {
 		address: target,
 		host: recipient_host,
-	} = {
-		let mut input = String::new();
-		io::stdin().read_line(&mut input)?;
-		parse_address(&input)?
-	};
+	} = parse_address(entered)?;
 	let directory = directory_base(url, &recipient_host);
 
-	ensure_session(state, target, &directory).await?;
+	ensure_session(state, target, &directory, reported).await?;
 
-	print!("Enter message: ");
-	io::stdout().flush()?;
-	let mut message = String::new();
-	io::stdin().read_line(&mut message)?;
-	let message = message.trim();
+	let message = text;
 
 	let (msg_type, ciphertext) = {
 		let peer = match state.peers.get_mut(&target) {
@@ -190,7 +187,7 @@ pub async fn send(write: &mut WriteStream, state: &mut State, url: &str) -> Resu
 	};
 
 	if let Err(e) = state.save_to_keyring() {
-		eprintln!("Save state failed: {e:?}");
+		reported.push(ClientEvent::warn(format!("Save state failed: {e:?}")));
 	}
 
 	let signed_bytes = {
@@ -281,6 +278,7 @@ pub async fn fetch_prekey_bundle(
 pub async fn fetch_device_list(
 	user: &UserId,
 	url: &str,
+	reported: &mut Vec<ClientEvent>,
 ) -> Result<(CrossSigningPublic, Vec<Device>)> {
 	#[derive(serde::Deserialize)]
 	struct Response {
@@ -298,12 +296,14 @@ pub async fn fetch_device_list(
 
 	let verified = response.keys.verify_device_list(user, &response.devices)?;
 
+	// Worth telling somebody about rather than silently dropping: a host serving
+	// devices that do not verify is either broken or trying something, and the
+	// two are not distinguishable from here.
 	if verified.len() != response.devices.len() {
-		eprintln!(
-			"warning: {} of {}'s advertised devices failed verification and were discarded",
+		reported.push(ClientEvent::warn(format!(
+			"{} of {user}'s advertised devices failed verification and were discarded",
 			response.devices.len() - verified.len(),
-			user
-		);
+		)));
 	}
 
 	Ok((response.keys, verified))

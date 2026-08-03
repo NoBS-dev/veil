@@ -1,4 +1,13 @@
-//! Client commands for communities — `DESIGN.md` §7, §8.
+//! Community commands — `DESIGN.md` §7, §8, and the outbound half of §17.
+//!
+//! **These take parameters and return events. They do not prompt and they do not
+//! print.** That is what makes them callable by something other than a terminal:
+//! a Qt front end has a text field, not a stdin, and a function that reads one
+//! cannot be driven by a view, tested without a pipe, or translated.
+//!
+//! Results come back as [`ClientEvent`], the same type the receive path emits.
+//! One stream of things that happened, rather than two — which is what a
+//! front end wants and what the CLI in `cli.rs` renders.
 //!
 //! Thin on purpose. The host owns ordering and membership, and everything it
 //! says about a community is independently checkable — the id is a hash of the
@@ -18,14 +27,10 @@
 //! tells everyone else the content is protected, so failing to encrypt has to
 //! fail the send.
 
-use crate::{WriteStream, messaging, state::State};
+use crate::{WriteStream, events::ClientEvent, messaging, state::State};
 use anyhow::Result;
 use futures_util::SinkExt;
-use std::{
-	collections::BTreeSet,
-	io::{self, Write as _},
-	sync::Arc,
-};
+use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::Mutex;
 use tungstenite::{Bytes, protocol::Message};
 use veil_protocol::{
@@ -37,14 +42,6 @@ use veil_protocol::{
 	identity::DeviceAddress,
 	invite::Invite,
 };
-
-fn ask(question: &str) -> Result<String> {
-	print!("{question}");
-	io::stdout().flush()?;
-	let mut input = String::new();
-	io::stdin().read_line(&mut input)?;
-	Ok(input.trim().to_owned())
-}
 
 async fn send(
 	write: &Arc<Mutex<WriteStream>>,
@@ -67,24 +64,11 @@ async fn send(
 /// may later transition to Open through the policy chain (§7.3) — one way, and
 /// not retroactive — but nothing can turn Open into Sealed, because the history
 /// was already readable.
-pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result<()> {
-	let mode = match ask("Mode — (s)ealed end-to-end, or (o)pen server-readable: ")?
-		.to_lowercase()
-		.as_str()
-	{
-		"s" | "sealed" => Mode::Sealed,
-		"o" | "open" => Mode::Open,
-		other => anyhow::bail!("'{other}' is not a mode"),
-	};
-
-	if mode == Mode::Open {
-		println!(
-			"Open: the host can read everything sent here. That is what makes search,\n\
-			 moderation and bots possible, and it is the right default for a large\n\
-			 community — but say so plainly to anyone joining."
-		);
-	}
-
+pub async fn found(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	mode: Mode,
+) -> Result<Vec<ClientEvent>> {
 	// One controller — this user — with a threshold of one. §12.4 wants k-of-n
 	// so a community outlives whoever founded it; adding controllers is a
 	// policy record, which is the next thing to build here.
@@ -96,11 +80,8 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 		veil_protocol::now_ms()?,
 	)?;
 
-	println!("Community id: {}", root.id());
-	match invite(state, root.id()) {
-		Ok(invite) => println!("Invite: {invite}"),
-		Err(e) => eprintln!("Could not build an invite: {e:#}"),
-	}
+	let id = root.id();
+	let link = invite(state, id).unwrap_or_else(|e| format!("<unavailable: {e:#}>"));
 
 	// Recorded *and persisted* before it is sent: we built this root, so we know
 	// its mode without having to ask the host. Keeping it only in memory meant
@@ -114,7 +95,13 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 		state,
 		ProtocolMessage::CreateCommunity(Box::new(root)),
 	)
-	.await
+	.await?;
+
+	Ok(vec![ClientEvent::Founded {
+		community: id,
+		invite: link,
+		host_readable: mode == Mode::Open,
+	}])
 }
 
 /// Joins by community id, or by an invite.
@@ -124,10 +111,12 @@ pub async fn found(write: &Arc<Mutex<WriteStream>>, state: &mut State) -> Result
 /// present, so a relay cannot quietly send a newcomer somewhere else (§3.2).
 /// Joining by bare id on a host already pinned is equivalent; joining by bare id
 /// on a new host is a blind pin, and the client says so when it happens.
-pub async fn join(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let entered = ask("Community id, or an invite: ")?;
-
-	let id = match Invite::parse(&entered) {
+pub async fn join(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	entered: &str,
+) -> Result<Vec<ClientEvent>> {
+	let id = match Invite::parse(entered) {
 		Ok(invite) => {
 			if invite.host_key != state.server_identity.unwrap_or(invite.host_key) {
 				anyhow::bail!(
@@ -141,10 +130,11 @@ pub async fn join(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> 
 			invite.community
 		}
 		// Not an invite, so treat it as a bare id.
-		Err(_) => CommunityId::parse(&entered)?,
+		Err(_) => CommunityId::parse(entered)?,
 	};
 
-	send(write, state, ProtocolMessage::JoinCommunity(id)).await
+	send(write, state, ProtocolMessage::JoinCommunity(id)).await?;
+	Ok(Vec::new())
 }
 
 /// Prints an invite for a community on this host.
@@ -168,10 +158,11 @@ pub async fn say(
 	write: &Arc<Mutex<WriteStream>>,
 	state: &mut State,
 	directory: &str,
-) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-	let body = ask("Message: ")?;
+	id: CommunityId,
+	channel: &str,
+	body: &str,
+) -> Result<Vec<ClientEvent>> {
+	let mut reported = Vec::new();
 
 	// The mode is not asked for and not taken from the host: it is inside the
 	// id. Whatever the host says about this community, it cannot make an id mean
@@ -187,7 +178,7 @@ pub async fn say(
 
 	let body = match state.community_mode(&id) {
 		Some(Mode::Sealed) => {
-			seal_for_channel(write, state, directory, &id, &channel, &body).await?
+			seal_for_channel(write, state, directory, &id, channel, &body, &mut reported).await?
 		}
 		Some(Mode::Open) => body,
 		// Not knowing is not the same as Open. A community we have not verified
@@ -204,13 +195,15 @@ pub async fn say(
 		state,
 		ProtocolMessage::Post(ChannelPost {
 			community: id,
-			channel,
+			channel: channel.to_owned(),
 			body,
 			nonce: veil_protocol::message::random_nonce(),
 			origin_ts: veil_protocol::now_ms()?,
 		}),
 	)
-	.await
+	.await?;
+
+	Ok(reported)
 }
 
 /// Encrypts for a Sealed channel, delivering key material if the readership
@@ -226,6 +219,7 @@ async fn seal_for_channel(
 	id: &CommunityId,
 	channel: &str,
 	plaintext: &[u8],
+	reported: &mut Vec<ClientEvent>,
 ) -> Result<Vec<u8>> {
 	let community = state.community_state(id)?;
 
@@ -244,7 +238,7 @@ async fn seal_for_channel(
 	// than handed a key.
 	let mut devices = BTreeSet::new();
 	for reader in readers {
-		let (_, list) = messaging::fetch_device_list(reader, directory).await?;
+		let (_, list) = messaging::fetch_device_list(reader, directory, reported).await?;
 		for device in list {
 			devices.insert(DeviceAddress::new(*reader, device.device_id));
 		}
@@ -266,11 +260,11 @@ async fn seal_for_channel(
 	)?;
 
 	if let Some((cause, delivery)) = delivery {
-		println!(
-			"Distributing {}#{channel} keys to {} device(s) ({cause:?}).",
-			id,
-			delivery.recipients.len()
-		);
+		reported.push(ClientEvent::KeysDistributed {
+			channel: format!("{id}#{channel}"),
+			recipients: delivery.recipients.len(),
+			cause: format!("{cause:?}"),
+		});
 
 		for recipient in &delivery.recipients {
 			// Every device but this one. Our *other* devices are readers like
@@ -288,13 +282,16 @@ async fn seal_for_channel(
 				&channel_id,
 				*recipient,
 				&delivery.payload,
+				reported,
 			)
 			.await
 			{
 				// One unreachable device must not stop the rest. It will get
 				// the key when it next appears, because the host queues an
 				// undeliverable frame like any other.
-				eprintln!("Could not deliver a key to {recipient}: {e:#}");
+				reported.push(ClientEvent::warn(format!(
+					"Could not deliver a key to {recipient}: {e:#}"
+				)));
 			}
 		}
 	}
@@ -314,8 +311,11 @@ async fn deliver_key(
 	channel: &ChannelId,
 	recipient: DeviceAddress,
 	payload: &[u8],
+	reported: &mut Vec<ClientEvent>,
 ) -> Result<()> {
-	messaging::ensure_session(state, recipient, directory).await?;
+	// Any warning raised while opening the session belongs to the caller's
+	// report, not to a second channel nobody is reading.
+	messaging::ensure_session(state, recipient, directory, reported).await?;
 
 	let (message_type, message) = {
 		let peer = state
@@ -346,29 +346,28 @@ async fn deliver_key(
 /// Signed rather than host-side so a host cannot invent a channel or rename one
 /// — the same reasoning as readership (§8.5), applied to the shape of the
 /// community rather than to who can read it.
-pub async fn channels(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
+pub fn list_channels(state: &State, id: CommunityId) -> Vec<ClientEvent> {
+	let listing = state
+		.community_state(&id)
+		.map(|community| {
+			community
+				.channels
+				.iter()
+				.map(|c| (c.name.clone(), c.topic.clone()))
+				.collect()
+		})
+		.unwrap_or_default();
 
-	if let Ok(community) = state.community_state(&id) {
-		if community.channels.is_empty() {
-			println!("No channels declared yet — any name is currently accepted.");
-		} else {
-			for channel in &community.channels {
-				println!("  #{} — {}", channel.name, channel.topic);
-			}
-		}
-	}
+	vec![ClientEvent::Channels { listing }]
+}
 
-	let mut channels = Vec::new();
-	loop {
-		let name = ask("Channel name (blank when done): ")?;
-		if name.is_empty() {
-			break;
-		}
-		let topic = ask("  topic: ")?;
-		channels.push(veil_protocol::community::ChannelSpec { name, topic });
-	}
-
+/// Declares the set, replacing whatever was there.
+pub async fn declare_channels(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	channels: Vec<veil_protocol::community::ChannelSpec>,
+) -> Result<Vec<ClientEvent>> {
 	if channels.is_empty() {
 		anyhow::bail!("declaring an empty set would leave the community with no channels");
 	}
@@ -388,16 +387,19 @@ pub async fn channels(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<
 			&[(0, state.cross_signing().master_secret())],
 		))),
 	)
-	.await
+	.await?;
+	Ok(Vec::new())
 }
 
 /// Says this device is here and watching (§10.3).
 ///
 /// Membership of the subscription *is* the presence signal — there is no
 /// separate status to set, and none of it enters the log.
-pub async fn watch(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-
+pub async fn watch(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+) -> Result<Vec<ClientEvent>> {
 	send(
 		write,
 		state,
@@ -410,7 +412,8 @@ pub async fn watch(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()>
 			who: None,
 		}),
 	)
-	.await
+	.await?;
+	Ok(Vec::new())
 }
 
 /// Reports a message to the community's moderators (§7.6).
@@ -421,18 +424,18 @@ pub async fn watch(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()>
 /// one message's index decrypts everything from there forward, so proving
 /// authorship discloses more than the message being reported. §7.6 accepts
 /// unattributed reports for exactly that reason and treats them as signal.
-pub async fn report(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-	let sequence: u64 = ask("Message number: ")?.parse()?;
-	let quoted = ask("What was said: ")?;
-	let reason = ask("Why you are reporting it: ")?;
-
-	println!(
-		"Filing without cryptographic attribution. Proving who wrote it would also \
-		 reveal everything sent after it in the same session, so it is not done by \
-		 default."
-	);
+pub async fn report(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	channel: &str,
+	sequence: u64,
+	quoted: &str,
+	reason: &str,
+) -> Result<Vec<ClientEvent>> {
+	let channel = channel.to_owned();
+	let quoted = quoted.to_owned();
+	let reason = reason.to_owned();
 
 	send(
 		write,
@@ -446,35 +449,41 @@ pub async fn report(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()
 			attribution: None,
 		})),
 	)
-	.await
+	.await?;
+
+	Ok(vec![ClientEvent::info(
+		"Filing without cryptographic attribution. Proving who wrote it would also \
+		 reveal everything sent after it in the same session, so it is not done by \
+		 default.",
+	)])
 }
 
 /// Claims a human-usable name on this host (§11.6).
-pub async fn alias(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let name = ask("Alias to claim: ")?;
+pub async fn alias(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	name: &str,
+) -> Result<Vec<ClientEvent>> {
+	send(write, state, ProtocolMessage::ClaimAlias(name.to_owned())).await?;
 
-	println!(
+	Ok(vec![ClientEvent::info(
 		"An alias is server-controlled and re-assignable. It is a convenience, not \
-		 your identity — share the contact link instead when it matters."
-	);
-
-	send(write, state, ProtocolMessage::ClaimAlias(name)).await
+		 your identity — share the contact link instead when it matters.",
+	)])
 }
 
 /// Prints this device's contact link.
 ///
 /// The safe way to be found: it carries the whole identity, so nothing is looked
 /// up and nothing can be substituted (§11.6).
-pub fn contact(state: &State) -> Result<()> {
-	println!(
-		"{}",
-		crate::contacts::Contact {
+pub fn contact(state: &State) -> Result<Vec<ClientEvent>> {
+	Ok(vec![ClientEvent::ContactLink {
+		link: crate::contacts::Contact {
 			user: state.user_id,
 			host: state.ip_and_port.to_string(),
 		}
-		.encode()
-	);
-	Ok(())
+		.encode(),
+	}])
 }
 
 /// Takes a contact link, or resolves `name@host`.
@@ -484,32 +493,19 @@ pub fn contact(state: &State) -> Result<()> {
 /// address is answered by a server, and anything a server tells you it can lie
 /// about — so that answer is pinned, and safety numbers remain the real
 /// verification (§11.6).
-pub async fn lookup(state: &mut State) -> Result<()> {
-	let entered = ask("Contact link, or an address (name@host): ")?;
-
-	let contact = match crate::contacts::Contact::parse(&entered) {
-		Ok(contact) => {
-			println!(
-				"{} — from the link itself, so no server was asked and none could \
-				 have answered wrongly.",
-				contact.user
-			);
-			contact
-		}
-		Err(_) => {
-			let contact = crate::contacts::resolve(state, &entered).await?;
-			println!("{entered} is {}", contact.user);
-			println!(
-				"Resolved by that host and pinned. Verify with `safety` before trusting \
-				 it — a name is not an identity."
-			);
-			contact
-		}
+pub async fn lookup(state: &mut State, entered: &str) -> Result<Vec<ClientEvent>> {
+	let (contact, from_link) = match crate::contacts::Contact::parse(entered) {
+		Ok(contact) => (contact, true),
+		Err(_) => (crate::contacts::resolve(state, entered).await?, false),
 	};
 
-	println!("Their mail goes to {}.", contact.host);
 	state.save_to_keyring()?;
-	Ok(())
+
+	Ok(vec![ClientEvent::Resolved {
+		user: contact.user,
+		host: contact.host,
+		from_link,
+	}])
 }
 
 /// Searches this device's own history (§10.4).
@@ -522,8 +518,7 @@ pub async fn lookup(state: &mut State) -> Result<()> {
 /// The limits are real and worth stating: a device searches what it has, and a
 /// new device is blank until it restores. That is a permanent gap versus Open,
 /// and one of the better honest arguments for choosing Open.
-pub fn search(state: &State) -> Result<()> {
-	let query = ask("Search for: ")?;
+pub fn search(state: &State, query: &str) -> Result<Vec<ClientEvent>> {
 	if query.is_empty() {
 		anyhow::bail!("nothing to search for");
 	}
@@ -533,28 +528,29 @@ pub fn search(state: &State) -> Result<()> {
 		&state.history_key,
 	)?;
 
-	let hits = history.search(&query, 20)?;
-	if hits.is_empty() {
-		println!("Nothing found. This device searches only what it has received.");
-		return Ok(());
-	}
-
-	for hit in hits {
-		match (hit.community, hit.sequence) {
-			(Some(community), Some(sequence)) => {
-				println!("[{community}#{} {sequence}] {}", hit.channel, hit.text)
-			}
-			_ => println!("[{}] {}", hit.sender, hit.text),
-		}
-	}
-
-	Ok(())
+	Ok(vec![ClientEvent::SearchResults {
+		hits: history
+			.search(query, 20)?
+			.into_iter()
+			.map(|hit| crate::events::SearchHit {
+				community: hit.community,
+				channel: hit.channel,
+				sender: hit.sender,
+				sequence: hit.sequence,
+				text: hit.text,
+			})
+			.collect(),
+	}])
 }
 
 /// Reads the moderation queue (§7.6).
-pub async fn queue(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	send(write, state, ProtocolMessage::FetchReports(id)).await
+pub async fn queue(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+) -> Result<Vec<ClientEvent>> {
+	send(write, state, ProtocolMessage::FetchReports(id)).await?;
+	Ok(Vec::new())
 }
 
 /// Posts a file to a channel (§10.2).
@@ -568,13 +564,14 @@ pub async fn attach(
 	write: &Arc<Mutex<WriteStream>>,
 	state: &mut State,
 	directory: &str,
-) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-	let path = ask("File path: ")?;
+	id: CommunityId,
+	channel: &str,
+	path: &str,
+) -> Result<Vec<ClientEvent>> {
+	let mut reported = Vec::new();
 
-	let contents = std::fs::read(&path)?;
-	let filename = std::path::Path::new(&path)
+	let contents = std::fs::read(path)?;
+	let filename = std::path::Path::new(path)
 		.file_name()
 		.map(|n| n.to_string_lossy().into_owned())
 		.unwrap_or_else(|| "attachment".to_owned());
@@ -598,15 +595,11 @@ pub async fn attach(
 	// there. A reference to a missing blob is a broken message; a blob nobody
 	// references is garbage the host can collect.
 	send(write, state, ProtocolMessage::UploadBlob(stored)).await?;
-	println!(
-		"Uploading {filename} ({} bytes{}).",
-		attachment.size,
-		if attachment.key.is_some() {
-			", encrypted"
-		} else {
-			", readable by the host"
-		}
-	);
+	reported.push(ClientEvent::Attached {
+		filename: filename.clone(),
+		size: attachment.size,
+		encrypted: attachment.key.is_some(),
+	});
 
 	// The reference travels in the message body, so in a Sealed community the
 	// key is inside the Megolm envelope and never reaches the host.
@@ -617,7 +610,7 @@ pub async fn attach(
 	let body = ChannelBody::file(head, attachment.clone()).encode()?;
 	let body = match state.community_mode(&id) {
 		Some(Mode::Sealed) => {
-			seal_for_channel(write, state, directory, &id, &channel, &body).await?
+			seal_for_channel(write, state, directory, &id, channel, &body, &mut reported).await?
 		}
 		_ => body,
 	};
@@ -627,13 +620,15 @@ pub async fn attach(
 		state,
 		ProtocolMessage::Post(ChannelPost {
 			community: id,
-			channel,
+			channel: channel.to_owned(),
 			body,
 			nonce: veil_protocol::message::random_nonce(),
 			origin_ts: veil_protocol::now_ms()?,
 		}),
 	)
-	.await
+	.await?;
+
+	Ok(reported)
 }
 
 /// Discards a message's content (§10.5).
@@ -643,26 +638,28 @@ pub async fn attach(
 /// receipt; member exports and offline clients keep what they have. Every
 /// messaging system provides exactly this and most imply more — here, where
 /// members are *encouraged* to keep copies (§12.3), implying more would be worse.
-pub async fn delete(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-	let sequence: u64 = ask("Message number: ")?.parse()?;
-
-	println!(
-		"This removes it from the host and from anyone online. It cannot reach a copy \
-		 someone already kept."
-	);
-
+pub async fn delete(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	channel: &str,
+	sequence: u64,
+) -> Result<Vec<ClientEvent>> {
 	send(
 		write,
 		state,
 		ProtocolMessage::DeleteMessage {
 			community: id,
-			channel,
+			channel: channel.to_owned(),
 			sequence,
 		},
 	)
-	.await
+	.await?;
+
+	Ok(vec![ClientEvent::info(
+		"This removes it from the host and from anyone online. It cannot reach a copy \
+		 someone already kept.",
+	)])
 }
 
 /// Assigns a member's role, as a signed policy record (§8.5).
@@ -677,19 +674,14 @@ pub async fn delete(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()
 /// reading what comes next, take them out of the channel's reader list with
 /// `readers`, which rotates the session — an expensive operation in a large
 /// community, and deliberately a separate act so it is not done by accident.
-pub async fn role(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let user = veil_protocol::identity::UserId::parse(&ask("User id: ")?)?;
-
-	let role = match ask("Role — (b)anned, (m)ember, (mod)erator: ")?
-		.to_lowercase()
-		.as_str()
-	{
-		"b" | "banned" => Role::Banned,
-		"m" | "member" => Role::Member,
-		"mod" | "moderator" => Role::Moderator,
-		other => anyhow::bail!("'{other}' is not a role"),
-	};
+pub async fn role(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	user: veil_protocol::identity::UserId,
+	role: Role,
+) -> Result<Vec<ClientEvent>> {
+	let mut reported = Vec::new();
 
 	if role == Role::Banned
 		&& let Ok(community) = state.community_state(&id)
@@ -698,10 +690,10 @@ pub async fn role(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> 
 			.values()
 			.any(|readers| readers.contains(&user))
 	{
-		println!(
+		reported.push(ClientEvent::info(format!(
 			"note: {user} still holds keys for channels they can read. A ban stops them \
 			 posting, not reading — run `readers` to drop them and rotate."
-		);
+		)));
 	}
 
 	let sequence = state
@@ -719,7 +711,9 @@ pub async fn role(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> 
 			&[(0, state.cross_signing().master_secret())],
 		))),
 	)
-	.await
+	.await?;
+
+	Ok(reported)
 }
 
 /// Sets who may read a channel, as a signed policy record (§8.5).
@@ -727,18 +721,14 @@ pub async fn role(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> 
 /// A controller signs this, and it is the *only* thing senders consult when
 /// deciding who receives Megolm keys — which is why it has to be signed rather
 /// than served.
-pub async fn readers(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-
-	let mut readers = Vec::new();
-	loop {
-		let entry = ask("Reader user id (blank when done): ")?;
-		if entry.is_empty() {
-			break;
-		}
-		readers.push(veil_protocol::identity::UserId::parse(&entry)?);
-	}
+pub async fn readers(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	channel: &str,
+	readers: Vec<veil_protocol::identity::UserId>,
+) -> Result<Vec<ClientEvent>> {
+	let channel = channel.to_owned();
 
 	// The next free sequence, from the chain we have verified. A record that
 	// does not advance is refused by every replayer, so guessing low simply
@@ -760,21 +750,25 @@ pub async fn readers(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<(
 		state,
 		ProtocolMessage::SubmitPolicy(Box::new(policy)),
 	)
-	.await
+	.await?;
+	Ok(Vec::new())
 }
 
-pub async fn history(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<()> {
-	let id = CommunityId::parse(&ask("Community id: ")?)?;
-	let channel = ask("Channel: ")?;
-
+pub async fn history(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	id: CommunityId,
+	channel: &str,
+) -> Result<Vec<ClientEvent>> {
 	send(
 		write,
 		state,
 		ProtocolMessage::Backfill {
 			community: id,
-			channel,
+			channel: channel.to_owned(),
 			after: 0,
 		},
 	)
-	.await
+	.await?;
+	Ok(Vec::new())
 }
