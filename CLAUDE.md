@@ -297,17 +297,22 @@ explicitly — each one closes a specific attack.
     reassignment and an impersonation are indistinguishable from the client. A
     contact link carries the whole identity and consults no directory, which is
     why it is the path to prefer; resolution exists for somebody typing a name.
-29. **Call transport needs both parties, and consent is per call** (§9.1). P2P
+29. **Call performance is latency and jitter, not encryption.** SRTP is a
+    millionth of the packet budget; the jitter buffer is the lever. It adapts to
+    observed spread, conceals a gap as silence of the right length rather than
+    skipping it, and reuses its storage. Do not replace it with a constant depth
+    — one chosen for the worst case makes every good connection feel bad.
+30. **Call transport needs both parties, and consent is per call** (§9.1). P2P
     exposes both addresses, so one side cannot trade the other's away, and a
     preference that carried into the next call would be a security failure in
     §9.1's own words. A withdrawal is final for that call. `call.rs` holds the
     rules; the media stack does not exist.
-30. **A bot is an ordinary account** (§18). It holds a role, can be banned, and
+31. **A bot is an ordinary account** (§18). It holds a role, can be banned, and
     reads a Sealed channel only if signed policy names it as a reader — so "is a
     bot reading this" is already answered by the reader list. The `Automated`
     marker is a label for the interface; nothing enforces it and nothing should
     branch on it.
-31. **Never send plaintext under a Sealed id.** The mode is inside the community
+32. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

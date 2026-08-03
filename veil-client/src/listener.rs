@@ -791,8 +791,8 @@ async fn answer_call(
 	};
 
 	// An answer completes a call we placed; anything else is an offer.
-	if let Some(session) = calls.lock().await.get(&signal.call) {
-		match session.accept_answer(&sdp).await {
+	if let Some(call) = calls.lock().await.get(&signal.call) {
+		match call.session.accept_answer(&sdp).await {
 			Ok(()) => say!(events, "{} answered.", signal.sender),
 			Err(e) => notice!(
 				events,
@@ -803,16 +803,16 @@ async fn answer_call(
 		return;
 	}
 
-	let session = match crate::media::Session::new(state.relay.as_deref()).await {
-		Ok(session) => session,
+	let call = match crate::media::Call::answering(state.relay.as_deref()).await {
+		Ok(call) => call,
 		Err(e) => {
 			notice!(events, "Could not open a media session: {e:#}");
 			return;
 		}
 	};
 
-	let answer = match session.answer(&sdp).await {
-		Ok(_) => match session.local_description_when_gathered().await {
+	let answer = match call.session.answer(&sdp).await {
+		Ok(_) => match call.session.local_description_when_gathered().await {
 			Ok(answer) => answer,
 			Err(e) => {
 				notice!(events, "Could not gather candidates: {e:#}");
@@ -853,7 +853,7 @@ async fn answer_call(
 				.await
 				.send(Message::Binary(Bytes::copy_from_slice(&sealed)))
 				.await;
-			calls.lock().await.insert(signal.call, session);
+			calls.lock().await.insert(signal.call, call);
 			say!(events, "Answered a call from {}.", signal.sender);
 		}
 		Err(e) => notice!(events, "Could not seal an answer: {e:#}"),

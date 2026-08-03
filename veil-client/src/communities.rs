@@ -478,10 +478,9 @@ pub async fn call(
 	// the fingerprint inside it means nothing.
 	messaging::ensure_session(state, recipient, directory, &mut reported).await?;
 
-	let session = crate::media::Session::new(state.relay.as_deref()).await?;
-	session.open_channel("audio").await?;
-	session.offer().await?;
-	let sdp = session.local_description_when_gathered().await?;
+	let call_media = crate::media::Call::open(state.relay.as_deref()).await?;
+	call_media.session.offer().await?;
+	let sdp = call_media.session.local_description_when_gathered().await?;
 
 	let mut call = [0u8; 16];
 	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut call);
@@ -508,7 +507,7 @@ pub async fn call(
 	)
 	.await?;
 
-	calls.lock().await.insert(call, session);
+	calls.lock().await.insert(call, call_media);
 	state.save_to_keyring()?;
 
 	reported.push(ClientEvent::info(format!(

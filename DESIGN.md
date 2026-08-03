@@ -104,8 +104,9 @@ to.
 | Megolm group messaging, `GroupKeyProvider` | **[built]** `groupkeys.rs`, wired into the client — Sealed channels encrypt end-to-end |
 | Roles: read-vs-rest split, signed role state | **[built]** `Role` in the signed chain; host enforces post/join/backfill |
 | Calls: 1:1 signalling and negotiation | **[built]** `media.rs` — real WebRTC, offer/answer over the Olm session |
-| Calls: jitter buffering and pacing | **[built]** tested; not wired until audio tracks exist |
-| Calls: audio capture and playback | not begun — needs devices |
+| Calls: RTP audio over SRTP | **[built]** Opus track, real packets through the buffer |
+| Calls: jitter buffering and pacing | **[built]** wired into the receive path |
+| Calls: capture and playback devices | not begun — hardware, not protocol |
 | Calls: mesh for small groups | designed, §9 — same primitives |
 | Calls: SFU and SFrame for large groups | designed, §9 — the only place new crypto appears |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |

@@ -42,7 +42,7 @@ use tokio::sync::Mutex;
 /// Outside `State` because a session is not serialisable and should not be: a
 /// call does not survive the process, and a stored one would be an invitation to
 /// resume something the other party has long since hung up on.
-pub type Calls = Arc<Mutex<HashMap<[u8; 16], Session>>>;
+pub type Calls = Arc<Mutex<HashMap<[u8; 16], Call>>>;
 
 pub fn calls() -> Calls {
 	Arc::new(Mutex::new(HashMap::new()))
@@ -50,13 +50,10 @@ pub fn calls() -> Calls {
 
 /// Reorders and paces incoming audio, adapting to the network it finds.
 ///
-/// **Built and tested, not yet wired.** The session below negotiates over a data
-/// channel, so no RTP flows through this yet — connecting it needs an audio
-/// track on the send side and capture and playback devices, which is the next
-/// piece of work. It is here now because the buffering policy is where call
-/// quality is decided and is the part worth getting right before there is audio
-/// to lose, not because anything currently calls it.
-#[allow(dead_code)]
+/// Fed by [`Session::on_audio`], which reads RTP off the wire and pushes it
+/// here. What remains unwired is the far end: turning what comes out of this
+/// into sound needs a playback device, which is a hardware concern rather than
+/// a protocol one.
 ///
 /// RTP arrives out of order, in bursts, and with gaps. Playback needs a steady
 /// 20 ms tick. The buffer absorbs the difference, and how much it absorbs is the
@@ -293,6 +290,64 @@ fn sequence_before(a: u16, b: u16) -> bool {
 	b.wrapping_sub(a) < u16::MAX / 2
 }
 
+/// Everything one call holds: the peer connection, and the buffer its audio
+/// arrives through.
+///
+/// Kept together because they have the same lifetime — the buffer is meaningless
+/// once the connection is gone, and holding it separately invites the two to
+/// drift apart.
+pub struct Call {
+	pub session: Session,
+	/// Audio arriving from the far end, reordered and paced.
+	///
+	/// **The last unwired step is playback.** RTP reaches this buffer and comes
+	/// back out in order — the tests drive exactly that — but turning packets
+	/// into sound needs an output device, which is a hardware concern rather
+	/// than a protocol one. These two fields are the interface that layer will
+	/// use, which is why they are public and why nothing in the client reads
+	/// them yet.
+	#[allow(dead_code)]
+	pub incoming: Arc<Mutex<JitterBuffer>>,
+	/// Where outgoing audio is written. A microphone feeds this.
+	#[allow(dead_code)]
+	pub outgoing:
+		Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>,
+}
+
+impl Call {
+	/// Opens a call, ready to send and receive audio.
+	pub async fn open(relay: Option<&str>) -> Result<Self> {
+		let session = Session::new(relay).await?;
+		let outgoing = session.add_audio().await?;
+
+		let incoming = Arc::new(Mutex::new(JitterBuffer::new()));
+		session.on_audio(incoming.clone());
+
+		Ok(Self {
+			session,
+			incoming,
+			outgoing,
+		})
+	}
+
+	/// Opens a call that is answering one, which must also offer to receive.
+	pub async fn answering(relay: Option<&str>) -> Result<Self> {
+		let call = Self::open(relay).await?;
+
+		// Without a receiving transceiver the answer negotiates nothing for the
+		// caller's audio, and the call is silent in one direction.
+		call.session
+			.connection
+			.add_transceiver_from_kind(
+				webrtc::rtp_transceiver::rtp_codec::RTPCodecType::Audio,
+				None,
+			)
+			.await?;
+
+		Ok(call)
+	}
+}
+
 /// A call's media session.
 ///
 /// Deliberately thin: WebRTC does the hard parts, and the value here is that
@@ -373,10 +428,64 @@ impl Session {
 		Ok(())
 	}
 
-	/// Adds a channel, so there is something to negotiate.
-	pub async fn open_channel(&self, label: &str) -> Result<()> {
-		self.connection.create_data_channel(label, None).await?;
-		Ok(())
+	/// Adds an outgoing audio track.
+	///
+	/// Opus at 48 kHz, which is what every WebRTC endpoint speaks and what the
+	/// 20 ms packet interval is chosen around. Returning the track rather than
+	/// keeping it lets the caller push samples from wherever they come from —
+	/// a microphone, a file, or a test.
+	pub async fn add_audio(
+		&self,
+	) -> Result<Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>>
+	{
+		use webrtc::{
+			rtp_transceiver::rtp_codec::RTCRtpCodecCapability,
+			track::track_local::track_local_static_sample::TrackLocalStaticSample,
+		};
+
+		let track = Arc::new(TrackLocalStaticSample::new(
+			RTCRtpCodecCapability {
+				mime_type: "audio/opus".to_owned(),
+				clock_rate: 48_000,
+				channels: 2,
+				..Default::default()
+			},
+			"audio".to_owned(),
+			"veil".to_owned(),
+		));
+
+		self.connection.add_track(track.clone()).await?;
+		Ok(track)
+	}
+
+	/// Feeds incoming audio into a jitter buffer.
+	///
+	/// **This is where the buffer earns its place.** RTP arrives reordered, in
+	/// bursts and with gaps; the buffer absorbs that and hands back a steady
+	/// stream. Reading happens on its own task because a receive loop that
+	/// shared a thread with playback would make every hiccup in one audible in
+	/// the other.
+	pub fn on_audio(&self, buffer: Arc<Mutex<JitterBuffer>>) {
+		use std::time::Instant;
+
+		let started = Instant::now();
+
+		self.connection.on_track(Box::new(move |track, _, _| {
+			let buffer = buffer.clone();
+
+			Box::pin(async move {
+				tokio::spawn(async move {
+					while let Ok((packet, _)) = track.read_rtp().await {
+						let arrived = started.elapsed();
+						buffer.lock().await.push(
+							packet.header.sequence_number,
+							&packet.payload,
+							arrived,
+						);
+					}
+				});
+			})
+		}));
 	}
 
 	/// The DTLS fingerprint this session will present.
@@ -627,6 +736,88 @@ mod tests {
 mod session_tests {
 	use super::*;
 
+	/// Audio actually flows, and arrives through the jitter buffer.
+	///
+	/// This is what turns the buffer from a tested algorithm into part of the
+	/// media path: real RTP, produced by one peer's Opus track and read off the
+	/// other's, encrypted by SRTP in between.
+	#[tokio::test]
+	async fn audio_flows_through_the_jitter_buffer() {
+		use std::time::Instant;
+		use webrtc::media::Sample;
+
+		// The real types, assembled the way a call assembles them — so this
+		// exercises what the client actually builds rather than a arrangement
+		// that only exists in a test.
+		let caller = Call::open(None).await.unwrap();
+		let callee = Call::answering(None).await.unwrap();
+
+		caller.session.offer().await.unwrap();
+		let offer = caller
+			.session
+			.local_description_when_gathered()
+			.await
+			.unwrap();
+		callee.session.answer(&offer).await.unwrap();
+		let answer = callee
+			.session
+			.local_description_when_gathered()
+			.await
+			.unwrap();
+		caller.session.accept_answer(&answer).await.unwrap();
+
+		assert!(
+			caller.session.connected(Duration::from_secs(20)).await,
+			"the peers should connect before any audio is sent"
+		);
+
+		// Synthetic samples rather than a microphone: this container has no
+		// audio devices, and the path being tested is the network one.
+		let deadline = Instant::now() + Duration::from_secs(20);
+		let mut sent = 0;
+		while sent < 50 && Instant::now() < deadline {
+			caller
+				.outgoing
+				.write_sample(&Sample {
+					data: vec![0xAA; 160].into(),
+					duration: PACKET,
+					..Default::default()
+				})
+				.await
+				.unwrap();
+			sent += 1;
+			tokio::time::sleep(PACKET).await;
+		}
+
+		// Give the last packets time to land.
+		let mut held = 0;
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while Instant::now() < deadline {
+			held = callee.incoming.lock().await.held();
+			if held >= 10 {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+
+		assert!(
+			held >= 10,
+			"audio should have arrived and been buffered, got {held} packets"
+		);
+
+		// And it comes back out in order, which is the buffer's whole job.
+		let mut buffer = callee.incoming.lock().await;
+		let first = buffer.pop();
+		assert!(
+			matches!(first, Playback::Packet(_)),
+			"the buffer should yield a packet once filled, got {first:?}"
+		);
+
+		drop(buffer);
+		caller.session.close().await.unwrap();
+		callee.session.close().await.unwrap();
+	}
+
 	/// Two peers negotiate a real connection, using only what would have crossed
 	/// the authenticated signalling channel.
 	///
@@ -641,7 +832,7 @@ mod session_tests {
 
 		// A data channel gives the connection something to negotiate; the media
 		// path is identical, and this needs no audio hardware to exercise.
-		caller.open_channel("media").await.unwrap();
+		caller.add_audio().await.unwrap();
 
 		caller.offer().await.unwrap();
 		let offer = caller.local_description_when_gathered().await.unwrap();
@@ -668,7 +859,7 @@ mod session_tests {
 	#[tokio::test]
 	async fn an_offer_carries_a_fingerprint_to_authenticate() {
 		let caller = Session::new(None).await.unwrap();
-		caller.open_channel("media").await.unwrap();
+		caller.add_audio().await.unwrap();
 		let offer = caller.offer().await.unwrap();
 
 		let fingerprint = Session::fingerprint(&offer)
@@ -680,7 +871,7 @@ mod session_tests {
 
 		// Two sessions are two keys, so a fingerprint identifies one of them.
 		let other = Session::new(None).await.unwrap();
-		other.open_channel("media").await.unwrap();
+		other.add_audio().await.unwrap();
 		let theirs = Session::fingerprint(&other.offer().await.unwrap()).unwrap();
 		assert_ne!(
 			fingerprint, theirs,
