@@ -1,3 +1,4 @@
+mod audio;
 mod cli;
 mod communities;
 mod contacts;

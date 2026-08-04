@@ -31,6 +31,10 @@ keyring = "2"
 # ICE, DTLS and SRTP. §9: a 1:1 call needs no new cryptography, because this
 # already encrypts end to end — what Veil supplies is authenticated signalling.
 webrtc = "0.11"
+# Devices and codec, both long-standing: cpal is what most Rust audio stands on,
+# and libopus is what every WebRTC endpoint already speaks.
+cpal = "0.15"
+opus = "0.3"
 # SQLCipher rather than plain SQLite: the search index lives inside the database,
 # and §10.4 requires the index on disk to be encrypted rather than only its backup.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher"] }

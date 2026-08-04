@@ -298,20 +298,17 @@ fn sequence_before(a: u16, b: u16) -> bool {
 /// drift apart.
 pub struct Call {
 	pub session: Session,
-	/// Audio arriving from the far end, reordered and paced.
-	///
-	/// **The last unwired step is playback.** RTP reaches this buffer and comes
-	/// back out in order — the tests drive exactly that — but turning packets
-	/// into sound needs an output device, which is a hardware concern rather
-	/// than a protocol one. These two fields are the interface that layer will
-	/// use, which is why they are public and why nothing in the client reads
-	/// them yet.
-	#[allow(dead_code)]
+	/// Audio arriving from the far end, reordered and paced. Drained by the
+	/// playback callback in [`crate::audio::run`].
 	pub incoming: Arc<Mutex<JitterBuffer>>,
 	/// Where outgoing audio is written. A microphone feeds this.
-	#[allow(dead_code)]
 	pub outgoing:
 		Arc<webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample>,
+	/// The device streams, held for as long as the call is up.
+	///
+	/// Dropping a `Call` drops these, which stops capture — a call that kept the
+	/// microphone open after it ended would be exactly the thing nobody wants.
+	pub audio: Mutex<Option<crate::audio::Streams>>,
 }
 
 impl Call {
@@ -327,6 +324,7 @@ impl Call {
 			session,
 			incoming,
 			outgoing,
+			audio: Mutex::new(None),
 		})
 	}
 

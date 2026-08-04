@@ -106,7 +106,7 @@ to.
 | Calls: 1:1 signalling and negotiation | **[built]** `media.rs` — real WebRTC, offer/answer over the Olm session |
 | Calls: RTP audio over SRTP | **[built]** Opus track, real packets through the buffer |
 | Calls: jitter buffering and pacing | **[built]** wired into the receive path |
-| Calls: capture and playback devices | not begun — hardware, not protocol |
+| Calls: capture, playback, Opus codec | **[built]** cpal + libopus; degrades on a machine with no devices |
 | Calls: mesh for small groups | designed, §9 — same primitives |
 | Calls: SFU and SFrame for large groups | designed, §9 — the only place new crypto appears |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
@@ -1045,6 +1045,31 @@ What people hear is latency and jitter, which come from four places:
    reuses its storage.
 4. **The relay hop**, which is the one the user can trade away — with both
    parties' consent, per call (§9.1).
+
+#### Existing libraries do the parts that should not be written twice
+
+**cpal** for devices and **libopus** for the codec. Neither is a place to be
+original: cpal is what most Rust audio stands on, and libopus is what every
+WebRTC endpoint already negotiates. Veil's contribution is the authenticated
+signalling in the middle, and everything either side of it should be ordinary.
+
+Three details that are not arbitrary:
+
+- **20 ms frames, 48 kHz, mono.** The frame length matches the packet interval,
+  because a codec frame and a network packet should be the same thing —
+  mismatched, every packet either splits a frame or carries two. Mono because
+  §9.1's figures assume voice, and stereo doubles the cost to convey nothing a
+  conversation needs.
+- **Concealment is the codec's, not silence.** When the buffer reports a gap,
+  Opus generates a frame that continues the waveform. Silence sounds like a
+  hole, and a listener hears the difference at one lost packet in a hundred.
+- **Audio owns its own thread.** Callbacks have a hard deadline, and `cpal`'s
+  streams are not `Send` — so they live on a dedicated thread and talk to the
+  async world over channels. Neither callback allocates or blocks.
+
+**A machine with no sound card still runs the client.** It places and answers
+calls and is told it has no audio, rather than being refused something it could
+otherwise do — which is the ordinary case on a server or in a container.
 
 ### 9.1 Transport: relayed by default, P2P by choice
 

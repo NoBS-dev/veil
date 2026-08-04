@@ -507,6 +507,19 @@ pub async fn call(
 	)
 	.await?;
 
+	// Audio starts if this machine has devices. A client on a box with no sound
+	// card should still be able to place a call — it simply cannot talk on it,
+	// and saying so is better than failing the call.
+	match crate::audio::run(&call_media) {
+		Ok(streams) => call_media.audio.lock().await.replace(streams),
+		Err(e) => {
+			reported.push(ClientEvent::warn(format!(
+				"Call connected without audio: {e:#}"
+			)));
+			None
+		}
+	};
+
 	calls.lock().await.insert(call, call_media);
 	state.save_to_keyring()?;
 

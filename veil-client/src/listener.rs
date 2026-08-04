@@ -853,6 +853,15 @@ async fn answer_call(
 				.await
 				.send(Message::Binary(Bytes::copy_from_slice(&sealed)))
 				.await;
+			// Once, not twice: an earlier version called this in both arms and
+			// would have opened two captures on the same microphone.
+			match crate::audio::run(&call) {
+				Ok(streams) => {
+					call.audio.lock().await.replace(streams);
+				}
+				Err(e) => notice!(events, "Answered without audio: {e:#}"),
+			}
+
 			calls.lock().await.insert(signal.call, call);
 			say!(events, "Answered a call from {}.", signal.sender);
 		}

@@ -79,6 +79,10 @@ cargo fmt --all
 One pre-existing clippy warning is known and left alone (a redundant `&` in a
 `format!` in the client). Everything else should stay clean.
 
+Audio needs system `opus` and `alsa-lib` (`paru -S --needed opus alsa-lib`).
+There are no audio devices in this container, so calls connect and report having
+no audio — which is the behaviour a server or CI box should get, and is tested.
+
 ## Environment
 
 This is an Arch container. The user has passwordless `paru`; install what you
