@@ -587,6 +587,40 @@ pub fn leg_id(call: [u8; 16], other: DeviceAddress) -> [u8; 16] {
 	id
 }
 
+/// Registers this device for wake-ups, or turns them off (§12.2).
+///
+/// **The wake-up carries nothing.** This device wakes, connects here, fetches
+/// and decrypts for itself — so Apple or Google learn that something was waiting
+/// and when, never what or from whom. A blank token turns it off, and polling
+/// takes over: slower and heavier on battery, and nobody learns when each
+/// message arrived rather than only that this device checked in.
+pub async fn push(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &State,
+	service: &str,
+	token: &str,
+) -> Result<Vec<ClientEvent>> {
+	send(
+		write,
+		state,
+		ProtocolMessage::RegisterPush {
+			service: service.to_owned(),
+			token: token.to_owned(),
+		},
+	)
+	.await?;
+
+	Ok(vec![ClientEvent::info(if token.is_empty() {
+		"Push off. This device will poll instead — slower, and nobody learns when \
+		 each message arrived."
+			.to_owned()
+	} else {
+		"Registered. The wake-up carries nothing: this device fetches and decrypts \
+		 for itself, so the push service never sees content or sender."
+			.to_owned()
+	})])
+}
+
 /// Places a group call as a full mesh (§9).
 ///
 /// **No SFU and no group key**, so this needs exactly the cryptography a 1:1

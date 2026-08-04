@@ -178,14 +178,21 @@ async fn accept_deposit(state: &ServerState, peer: &[u8; 32], bytes: &[u8]) -> D
 	// and the mailbox is the one path that survives them vanishing mid-flush.
 	// The queued frame is the *sender's* envelope, so what Bob eventually opens
 	// is what Alice signed.
-	match state
-		.store
-		.lock()
-		.await
-		.enqueue(&msg.recipient, &envelope, now)
-	{
+	// Scoped, not held across the match. A guard taken in a match scrutinee
+	// lives for the whole expression, so waking inside an arm — which needs the
+	// store again — deadlocked the connection. The same discipline the routing
+	// map has: never hold a lock across an await that might want it.
+	let queued = {
+		let store = state.store.lock().await;
+		store.enqueue(&msg.recipient, &envelope, now)
+	};
+
+	match queued {
 		Ok(()) => {
 			eprintln!("S2S: accepted mail for {}", msg.recipient);
+			// Mail arriving from another server is still mail, and a device
+			// waiting on it should be woken the same way (§12.2).
+			crate::wake_for_mail(state, &msg.recipient).await;
 			DepositResult::Accepted
 		}
 		Err(e) => DepositResult::TryAgain(format!("could not queue: {e}")),

@@ -212,6 +212,17 @@ impl Store {
 			 -- it cannot open: it holds the cross-signing secrets and every
 			 -- Megolm session, so a host that could read it could impersonate
 			 -- its user and read every Sealed community they are in.
+			 -- How to wake a device that is not connected (§12.2). A token and
+			 -- nothing else: the wake-up carries no content, so there is no
+			 -- content to store alongside it.
+			 CREATE TABLE IF NOT EXISTS push_tokens (
+			     user_id    BLOB NOT NULL,
+			     device_id  BLOB NOT NULL,
+			     service    TEXT NOT NULL,
+			     token      TEXT NOT NULL,
+			     PRIMARY KEY (user_id, device_id)
+			 );
+
 			 CREATE TABLE IF NOT EXISTS backups (
 			     user_id    BLOB PRIMARY KEY,
 			     blob       BLOB    NOT NULL,
@@ -783,6 +794,49 @@ impl Store {
 		Ok(rows.collect::<Result<Vec<_>, _>>()?)
 	}
 
+	// ---- push (§12.2) -----------------------------------------------------
+
+	/// Records how to wake a device, or forgets it when the token is empty.
+	pub fn set_push_token(&self, device: &DeviceAddress, service: &str, token: &str) -> Result<()> {
+		if token.is_empty() {
+			self.db.execute(
+				"DELETE FROM push_tokens WHERE user_id = ?1 AND device_id = ?2",
+				params![
+					device.user.as_bytes().as_slice(),
+					device.device.as_bytes().as_slice()
+				],
+			)?;
+			return Ok(());
+		}
+
+		self.db.execute(
+			"INSERT INTO push_tokens (user_id, device_id, service, token) VALUES (?1, ?2, ?3, ?4)
+			 ON CONFLICT(user_id, device_id) DO UPDATE SET
+			   service = excluded.service, token = excluded.token",
+			params![
+				device.user.as_bytes().as_slice(),
+				device.device.as_bytes().as_slice(),
+				service,
+				token
+			],
+		)?;
+		Ok(())
+	}
+
+	pub fn push_token(&self, device: &DeviceAddress) -> Result<Option<(String, String)>> {
+		Ok(self
+			.db
+			.query_row(
+				"SELECT service, token FROM push_tokens WHERE user_id = ?1 AND device_id = ?2",
+				params![
+					device.user.as_bytes().as_slice(),
+					device.device.as_bytes().as_slice()
+				],
+				|r| Ok((r.get(0)?, r.get(1)?)),
+			)
+			.optional()?)
+	}
+
 	// ---- key backup (§12.5) -----------------------------------------------
 
 	/// Replaces this user's backup. One per user: an older one is of no use
@@ -1315,5 +1369,56 @@ mod tests {
 
 		store.enqueue(&mine, b"for me", 1).unwrap();
 		assert_eq!(store.pending_count(&other).unwrap(), 0);
+	}
+
+	#[test]
+	fn a_push_token_is_recorded_and_can_be_withdrawn() {
+		let store = Store::open(":memory:").unwrap();
+		let device = DeviceAddress::new(
+			CrossSigningSecrets::new().user_id(),
+			veil_protocol::identity::DeviceId::generate(),
+		);
+
+		assert!(store.push_token(&device).unwrap().is_none());
+
+		store.set_push_token(&device, "apns", "abc").unwrap();
+		assert_eq!(
+			store.push_token(&device).unwrap(),
+			Some(("apns".to_owned(), "abc".to_owned()))
+		);
+
+		// Re-registering replaces rather than accumulating: a device has one
+		// token, and a stale one wakes a device that no longer exists.
+		store.set_push_token(&device, "fcm", "def").unwrap();
+		assert_eq!(
+			store.push_token(&device).unwrap(),
+			Some(("fcm".to_owned(), "def".to_owned()))
+		);
+
+		// An empty token is how a device turns push off — §12.2 offers polling
+		// as an alternative, and choosing it has to be expressible.
+		store.set_push_token(&device, "fcm", "").unwrap();
+		assert!(
+			store.push_token(&device).unwrap().is_none(),
+			"turning push off must forget the token, not keep it unused"
+		);
+	}
+
+	/// Tokens belong to devices, not users. A person's phone registering must
+	/// not cause their laptop to be woken.
+	#[test]
+	fn push_tokens_do_not_leak_between_a_users_devices() {
+		let store = Store::open(":memory:").unwrap();
+		let user = CrossSigningSecrets::new().user_id();
+		let phone = DeviceAddress::new(user, veil_protocol::identity::DeviceId::generate());
+		let laptop = DeviceAddress::new(user, veil_protocol::identity::DeviceId::generate());
+
+		store.set_push_token(&phone, "apns", "phone-token").unwrap();
+
+		assert!(store.push_token(&phone).unwrap().is_some());
+		assert!(
+			store.push_token(&laptop).unwrap().is_none(),
+			"one device registering must not register the others"
+		);
 	}
 }

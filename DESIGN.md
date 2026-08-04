@@ -119,7 +119,9 @@ to.
 | Finding people: aliases, contact links, pinning | **[built]** §11.6 |
 | Reputation and server discovery | designed, §11.4–11.5 |
 | Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
-| Message store, push | designed, §12.1–12.2 |
+| Message store | **[built]** `store.rs` |
+| Push: registration, wake path, gateway boundary | **[built]** `push.rs` |
+| Push: APNs and FCM transport | not begun — needs credentials and a device |
 | Backups, succession, migration | designed, §12.3–12.4 |
 | Key backup, recovery key, enrolment bundles | **[built]** `keybackup.rs`, stored and restorable |
 | Horizontal scaling | designed, §13.1–13.3 |
@@ -1864,11 +1866,24 @@ Two separate settings, easily conflated:
 timing correlation: nobody learns when each individual message arrived, only that
 the device checked in on a schedule. It also doubles as the escape hatch below.
 
-> **Polling is built; contentless push is not.** Push needs APNs and FCM
-> credentials, a signed application, and a device to receive on — none of which
-> exist yet, and none of which can be exercised from a desktop. Polling is the
-> half that works today, and it is deliberately the half that matters for §1.3:
-> it is what stops the push gateway becoming a dependency.
+> **The push path is built; the transport is not.** Devices register a token,
+> the server decides when to wake one, and a `Gateway` trait is where APNs or
+> FCM plugs in. What does not exist is either transport, because both need
+> credentials, a signed application and a device to receive on — none of which
+> can be exercised from a desktop. Adding one is an HTTP request against a
+> documented API rather than a new concept threaded through the server.
+>
+> **Contentlessness is enforced by the type.** `Gateway::wake` takes a device,
+> a service and a token, and has no parameter a message could travel through —
+> so a careless caller cannot leak content into a push; it would have to change
+> the trait first, which is a conversation rather than an accident. §12.2 calls
+> contentless push "architectural and not optional", and this is what that has
+> to mean in code.
+>
+> A host with no push credentials gets a gateway that does nothing, because a
+> self-hoster having no APNs account must not mean a broken server (§1.3). Its
+> users poll, which is the half that works today and deliberately the half that
+> matters: it is what stops a push gateway becoming a dependency.
 
 #### Push is a §1.3 exception, and should be named as one
 

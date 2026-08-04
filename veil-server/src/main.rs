@@ -1,5 +1,6 @@
 mod community;
 mod delivery;
+mod push;
 mod store;
 mod tlsframe;
 
@@ -100,6 +101,12 @@ struct ServerState {
 	/// server-to-server deposits spam-resistant where client-to-mailbox
 	/// deposits would not be.
 	deposit_limiter: Arc<Mutex<RateLimiter<[u8; 32]>>>,
+	/// How wake-ups reach a device that is not connected (§12.2).
+	///
+	/// A trait object because a self-hoster has no push credentials and must
+	/// still have a working server — that case gets `NotConfigured`, and its
+	/// users poll instead.
+	push: Arc<dyn push::Gateway>,
 	/// Hosts that have proved they speak Veil, so the proof is not repeated on
 	/// every directory lookup (§3.4).
 	verified_hosts: Arc<RwLock<std::collections::HashSet<String>>>,
@@ -307,6 +314,9 @@ async fn main() -> Result<()> {
 			DEPOSITS_PER_SERVER_PER_WINDOW,
 			RATE_WINDOW_MS,
 		))),
+		// A host with no push credentials is the ordinary self-hosted case
+		// (§1.3), so this is what one gets unless configured otherwise.
+		push: Arc::new(push::NotConfigured),
 		verified_hosts: Arc::new(RwLock::new(std::collections::HashSet::new())),
 		tls_binding,
 	};
@@ -711,10 +721,16 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 							opened.timestamp_ms,
 						);
 						match queued {
-							Ok(()) => eprintln!(
-								"{} is {e}; mail queued for their next connection",
-								msg.recipient
-							),
+							Ok(()) => {
+								eprintln!(
+									"{} is {e}; mail queued for their next connection",
+									msg.recipient
+								);
+								// Woken only when something was actually stored:
+								// a wake-up for an empty mailbox spends a
+								// device's battery to find nothing.
+								wake_for_mail(&state, &msg.recipient).await;
+							}
 							Err(err) => {
 								eprintln!("Could not queue mail for {}: {err:#}", msg.recipient)
 							}
@@ -801,6 +817,28 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					// an hour later is an invitation to a call nobody is on, and
 					// worse, it would ring.
 					eprintln!("Dropping a call signal for {recipient}, who is {e}");
+				}
+			}
+			ProtocolMessage::RegisterPush { service, token } => {
+				let Some(service) = push::Service::parse(&service) else {
+					eprintln!("Unknown push service from {address}");
+					continue;
+				};
+
+				if token.len() > 512 {
+					eprintln!("Refusing an oversized push token from {address}");
+					continue;
+				}
+
+				match state
+					.store
+					.lock()
+					.await
+					.set_push_token(&address, service.name(), &token)
+				{
+					Ok(()) if token.is_empty() => eprintln!("{address} turned push off"),
+					Ok(()) => eprintln!("{address} registered for {} push", service.name()),
+					Err(e) => eprintln!("Could not record a push token: {e:#}"),
 				}
 			}
 			ProtocolMessage::CallRoster(roster) => {
@@ -1110,6 +1148,37 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 	CLIENTS.write().await.remove(&address);
 	writer.abort();
 	println!("{address} disconnected");
+}
+
+/// Wakes a device that has mail waiting (§12.2).
+///
+/// **Carries nothing.** The device wakes, connects here, fetches and decrypts
+/// for itself, and builds its own notification — so the platform push service
+/// learns that a device had something waiting and when, never what or from whom.
+/// `Gateway::wake` has no parameter a message could travel through, which is
+/// where that guarantee lives.
+///
+/// Silent when the device never registered, which is every desktop and every
+/// user who chose polling instead.
+async fn wake_for_mail(state: &ServerState, recipient: &DeviceAddress) {
+	let registration = state
+		.store
+		.lock()
+		.await
+		.push_token(recipient)
+		.ok()
+		.flatten();
+
+	let Some((service, token)) = registration else {
+		return;
+	};
+	let Some(service) = push::Service::parse(&service) else {
+		return;
+	};
+
+	if let Err(e) = state.push.wake(*recipient, service, &token) {
+		eprintln!("Could not wake {recipient}: {e:#}");
+	}
 }
 
 /// Seals a message from this host and sends it to one device.

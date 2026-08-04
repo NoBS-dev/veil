@@ -370,6 +370,15 @@ pub enum ProtocolMessage {
 	/// with a cross-signed device, the media keys are authenticated with no new
 	/// PKI — so a two-person call needs no new cryptography at all.
 	CallSignal(CallSignal),
+	/// Registers how to wake this device when it is not connected (§12.2).
+	///
+	/// An empty token unregisters. The wake-up that follows carries nothing —
+	/// the device connects and fetches for itself, so the platform push service
+	/// never sees content or sender.
+	RegisterPush {
+		service: String,
+		token: String,
+	},
 	/// Tells a participant who else is in a group call (§9).
 	///
 	/// Sent to each participant over the same authenticated path as an offer.

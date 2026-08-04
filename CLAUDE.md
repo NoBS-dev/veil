@@ -136,7 +136,7 @@ printf 'msg\n<bob-key>\nhello\n' > a.in
 Client CLI commands: `curve`, `ed`, `list`, `msg`, `devices`, `safety`, `poll`,
 `remove`, `quit`, and for communities `found`, `join`, `readers`, `role`, `say`,
 `history`, `attach`, `delete`, `report`, `queue`, `channels`, `watch`, `search`, `alias`, `contact`, `lookup`, `call`, `revoke`, `backup`,
-`restore`.
+`restore`, `push`, `groupcall`.
 
 Local history is an **SQLCipher database beside the profile**, opened with a key
 held in the profile itself (§10.4). The keyring holds the key, never the data —

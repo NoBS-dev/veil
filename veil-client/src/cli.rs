@@ -204,6 +204,15 @@ pub async fn cli(
 				}
 				Err(e) => eprintln!("{e:#}"),
 			},
+			"push" => match (
+				ask("Service (apns/fcm): "),
+				ask("Token (blank to turn push off): "),
+			) {
+				(Ok(service), Ok(token)) => {
+					show(communities::push(&write, &state, &service, &token).await)
+				}
+				_ => eprintln!("Could not read that."),
+			},
 			"backup" => show(communities::backup(&write, &state).await),
 			"restore" => match (ask("User id: "), ask("Recovery key: ")) {
 				(Ok(user), Ok(key)) => show(communities::restore(&mut state, &user, &key).await),

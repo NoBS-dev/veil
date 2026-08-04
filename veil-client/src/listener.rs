@@ -776,6 +776,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
 		ProtocolMessage::CallSignal(_) => "call signal",
+		ProtocolMessage::RegisterPush { .. } => "push registration",
 		ProtocolMessage::CallRoster(_) => "call roster",
 		ProtocolMessage::StoreBackup(_) => "key backup",
 		ProtocolMessage::RevokeDevice(_) => "device revocation",
