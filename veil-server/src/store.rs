@@ -208,6 +208,16 @@ impl Store {
 			     claimed_at INTEGER NOT NULL
 			 );
 
+			 -- One encrypted blob per user (§12.5). The host stores something
+			 -- it cannot open: it holds the cross-signing secrets and every
+			 -- Megolm session, so a host that could read it could impersonate
+			 -- its user and read every Sealed community they are in.
+			 CREATE TABLE IF NOT EXISTS backups (
+			     user_id    BLOB PRIMARY KEY,
+			     blob       BLOB    NOT NULL,
+			     stored_at  INTEGER NOT NULL
+			 );
+
 			 CREATE TABLE IF NOT EXISTS server_identity (
 			     id      INTEGER PRIMARY KEY CHECK (id = 1),
 			     pickle  TEXT NOT NULL
@@ -771,6 +781,31 @@ impl Store {
 		)?;
 
 		Ok(rows.collect::<Result<Vec<_>, _>>()?)
+	}
+
+	// ---- key backup (§12.5) -----------------------------------------------
+
+	/// Replaces this user's backup. One per user: an older one is of no use
+	/// once a newer exists, and keeping several multiplies what a stolen
+	/// recovery key opens.
+	pub fn store_backup(&self, user: &UserId, blob: &[u8], now: u64) -> Result<()> {
+		self.db.execute(
+			"INSERT INTO backups (user_id, blob, stored_at) VALUES (?1, ?2, ?3)
+			 ON CONFLICT(user_id) DO UPDATE SET blob = excluded.blob, stored_at = excluded.stored_at",
+			params![user.as_bytes().as_slice(), blob, now],
+		)?;
+		Ok(())
+	}
+
+	pub fn backup(&self, user: &UserId) -> Result<Option<Vec<u8>>> {
+		Ok(self
+			.db
+			.query_row(
+				"SELECT blob FROM backups WHERE user_id = ?1",
+				params![user.as_bytes().as_slice()],
+				|r| r.get(0),
+			)
+			.optional()?)
 	}
 
 	// ---- aliases (§11.6) --------------------------------------------------

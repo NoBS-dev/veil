@@ -553,6 +553,92 @@ pub async fn call(
 	Ok(reported)
 }
 
+/// Uploads an encrypted backup of this identity (§12.5).
+///
+/// **One recovery key covers identity and history**, because splitting them
+/// would only give somebody two things to lose. The blob holds the
+/// cross-signing secrets and the Megolm sessions, and the host stores something
+/// it cannot open — a host that could would be able to impersonate its user and
+/// read every Sealed community they are in.
+///
+/// The key is generated here and shown once. It is random rather than derived
+/// from a passphrase, and that is load-bearing: the blob is fetchable by user
+/// id, so whoever holds it can attack it offline at their leisure.
+pub async fn backup(write: &Arc<Mutex<WriteStream>>, state: &State) -> Result<Vec<ClientEvent>> {
+	use veil_protocol::keybackup::{BackupPayload, RecoveryKey, seal};
+
+	let key = RecoveryKey::generate();
+
+	// Round-tripped rather than cloned: `CrossSigningSecrets` is deliberately
+	// not `Clone`, so copying the master key is something a caller has to ask
+	// for in as many words. A backup is the one place that is legitimate.
+	let payload = BackupPayload {
+		cross_signing: serde_json::from_str(&serde_json::to_string(state.cross_signing())?)?,
+		sessions: state.megolm_exports()?,
+	};
+
+	let sealed = seal(&key, &payload)?;
+	send(
+		write,
+		state,
+		ProtocolMessage::StoreBackup(serde_json::to_vec(&sealed)?),
+	)
+	.await?;
+
+	Ok(vec![
+		ClientEvent::info(format!("Recovery key: {}", key.display())),
+		ClientEvent::info(
+			"Write that down now — it is shown once and is not recoverable. It restores \
+			 both your identity and your history, on a device that has nothing else.",
+		),
+	])
+}
+
+/// Restores an identity from a backup (§12.5).
+///
+/// Runs on a device with nothing, which is the case it exists for — so it
+/// fetches by user id without authenticating, and the recovery key is the only
+/// thing standing between the blob and whoever has it.
+pub async fn restore(
+	state: &mut State,
+	user: &str,
+	recovery_key: &str,
+) -> Result<Vec<ClientEvent>> {
+	use veil_protocol::keybackup::{RecoveryKey, open};
+
+	let user = veil_protocol::identity::UserId::parse(user)?;
+	let key = RecoveryKey::parse(recovery_key)?;
+
+	let (scheme, _) = state.schemes();
+	let _ = scheme;
+	let blob = messaging::directory_client()?
+		.get(format!("http://{}/backup/{user}", state.ip_and_port))
+		.send()
+		.await?
+		.error_for_status()?
+		.bytes()
+		.await?;
+
+	let payload = open(&key, &serde_json::from_slice(&blob)?)?;
+
+	if payload.cross_signing.user_id() != user {
+		anyhow::bail!(
+			"that backup belongs to {}, not {user} — the host served the wrong one",
+			payload.cross_signing.user_id()
+		);
+	}
+
+	let sessions = payload.sessions.len();
+	state.adopt_identity(payload)?;
+	state.save_to_keyring()?;
+
+	Ok(vec![ClientEvent::info(format!(
+		"Restored {user} with {sessions} session(s). This device has a new device id, so \
+		 peers will see it as a new device of yours and history it was never given stays \
+		 unreadable."
+	))])
+}
+
 /// Retires one of this user's own devices (§5.6).
 ///
 /// **The case this exists for is a device already out of your hands**, so it

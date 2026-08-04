@@ -142,7 +142,24 @@ pub fn open_envelope(bytes: &[u8]) -> anyhow::Result<OpenedEnvelope> {
 }
 
 /// Rejects envelopes timestamped outside the accepted window, and any nonce
-/// seen before within it. A signature stays valid forever, so without this an
+/// seen before within it.
+///
+/// **In memory, deliberately.** A restart empties it, which reopens a window of
+/// one `REPLAY_WINDOW_MS` during which a captured envelope could be replayed.
+/// That looks worse than it is, and the reason is worth writing down rather
+/// than rediscovering:
+///
+/// - The attack this guard names — replaying a key upload to resurrect consumed
+///   one-time keys — is separately defended by a clock the *store* persists, so
+///   it survives a restart on its own (invariant 4).
+/// - A replayed message is dropped by the recipient before any Olm work,
+///   because a message id is a hash of its content and duplicates are refused
+///   (invariant 12).
+///
+/// So the residual is a narrow window, requiring a restart inside it, against
+/// two defences that both persist. Persisting every nonce would mean a database
+/// write per envelope for the life of the process — a permanent cost against a
+/// coincidence. If that trade ever changes, this is the comment to revisit. A signature stays valid forever, so without this an
 /// attacker could re-send a captured envelope verbatim: replaying a
 /// [`ProtocolMessage::UploadKeys`] would resurrect already-consumed one-time
 /// keys, defeating the point of them being one-time.
@@ -353,6 +370,12 @@ pub enum ProtocolMessage {
 	/// with a cross-signed device, the media keys are authenticated with no new
 	/// PKI — so a two-person call needs no new cryptography at all.
 	CallSignal(CallSignal),
+	/// Stores this user's encrypted key backup (§12.5).
+	///
+	/// Ciphertext the host cannot read — it holds the cross-signing secrets and
+	/// every Megolm session, so a host able to open it could read every Sealed
+	/// community its user belongs to and impersonate them besides.
+	StoreBackup(Vec<u8>),
 	/// Retires one of the sender's own devices (§5.6).
 	///
 	/// Carries the owner's signature over the device as retired, so the host is

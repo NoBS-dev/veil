@@ -121,7 +121,7 @@ to.
 | Key directory and mailboxes | **[built]** `veil-server/src/store.rs` |
 | Message store, push | designed, §12.1–12.2 |
 | Backups, succession, migration | designed, §12.3–12.4 |
-| Key backup, recovery key, enrolment bundles | **[built]** `keybackup.rs` |
+| Key backup, recovery key, enrolment bundles | **[built]** `keybackup.rs`, stored and restorable |
 | Horizontal scaling | designed, §13.1–13.3 |
 | Time synchronisation | **[built]** `clock.rs`, server-side |
 | Client architecture (seam, Qt, mobile) | designed, §17 |
@@ -2538,6 +2538,27 @@ Three properties follow, and all three are tested:
   sessions with it. For a Sealed channel, drop it from the reader list as well —
   that rotates the key, and it is a separate act because it is the expensive one
   (§8.5).
+
+## 12.6 Restoring after losing everything
+
+**Fetching a backup is unauthenticated, and it has to be.** Restoring runs on a
+device that has nothing, and the credentials it would authenticate with are
+inside the backup. So the blob is served by user id, rate limited per IP, and
+everything rests on the recovery key.
+
+That is what makes §12.5's insistence on a *random* recovery key load-bearing
+rather than fastidious: whoever fetches the blob can attack it offline at their
+leisure, and a passphrase would make that worth doing.
+
+A restored device gets a **new device id**. It is a new device of the same user,
+which is what it actually is — reusing the old id would claim to be a device
+that may still exist, and two devices sharing one id is precisely what a routing
+map cannot represent.
+
+**History is not yet in the backup.** The blob carries the cross-signing
+secrets, which is the half that matters more: losing those loses the account,
+where losing sessions loses history. Exporting Megolm sessions needs the
+provider to surface inbound session keys, which it does not yet do.
 
 ## 18. Bots
 

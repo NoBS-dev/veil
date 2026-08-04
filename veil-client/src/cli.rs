@@ -190,6 +190,11 @@ pub async fn cli(
 				}
 				Err(e) => eprintln!("{e:#}"),
 			},
+			"backup" => show(communities::backup(&write, &state).await),
+			"restore" => match (ask("User id: "), ask("Recovery key: ")) {
+				(Ok(user), Ok(key)) => show(communities::restore(&mut state, &user, &key).await),
+				_ => eprintln!("Could not read that."),
+			},
 			"revoke" => match (ask("Device id to retire: "), ask("Its signing key (hex): ")) {
 				(Ok(device), Ok(key)) => {
 					match (

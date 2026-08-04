@@ -364,6 +364,39 @@ impl State {
 	///
 	/// `None` means "not known", not "Open". A caller deciding whether it is
 	/// safe to send plaintext must treat the two differently.
+	/// The Megolm sessions this device holds, for a backup (§12.5).
+	pub fn megolm_exports(&self) -> Result<Vec<veil_protocol::keybackup::SessionExport>> {
+		// Nothing exports the sessions themselves yet — vodozemac exposes an
+		// inbound session's key, but the provider does not surface it. The
+		// backup carries identity now and history when it can, which is the
+		// half that matters most: losing the cross-signing secrets means
+		// losing the account, where losing history means losing history.
+		Ok(Vec::new())
+	}
+
+	/// Replaces this profile's identity with a restored one.
+	///
+	/// The device id is *not* restored. A restored device is a new device of the
+	/// same user, which is what it actually is — reusing the old id would claim
+	/// to be a device that may still exist, and two devices sharing one id is
+	/// exactly what the routing map cannot represent.
+	pub fn adopt_identity(
+		&mut self,
+		payload: veil_protocol::keybackup::BackupPayload,
+	) -> Result<()> {
+		self.user_id = payload.cross_signing.user_id();
+		self.cross_signing = payload.cross_signing;
+
+		// Everything learned as the old identity is meaningless now.
+		self.peers.clear();
+		self.peer_devices.clear();
+		self.known_communities.clear();
+		self.community_roots.clear();
+		self.community_chains.clear();
+
+		Ok(())
+	}
+
 	/// Records devices an owner has retired, and reports whether one is retired.
 	pub fn remember_revocations(&mut self, user: UserId, revoked: &[DeviceId]) {
 		for device in revoked {

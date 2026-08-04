@@ -349,6 +349,7 @@ async fn main() -> Result<()> {
 		)
 		.route("/users/{user}/devices", routing::get(get_device_list))
 		.route("/aliases/{alias}", routing::get(resolve_alias))
+		.route("/backup/{user}", routing::get(fetch_backup))
 		.route("/relay", routing::any(relay))
 		.route("/s2s", routing::any(deposit_socket))
 		.route(
@@ -379,6 +380,38 @@ async fn main() -> Result<()> {
 
 async fn socket(socket: WebSocketUpgrade, State(state): State<ServerState>) -> Response {
 	socket.on_upgrade(|socket| handle_socket(socket, state))
+}
+
+/// Serves a user's encrypted backup (§12.5).
+///
+/// **Unauthenticated, and it has to be.** Restoring happens on a device that has
+/// nothing yet — the credentials it would authenticate with are inside the
+/// backup. So the blob is fetchable by user id, and everything rests on the
+/// recovery key.
+///
+/// That is exactly why `keybackup` insists the recovery key is randomly
+/// generated and never derived from a passphrase: whoever holds this blob can
+/// attack it offline at their leisure, and a passphrase would make that
+/// worthwhile. Rate limited per IP so it cannot be swept cheaply.
+async fn fetch_backup(
+	State(state): State<ServerState>,
+	ConnectInfo(peer): ConnectInfo<SocketAddr>,
+	Path(user): Path<String>,
+) -> Response {
+	let now = state.clock.read().await.now_ms();
+	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
+		return (StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response();
+	}
+
+	let Ok(user) = UserId::parse(&user) else {
+		return (StatusCode::BAD_REQUEST, "not a user id").into_response();
+	};
+
+	match state.store.lock().await.backup(&user) {
+		Ok(Some(blob)) => blob.into_response(),
+		Ok(None) => (StatusCode::NOT_FOUND, "no backup").into_response(),
+		Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+	}
 }
 
 /// Resolves a human-typed name to the identity behind it (§11.6).
@@ -768,6 +801,23 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					// an hour later is an invitation to a call nobody is on, and
 					// worse, it would ring.
 					eprintln!("Dropping a call signal for {recipient}, who is {e}");
+				}
+			}
+			ProtocolMessage::StoreBackup(blob) => {
+				if blob.len() > MAX_BLOB {
+					eprintln!("Refusing an oversized backup from {address}");
+					continue;
+				}
+
+				let now = state.clock.read().await.now_ms();
+				match state
+					.store
+					.lock()
+					.await
+					.store_backup(&address.user, &blob, now)
+				{
+					Ok(()) => eprintln!("Stored a backup for {}", address.user),
+					Err(e) => eprintln!("Could not store a backup: {e:#}"),
 				}
 			}
 			ProtocolMessage::RevokeDevice(revocation) => {
