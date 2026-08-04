@@ -130,11 +130,30 @@ impl CrossSigningSecrets {
 	}
 
 	pub fn sign_device(&self, device: &DeviceId, device_ed25519: &[u8; 32]) -> [u8; 64] {
+		self.sign_device_state(device, device_ed25519, false)
+	}
+
+	/// Signs a device as retired (§5.6).
+	///
+	/// The self-signing key rather than the master, like enrolment — a user
+	/// retiring a lost laptop should not have to bring the master key out of
+	/// wherever it is kept (invariant 9).
+	pub fn revoke_device(&self, device: &DeviceId, device_ed25519: &[u8; 32]) -> [u8; 64] {
+		self.sign_device_state(device, device_ed25519, true)
+	}
+
+	fn sign_device_state(
+		&self,
+		device: &DeviceId,
+		device_ed25519: &[u8; 32],
+		revoked: bool,
+	) -> [u8; 64] {
 		self.self_signing
 			.sign(&device_binding_input(
 				&self.user_id(),
 				device,
 				device_ed25519,
+				revoked,
 			))
 			.to_bytes()
 	}
@@ -163,6 +182,16 @@ pub struct CrossSigningPublic {
 	/// Master key's signature over the user-signing key.
 	#[serde_as(as = "[_; 64]")]
 	pub user_signing_signature: [u8; 64],
+}
+
+/// What a device list came to, once checked.
+///
+/// Revoked devices are carried rather than dropped so a caller can go on
+/// refusing them after a host stops listing them.
+#[derive(Debug, Clone, Default)]
+pub struct VerifiedDevices {
+	pub active: Vec<crate::identity::Device>,
+	pub revoked: Vec<crate::identity::DeviceId>,
 }
 
 impl CrossSigningPublic {
@@ -214,13 +243,14 @@ impl CrossSigningPublic {
 		device: &DeviceId,
 		device_ed25519: &[u8; 32],
 		signature: &[u8; 64],
+		revoked: bool,
 	) -> anyhow::Result<()> {
 		self.verify(user)?;
 
 		let self_signing = Ed25519PublicKey::from_slice(&self.self_signing)?;
 		self_signing
 			.verify(
-				&device_binding_input(user, device, device_ed25519),
+				&device_binding_input(user, device, device_ed25519, revoked),
 				&Ed25519Signature::from_slice(signature)?,
 			)
 			.map_err(|e| anyhow::anyhow!("device {device} is not signed by {user}'s SSK: {e}"))?;
@@ -235,26 +265,45 @@ impl CrossSigningPublic {
 	/// user id. Entries that fail are dropped rather than rejecting the whole
 	/// list, so one bad or malicious entry cannot deny service to the rest —
 	/// but nothing that fails is ever returned.
+	///
+	/// **Revoked devices are returned separately, not silently dropped.** A
+	/// caller needs to know which devices were retired so it can refuse them
+	/// later even if the host stops mentioning them — a host that withholds a
+	/// revocation would otherwise be able to bring a retired device back.
 	pub fn verify_device_list(
 		&self,
 		user: &UserId,
 		devices: &[crate::identity::Device],
-	) -> anyhow::Result<Vec<crate::identity::Device>> {
+	) -> anyhow::Result<VerifiedDevices> {
 		self.verify(user)?;
 
-		Ok(devices
-			.iter()
-			.filter(|device| {
-				self.verify_device(
+		let mut active = Vec::new();
+		let mut revoked = Vec::new();
+
+		for device in devices {
+			// The signature covers the revoked flag, so an entry only verifies
+			// as whatever its owner actually signed it as.
+			if self
+				.verify_device(
 					user,
 					&device.device_id,
 					&device.ed25519,
 					&device.ssk_signature,
+					device.revoked,
 				)
-				.is_ok()
-			})
-			.cloned()
-			.collect())
+				.is_err()
+			{
+				continue;
+			}
+
+			if device.revoked {
+				revoked.push(device.device_id);
+			} else {
+				active.push(device.clone());
+			}
+		}
+
+		Ok(VerifiedDevices { active, revoked })
 	}
 
 	/// Have *we* verified this person? Checks our own user-signing key's
@@ -282,6 +331,7 @@ impl CrossSigningPublic {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::identity::Device;
 
 	fn device() -> (DeviceId, [u8; 32]) {
 		(
@@ -305,7 +355,7 @@ mod tests {
 		assert!(
 			alice
 				.public()
-				.verify_device(&alice.user_id(), &id, &key, &signature)
+				.verify_device(&alice.user_id(), &id, &key, &signature, false)
 				.is_ok()
 		);
 	}
@@ -320,13 +370,13 @@ mod tests {
 
 		let by_master = alice
 			.master
-			.sign(&device_binding_input(&alice.user_id(), &id, &key))
+			.sign(&device_binding_input(&alice.user_id(), &id, &key, false))
 			.to_bytes();
 
 		assert!(
 			alice
 				.public()
-				.verify_device(&alice.user_id(), &id, &key, &by_master)
+				.verify_device(&alice.user_id(), &id, &key, &by_master, false)
 				.is_err()
 		);
 	}
@@ -348,7 +398,7 @@ mod tests {
 		let signature = mallory.sign_device(&id, &key);
 		assert!(
 			forged
-				.verify_device(&alice.user_id(), &id, &key, &signature)
+				.verify_device(&alice.user_id(), &id, &key, &signature, false)
 				.is_err()
 		);
 	}
@@ -377,12 +427,12 @@ mod tests {
 		let (other_id, other_key) = device();
 		assert!(
 			public
-				.verify_device(&user, &other_id, &key, &signature)
+				.verify_device(&user, &other_id, &key, &signature, false)
 				.is_err()
 		);
 		assert!(
 			public
-				.verify_device(&user, &id, &other_key, &signature)
+				.verify_device(&user, &id, &other_key, &signature, false)
 				.is_err()
 		);
 
@@ -390,7 +440,7 @@ mod tests {
 		let bob = CrossSigningSecrets::new();
 		assert!(
 			bob.public()
-				.verify_device(&bob.user_id(), &id, &key, &signature)
+				.verify_device(&bob.user_id(), &id, &key, &signature, false)
 				.is_err()
 		);
 	}
@@ -431,7 +481,7 @@ mod tests {
 		// Alice trusts it without re-verifying Bob.
 		assert!(
 			bob_public
-				.verify_device(&bob.user_id(), &laptop, &laptop_key, &signature)
+				.verify_device(&bob.user_id(), &laptop, &laptop_key, &signature, false)
 				.is_ok()
 		);
 	}
@@ -461,8 +511,6 @@ mod tests {
 	/// invents must not survive verification — while the genuine entries do.
 	#[test]
 	fn a_forged_entry_is_dropped_from_a_device_list() {
-		use crate::identity::Device;
-
 		let alice = CrossSigningSecrets::new();
 		let mallory = CrossSigningSecrets::new();
 		let user = alice.user_id();
@@ -477,6 +525,7 @@ mod tests {
 				display_name: name.into(),
 				created_at: 0,
 				last_seen: 0,
+				revoked: false,
 			}
 		};
 
@@ -489,7 +538,11 @@ mod tests {
 		];
 
 		let verified = alice.public().verify_device_list(&user, &devices).unwrap();
-		let names: Vec<_> = verified.iter().map(|d| d.display_name.as_str()).collect();
+		let names: Vec<_> = verified
+			.active
+			.iter()
+			.map(|d| d.display_name.as_str())
+			.collect();
 		assert_eq!(names, ["phone", "laptop"]);
 	}
 
@@ -506,7 +559,142 @@ mod tests {
 		assert!(
 			restored
 				.public()
-				.verify_device(&restored.user_id(), &id, &key, &signature)
+				.verify_device(&restored.user_id(), &id, &key, &signature, false)
+				.is_ok()
+		);
+	}
+
+	/// §5.6: a device you no longer hold must be removable, which is the one
+	/// case where you cannot ask it to cooperate.
+	#[test]
+	fn a_revoked_device_is_not_returned_as_usable() {
+		let alice = CrossSigningSecrets::new();
+		let user = alice.user_id();
+		let (kept, kept_key) = device();
+		let (lost, lost_key) = device();
+
+		let devices = vec![
+			Device {
+				device_id: kept,
+				ed25519: kept_key,
+				curve25519: [0; 32],
+				ssk_signature: alice.sign_device(&kept, &kept_key),
+				display_name: "desktop".into(),
+				created_at: 0,
+				last_seen: 0,
+				revoked: false,
+			},
+			Device {
+				device_id: lost,
+				ed25519: lost_key,
+				curve25519: [0; 32],
+				ssk_signature: alice.revoke_device(&lost, &lost_key),
+				display_name: "stolen laptop".into(),
+				created_at: 0,
+				last_seen: 0,
+				revoked: true,
+			},
+		];
+
+		let verified = alice.public().verify_device_list(&user, &devices).unwrap();
+
+		assert_eq!(verified.active.len(), 1);
+		assert_eq!(verified.active[0].device_id, kept);
+		assert_eq!(
+			verified.revoked,
+			vec![lost],
+			"a revocation must be reported, not silently dropped — a caller has to \
+			 remember it once the host stops mentioning it"
+		);
+	}
+
+	/// A host cannot retire somebody's device for them: the flag is signed.
+	#[test]
+	fn a_host_cannot_revoke_a_device_it_does_not_own() {
+		let alice = CrossSigningSecrets::new();
+		let user = alice.user_id();
+		let (id, key) = device();
+
+		// The host flips the flag on an entry Alice signed as active.
+		let tampered = Device {
+			device_id: id,
+			ed25519: key,
+			curve25519: [0; 32],
+			ssk_signature: alice.sign_device(&id, &key),
+			display_name: "laptop".into(),
+			created_at: 0,
+			last_seen: 0,
+			revoked: true,
+		};
+
+		let verified = alice
+			.public()
+			.verify_device_list(&user, std::slice::from_ref(&tampered))
+			.unwrap();
+		assert!(
+			verified.active.is_empty() && verified.revoked.is_empty(),
+			"an entry whose flag was changed must verify as neither"
+		);
+	}
+
+	/// Nor un-retire one. The signature covers the flag in both directions.
+	#[test]
+	fn a_host_cannot_unrevoke_a_device() {
+		let alice = CrossSigningSecrets::new();
+		let user = alice.user_id();
+		let (id, key) = device();
+
+		let tampered = Device {
+			device_id: id,
+			ed25519: key,
+			curve25519: [0; 32],
+			// Signed as revoked, served as active.
+			ssk_signature: alice.revoke_device(&id, &key),
+			display_name: "stolen laptop".into(),
+			created_at: 0,
+			last_seen: 0,
+			revoked: false,
+		};
+
+		let verified = alice
+			.public()
+			.verify_device_list(&user, std::slice::from_ref(&tampered))
+			.unwrap();
+		assert!(
+			verified.active.is_empty(),
+			"a device signed as retired must not be usable by clearing a flag"
+		);
+	}
+
+	/// Revoking uses the self-signing key, not the master — retiring a lost
+	/// laptop should not mean fetching the key you keep offline (invariant 9).
+	#[test]
+	fn revoking_does_not_need_the_master_key() {
+		let alice = CrossSigningSecrets::new();
+		let (id, key) = device();
+
+		let by_master =
+			alice
+				.master_secret()
+				.sign(&device_binding_input(&alice.user_id(), &id, &key, true));
+
+		assert!(
+			alice
+				.public()
+				.verify_device(&alice.user_id(), &id, &key, &by_master.to_bytes(), true)
+				.is_err(),
+			"a master-key signature is not a device signature, revocation included"
+		);
+		assert!(
+			alice
+				.public()
+				.verify_device(
+					&alice.user_id(),
+					&id,
+					&key,
+					&alice.revoke_device(&id, &key),
+					true
+				)
 				.is_ok()
 		);
 	}

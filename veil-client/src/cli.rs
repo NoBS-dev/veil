@@ -79,9 +79,6 @@ pub async fn cli(
 
 				println!("{}", base64::encode(state.account.ed25519_key().as_bytes()));
 			}
-			"list" => {
-				println!("{:?}", list_clients(url).await?);
-			}
 			"quit" | "exit" => {
 				println!("Quitting...");
 				std::process::exit(0);
@@ -90,8 +87,6 @@ pub async fn cli(
 				state.delete_from_keyring()?;
 			}
 			"msg" => {
-				println!("{:?}", list_clients(url).await?);
-
 				match (
 					ask("Enter target device (<user-id>/<device-id>[@host]): "),
 					ask("Enter message: "),
@@ -194,6 +189,20 @@ pub async fn cli(
 					show(communities::call(&write, &mut state, url, &calls, &target).await)
 				}
 				Err(e) => eprintln!("{e:#}"),
+			},
+			"revoke" => match (ask("Device id to retire: "), ask("Its signing key (hex): ")) {
+				(Ok(device), Ok(key)) => {
+					match (
+						veil_protocol::identity::DeviceId::parse(&device),
+						veil_protocol::parse_hex_key(&key),
+					) {
+						(Ok(device), Ok(key)) => {
+							show(communities::revoke(&write, &mut state, device, key).await)
+						}
+						_ => eprintln!("Could not read that."),
+					}
+				}
+				_ => eprintln!("Could not read that."),
 			},
 			"alias" => match ask("Alias to claim: ") {
 				Ok(name) => show(communities::alias(&write, &state, &name).await),
@@ -353,7 +362,13 @@ async fn show_devices(state: &mut State, url: &str) -> Result<()> {
 	let user = UserId::parse(input.trim())?;
 
 	let mut reported = Vec::new();
-	let (keys, devices) = messaging::fetch_device_list(&user, url, &mut reported).await?;
+	let (keys, listed) = messaging::fetch_device_list(&user, url, &mut reported).await?;
+	state.remember_revocations(user, &listed.revoked);
+	let devices = listed.active;
+
+	for retired in &listed.revoked {
+		println!("  {retired} — retired by its owner");
+	}
 	for event in &reported {
 		eprintln!("{}", event.render());
 	}
@@ -458,16 +473,4 @@ fn show_safety_number(state: &mut State) -> Result<()> {
 	println!("Verified {verified}. Their devices will now check out automatically.");
 
 	Ok(())
-}
-
-async fn list_clients(url: &str) -> anyhow::Result<Vec<String>> {
-	Ok(messaging::directory_client()?
-		.get(format!("{url}/clients"))
-		.send()
-		.await?
-		.text()
-		.await?
-		.lines()
-		.map(|line| line.trim().to_string())
-		.collect())
 }

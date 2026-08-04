@@ -353,6 +353,12 @@ pub enum ProtocolMessage {
 	/// with a cross-signed device, the media keys are authenticated with no new
 	/// PKI — so a two-person call needs no new cryptography at all.
 	CallSignal(CallSignal),
+	/// Retires one of the sender's own devices (§5.6).
+	///
+	/// Carries the owner's signature over the device as retired, so the host is
+	/// recording a statement rather than making one — it can neither retire a
+	/// device on a user's behalf nor refuse to believe one that verifies.
+	RevokeDevice(RevokeDevice),
 	/// Claims a human-usable name on this host (§11.6).
 	///
 	/// The alias is **never** the identity. It is server-controlled and
@@ -495,6 +501,17 @@ pub struct Report {
 	/// report is accepted too and treated as signal for human review rather than
 	/// proof — which is what mainstream platforms do with reports regardless.
 	pub attribution: Option<String>,
+}
+
+/// A device its owner has retired.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct RevokeDevice {
+	pub device: DeviceId,
+	/// The retired device's signing key, which the signature covers.
+	pub device_ed25519: [u8; 32],
+	/// The owner's self-signing key over (user, device, key, retired).
+	pub signature: [u8; 64],
 }
 
 /// One step of call setup, addressed to a device.

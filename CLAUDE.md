@@ -316,7 +316,16 @@ explicitly — each one closes a specific attack.
     bot reading this" is already answered by the reader list. The `Automated`
     marker is a label for the interface; nothing enforces it and nothing should
     branch on it.
-32. **Never send plaintext under a Sealed id.** The mode is inside the community
+32. **Megolm sessions rotate on age and volume, not only on membership**
+    (§8.3). Without both, one stolen key is worth a whole channel for as long as
+    the channel has existed — a busy channel hits the message count in an
+    afternoon, a quiet one would keep a session forever. The counters are
+    persisted, because a client that restarted daily would otherwise never
+    rotate.
+33. **A device retirement is signed by its owner and is monotonic** (§5.6). A
+    host cannot retire a device or revive one, and clients remember retirements
+    so a host that stops mentioning one changes nothing.
+34. **Never send plaintext under a Sealed id.** The mode is inside the community
     id, so that id is what tells everyone else the content is protected. A
     client that cannot encrypt must refuse to post rather than fall back — the
     fallback is worse than the failure.

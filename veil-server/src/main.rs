@@ -58,6 +58,12 @@ const MAX_BLOB: usize = 16 << 20;
 /// starting point, because the alternative is unbounded disk use by anyone who
 /// can connect.
 const MAX_BLOB_STORAGE: i64 = 4 << 30;
+/// Actions one device may take per window: posts, blobs, keys, signalling.
+///
+/// Generous enough that nobody typing will notice, and low enough that a script
+/// cannot fill a channel. Ephemeral events are excluded — typing notifications
+/// legitimately arrive far faster than this and cost nothing to drop.
+const ACTIONS_PER_DEVICE_PER_WINDOW: u32 = 600;
 /// Deposits one server may make per window (§3.4). Generous — a busy server
 /// legitimately carries mail for many users — but bounded.
 const DEPOSITS_PER_SERVER_PER_WINDOW: u32 = 600;
@@ -80,6 +86,13 @@ struct ServerState {
 	ip_limiter: Arc<Mutex<RateLimiter<IpAddr>>>,
 	otk_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
 	tunnel_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
+	/// What one device may send per window.
+	///
+	/// Membership was the only gate on posting, uploading and signalling, which
+	/// makes a member the limit — one could fill a channel or the blob store as
+	/// fast as it could write. Keyed by device rather than by user so one
+	/// misbehaving client does not silence its owner's other devices.
+	device_limiter: Arc<Mutex<RateLimiter<DeviceAddress>>>,
 	/// Deposits one *server* may make per window (§3.4).
 	///
 	/// Keyed on the peer's identity key rather than its IP: an operator running
@@ -286,6 +299,10 @@ async fn main() -> Result<()> {
 			TUNNELS_PER_USER_PER_WINDOW,
 			RATE_WINDOW_MS,
 		))),
+		device_limiter: Arc::new(Mutex::new(RateLimiter::new(
+			ACTIONS_PER_DEVICE_PER_WINDOW,
+			RATE_WINDOW_MS,
+		))),
 		deposit_limiter: Arc::new(Mutex::new(RateLimiter::new(
 			DEPOSITS_PER_SERVER_PER_WINDOW,
 			RATE_WINDOW_MS,
@@ -326,7 +343,6 @@ async fn main() -> Result<()> {
 
 	let router = Router::new()
 		.route("/", routing::any(socket))
-		.route("/clients", routing::get(list_clients))
 		.route(
 			"/devices/{user}/{device}/otk",
 			routing::get(get_prekey_bundle),
@@ -496,9 +512,16 @@ async fn authenticate(
 	// signed this envelope — so a peer cannot present someone else's valid
 	// enrolment. Drop any link and a peer can be routed under an identity it
 	// does not own.
-	claim
-		.keys
-		.verify_device(&claim.user, &claim.device, &opened.sender, &claim.binding)?;
+	// `false`: a device connecting is by definition claiming to be active. A
+	// retired one cannot authenticate, because its binding was signed as
+	// revoked and will not verify as anything else.
+	claim.keys.verify_device(
+		&claim.user,
+		&claim.device,
+		&opened.sender,
+		&claim.binding,
+		false,
+	)?;
 
 	// Everything needed for a device-list entry has just been verified, so
 	// record it here rather than trusting a later self-report.
@@ -512,6 +535,7 @@ async fn authenticate(
 			curve25519: [0; 32], // filled in by the key upload
 			ssk_signature: claim.binding,
 			display_name: String::new(),
+			revoked: false,
 			created_at: now,
 			last_seen: now,
 		},
@@ -589,6 +613,17 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 				.check_at(now, opened.timestamp_ms, opened.nonce)
 		{
 			eprintln!("Discarding a replayed envelope: {e:#}");
+			continue;
+		}
+
+		// Everything below this point is an action a member takes, and until
+		// this existed the only limit on any of them was membership. Ephemeral
+		// events are deliberately outside it: typing notifications arrive far
+		// faster than any sane budget and cost nothing to drop.
+		if !matches!(opened.message, ProtocolMessage::Ephemeral(_))
+			&& !state.device_limiter.lock().await.allow(address, now)
+		{
+			eprintln!("{address} is over its action budget; dropping a frame");
 			continue;
 		}
 
@@ -733,6 +768,51 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					// an hour later is an invitation to a call nobody is on, and
 					// worse, it would ring.
 					eprintln!("Dropping a call signal for {recipient}, who is {e}");
+				}
+			}
+			ProtocolMessage::RevokeDevice(revocation) => {
+				// Recorded, not decided. The host checks the owner's signature
+				// and stores what it says; it cannot retire somebody's device
+				// and cannot decline to believe a valid retirement, because
+				// every client verifies the same signature itself.
+				let store = state.store.lock().await;
+				let Ok(Some((keys, devices))) = store.device_list(&address.user) else {
+					eprintln!("Revocation from {address} for a user we do not hold");
+					continue;
+				};
+
+				if keys
+					.verify_device(
+						&address.user,
+						&revocation.device,
+						&revocation.device_ed25519,
+						&revocation.signature,
+						true,
+					)
+					.is_err()
+				{
+					eprintln!("Discarding an unsigned revocation from {address}");
+					continue;
+				}
+
+				let Some(existing) = devices
+					.iter()
+					.find(|d| d.device_id == revocation.device)
+					.cloned()
+				else {
+					eprintln!("Revocation from {address} for a device we do not hold");
+					continue;
+				};
+
+				let retired = Device {
+					ssk_signature: revocation.signature,
+					revoked: true,
+					..existing
+				};
+
+				match store.upsert_device(&address.user, &keys, &retired) {
+					Ok(()) => eprintln!("{} retired device {}", address.user, revocation.device),
+					Err(e) => eprintln!("Could not record a revocation: {e:#}"),
 				}
 			}
 			ProtocolMessage::ClaimAlias(alias) => {
@@ -1016,23 +1096,6 @@ async fn flush_mailbox(state: &ServerState, address: &DeviceAddress) -> Result<(
 // TODO: this hands the full roster to anyone who asks, which is a metadata leak
 // no amount of rate limiting fixes. It wants replacing with per-user contact
 // lists before this faces an untrusted network.
-async fn list_clients(
-	State(state): State<ServerState>,
-	ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
-	let now = state.clock.read().await.now_ms();
-
-	if !state.ip_limiter.lock().await.allow(peer.ip(), now) {
-		return Err((StatusCode::TOO_MANY_REQUESTS, "Too many requests".into()));
-	}
-
-	println!("List called");
-
-	let clients = CLIENTS.read().await;
-	let iter = clients.keys().map(DeviceAddress::to_string);
-	Ok(itertools::Itertools::intersperse(iter, String::from("\n")).collect::<String>())
-}
-
 /// Applies a key upload, completing the device entry the handshake started.
 fn store_upload(
 	store: &mut store::Store,

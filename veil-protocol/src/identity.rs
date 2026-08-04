@@ -109,6 +109,16 @@ impl DeviceId {
 		&self.0
 	}
 
+	/// Parses the base32 form a device address is written in (§5.3).
+	pub fn parse(text: &str) -> anyhow::Result<Self> {
+		let bytes =
+			data_encoding::BASE32_NOPAD.decode(text.trim().to_ascii_uppercase().as_bytes())?;
+
+		Ok(Self::from_bytes(bytes.as_slice().try_into().map_err(
+			|_| anyhow::anyhow!("a device id is 16 bytes; got {}", bytes.len()),
+		)?))
+	}
+
 	pub fn from_bytes(bytes: [u8; 16]) -> Self {
 		Self(bytes)
 	}
@@ -168,6 +178,14 @@ pub struct Device {
 	pub display_name: String,
 	pub created_at: u64,
 	pub last_seen: u64,
+	/// Whether the owner has retired this device (§5.6).
+	///
+	/// **Inside the signed binding**, so a host can neither revoke a device on a
+	/// user's behalf nor un-revoke one they retired. Revoking is the one thing
+	/// that must work when a device is already out of your hands, which is
+	/// exactly when you cannot ask it to cooperate.
+	#[serde(default)]
+	pub revoked: bool,
 }
 
 impl Device {
@@ -188,12 +206,16 @@ pub fn device_binding_input(
 	user: &UserId,
 	device: &DeviceId,
 	device_ed25519: &[u8; 32],
+	revoked: bool,
 ) -> Vec<u8> {
-	let mut buffer = Vec::with_capacity(DEVICE_BINDING_DOMAIN.len() + USER_ID_LEN + 16 + 32);
+	let mut buffer = Vec::with_capacity(DEVICE_BINDING_DOMAIN.len() + USER_ID_LEN + 16 + 33);
 	buffer.extend_from_slice(DEVICE_BINDING_DOMAIN);
 	buffer.extend_from_slice(user.as_bytes());
 	buffer.extend_from_slice(device.as_bytes());
 	buffer.extend_from_slice(device_ed25519);
+	// Covered by the signature, so revoking is a statement only the owner can
+	// make and only they can take back.
+	buffer.push(u8::from(revoked));
 	buffer
 }
 
@@ -328,6 +350,7 @@ mod tests {
 				display_name: "phone".into(),
 				created_at: 1,
 				last_seen: 1,
+				revoked: false,
 			},
 			1,
 		);
@@ -340,6 +363,7 @@ mod tests {
 				display_name: "laptop".into(),
 				created_at: 2,
 				last_seen: 2,
+				revoked: false,
 			},
 			2,
 		);
@@ -355,6 +379,7 @@ mod tests {
 				display_name: "phone".into(),
 				created_at: 1,
 				last_seen: 3,
+				revoked: false,
 			},
 			3,
 		);
@@ -388,6 +413,7 @@ mod tests {
 				display_name: "d".into(),
 				created_at: 0,
 				last_seen: 0,
+				revoked: false,
 			},
 			11,
 		);

@@ -98,6 +98,7 @@ to.
 | Protocol version negotiation | **[built]** `version.rs` |
 | User/device separation, multi-device | **[built]** `identity.rs` |
 | Cross-signing, verifiable device lists | **[built]** `crosssign.rs` |
+| Device retirement | **[built]** §5.6 — signed, monotonic |
 | Community roots, policy chain, mode binding | **[built]** `community.rs`, served over a transport |
 | Communities and channels on a host | **[built]** `veil-server/src/community.rs` — create, join, post, backfill, host-assigned ordering |
 | Moderation and reporting under Sealed | **[built]** reports held for a moderator; unattributed accepted |
@@ -2513,6 +2514,30 @@ IDE-style floating windows — a much smaller problem.
 | v3 | Floating windows, tab groups | KDDockWidgets |
 
 ---
+
+## 5.6 Retiring a device
+
+**Added after implementation.** §5 described enrolling devices and never
+retiring one, which left a stolen laptop a valid member of an identity forever.
+
+A retirement is a **signed statement by the owner**, not a request to a host.
+The self-signing key signs the device as retired — the master stays wherever it
+is kept (invariant 9) — and because the retired flag is inside the signature, a
+host can neither retire somebody's device nor serve a retired one as active.
+
+Three properties follow, and all three are tested:
+
+- **It works on a device you no longer hold.** That is the case it exists for,
+  so nothing about it can require the device to cooperate.
+- **It is monotonic.** The signature stops a host forging either direction, but
+  a host replaying an older, genuinely-signed entry could otherwise bring a
+  device back. Hosts keep the retired flag once set, and clients remember
+  retirements so a host that stops mentioning one changes nothing.
+- **It does not reach the device.** Anything it already holds, it keeps.
+  Retiring stops it being *given* anything further and stops peers opening new
+  sessions with it. For a Sealed channel, drop it from the reader list as well —
+  that rotates the key, and it is a separate act because it is the expensive one
+  (§8.5).
 
 ## 18. Bots
 

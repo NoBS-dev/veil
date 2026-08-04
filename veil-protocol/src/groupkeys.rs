@@ -18,6 +18,19 @@ use vodozemac::megolm::{
 	GroupSession, InboundGroupSession, MegolmMessage, SessionConfig, SessionKey,
 };
 
+/// Messages one session will carry before it is replaced.
+///
+/// Matrix's value. A busy channel reaches this in an afternoon, which is the
+/// point — it bounds how much one stolen key is worth in traffic rather than in
+/// time.
+const MESSAGES_PER_SESSION: u64 = 100;
+/// How long one session lives, however quiet the channel.
+///
+/// The other half of the bound: without it a channel with little traffic keeps
+/// one session indefinitely, and a key taken from it is worth everything ever
+/// said there.
+const SESSION_LIFETIME_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// A channel within a community.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ChannelId {
@@ -80,6 +93,8 @@ pub enum RotationCause {
 	/// Only additions; the existing key is handed to the newcomers. Joiners
 	/// cannot read history from before they joined, by construction (§8.3).
 	MembersAdded,
+	/// The session has run long enough. See [`MegolmProvider::rotation_due`].
+	Aged,
 }
 
 pub trait GroupKeyProvider {
@@ -94,10 +109,14 @@ pub trait GroupKeyProvider {
 
 	/// Applies a readership decided by verified policy, returning whatever key
 	/// material now needs delivering.
+	/// `now` is supplied rather than read, for the same reason `ReplayGuard`
+	/// takes it: a provider that read the clock itself could not be told about
+	/// an SNTP offset (§13.4) and could not be driven by a test.
 	fn set_readership(
 		&mut self,
 		channel: &ChannelId,
 		readership: &Readership,
+		now: u64,
 	) -> anyhow::Result<Option<(RotationCause, KeyDelivery)>>;
 
 	/// Accepts key material a peer sent us.
@@ -113,6 +132,12 @@ struct Outbound {
 	session: GroupSession,
 	readers: BTreeSet<DeviceAddress>,
 	policy_sequence: u64,
+	/// Messages sent under this session, and when it was established.
+	///
+	/// Both bound how much one stolen key is worth — see
+	/// [`MegolmProvider::rotation_due`].
+	messages: u64,
+	established_at: u64,
 }
 
 /// Megolm behind the boundary.
@@ -151,6 +176,12 @@ struct OutboundState {
 	session: String,
 	readers: BTreeSet<DeviceAddress>,
 	policy_sequence: u64,
+	/// Carried across a restart. Without these a client that restarted daily
+	/// would never rotate, which is the failure the limits exist to prevent.
+	#[serde(default)]
+	messages: u64,
+	#[serde(default)]
+	established_at: u64,
 }
 
 impl MegolmProvider {
@@ -167,6 +198,8 @@ impl MegolmProvider {
 							session: serde_json::to_string(&out.session.pickle())?,
 							readers: out.readers.clone(),
 							policy_sequence: out.policy_sequence,
+							messages: out.messages,
+							established_at: out.established_at,
 						},
 					))
 				})
@@ -198,6 +231,8 @@ impl MegolmProvider {
 					session: GroupSession::from_pickle(serde_json::from_str(&out.session)?),
 					readers: out.readers,
 					policy_sequence: out.policy_sequence,
+					messages: out.messages,
+					established_at: out.established_at,
 				},
 			);
 		}
@@ -225,6 +260,51 @@ impl MegolmProvider {
 	/// Cost of the next rotation, in pairwise Olm encryptions. Exposed because
 	/// it is the number that decides whether Megolm remains viable for a given
 	/// channel (§8.3).
+	/// Whether a channel's session has run long enough to be replaced.
+	///
+	/// **Megolm has no backward secrecy within a session.** A key taken from a
+	/// device today decrypts every message sent under that session, including
+	/// ones from before the theft, and goes on decrypting until the session
+	/// ends. Rotating on nothing but membership change means a session
+	/// established a year ago is still the session — so one stolen device is
+	/// worth a year of a channel.
+	///
+	/// Rotation bounds that. Both limits matter and neither substitutes for the
+	/// other: a busy channel reaches the message count in an afternoon, and a
+	/// quiet one would otherwise keep one session indefinitely. The values match
+	/// Matrix's, which is not laziness — they are what a decade of running this
+	/// in practice settled on, and departing from them needs a reason.
+	pub fn rotation_due(&self, channel: &ChannelId, now: u64) -> bool {
+		self.outbound.get(channel).is_some_and(|out| {
+			out.messages >= MESSAGES_PER_SESSION
+				|| now.saturating_sub(out.established_at) >= SESSION_LIFETIME_MS
+		})
+	}
+
+	/// Replaces a channel's session if it is due, returning what to distribute.
+	///
+	/// Separate from `encrypt` so the caller decides when to pay the cost — it
+	/// is `Σ(devices)` pairwise encryptions — and so encryption itself stays a
+	/// function that cannot fail for a reason the caller has to handle.
+	pub fn rotate_if_due(
+		&mut self,
+		channel: &ChannelId,
+		now: u64,
+	) -> Option<(RotationCause, KeyDelivery)> {
+		if !self.rotation_due(channel, now) {
+			return None;
+		}
+
+		let existing = self.outbound.get(channel)?;
+		let readership = Readership {
+			devices: existing.readers.clone(),
+			policy_sequence: existing.policy_sequence,
+		};
+		let recipients = readership.devices.iter().copied().collect();
+
+		Some(self.establish(channel, &readership, RotationCause::Aged, recipients, now))
+	}
+
 	pub fn rotation_cost(&self, channel: &ChannelId) -> usize {
 		self.outbound
 			.get(channel)
@@ -238,6 +318,7 @@ impl MegolmProvider {
 		readership: &Readership,
 		cause: RotationCause,
 		recipients: Vec<DeviceAddress>,
+		now: u64,
 	) -> (RotationCause, KeyDelivery) {
 		let session = GroupSession::new(SessionConfig::version_2());
 		let payload = session.session_key().to_base64().into_bytes();
@@ -256,6 +337,8 @@ impl MegolmProvider {
 				session,
 				readers: readership.devices.clone(),
 				policy_sequence: readership.policy_sequence,
+				messages: 0,
+				established_at: now,
 			},
 		);
 
@@ -275,6 +358,10 @@ impl GroupKeyProvider for MegolmProvider {
 		let outbound = self.outbound.get_mut(channel).ok_or_else(|| {
 			anyhow::anyhow!("no group session for {channel}; set a readership first")
 		})?;
+
+		// Counted here rather than by the caller, so a caller that forgets does
+		// not silently disable the volume limit.
+		outbound.messages = outbound.messages.saturating_add(1);
 
 		Ok(outbound.session.encrypt(plaintext).to_base64().into_bytes())
 	}
@@ -298,6 +385,7 @@ impl GroupKeyProvider for MegolmProvider {
 		&mut self,
 		channel: &ChannelId,
 		readership: &Readership,
+		now: u64,
 	) -> anyhow::Result<Option<(RotationCause, KeyDelivery)>> {
 		let Some(existing) = self.outbound.get(channel) else {
 			let recipients = readership.devices.iter().copied().collect();
@@ -306,6 +394,7 @@ impl GroupKeyProvider for MegolmProvider {
 				readership,
 				RotationCause::Established,
 				recipients,
+				now,
 			)));
 		};
 
@@ -337,6 +426,7 @@ impl GroupKeyProvider for MegolmProvider {
 				readership,
 				RotationCause::MemberRemoved,
 				recipients,
+				now,
 			)));
 		}
 
@@ -419,7 +509,7 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(device());
 		let (cause, delivery) = sender
-			.set_readership(&channel, &readership(&[alice, bob], 1))
+			.set_readership(&channel, &readership(&[alice, bob], 1), 0)
 			.unwrap()
 			.unwrap();
 		assert_eq!(cause, RotationCause::Established);
@@ -446,7 +536,7 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(device());
 		let (_, first) = sender
-			.set_readership(&channel, &readership(&[alice, bob, carol], 1))
+			.set_readership(&channel, &readership(&[alice, bob, carol], 1), 0)
 			.unwrap()
 			.unwrap();
 
@@ -462,7 +552,7 @@ mod tests {
 
 		// Carol loses access.
 		let (cause, second) = sender
-			.set_readership(&channel, &readership(&[alice, bob], 2))
+			.set_readership(&channel, &readership(&[alice, bob], 2), 0)
 			.unwrap()
 			.unwrap();
 		assert_eq!(cause, RotationCause::MemberRemoved);
@@ -488,12 +578,12 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(device());
 		let (_, first) = sender
-			.set_readership(&channel, &readership(&[alice, bob], 1))
+			.set_readership(&channel, &readership(&[alice, bob], 1), 0)
 			.unwrap()
 			.unwrap();
 
 		let (cause, second) = sender
-			.set_readership(&channel, &readership(&[alice, bob, dave], 2))
+			.set_readership(&channel, &readership(&[alice, bob, dave], 2), 0)
 			.unwrap()
 			.unwrap();
 
@@ -513,12 +603,12 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(device());
 		sender
-			.set_readership(&channel, &readership(&[alice, bob], 1))
+			.set_readership(&channel, &readership(&[alice, bob], 1), 0)
 			.unwrap();
 
 		assert!(
 			sender
-				.set_readership(&channel, &readership(&[alice, bob], 2))
+				.set_readership(&channel, &readership(&[alice, bob], 2), 0)
 				.unwrap()
 				.is_none()
 		);
@@ -532,16 +622,16 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(device());
 		sender
-			.set_readership(&channel, &readership(&[alice, bob, carol], 5))
+			.set_readership(&channel, &readership(&[alice, bob, carol], 5), 0)
 			.unwrap();
 		sender
-			.set_readership(&channel, &readership(&[alice, bob], 6))
+			.set_readership(&channel, &readership(&[alice, bob], 6), 0)
 			.unwrap();
 
 		// Replaying the older record, which still lists Carol.
 		assert!(
 			sender
-				.set_readership(&channel, &readership(&[alice, bob, carol], 5))
+				.set_readership(&channel, &readership(&[alice, bob, carol], 5), 0)
 				.is_err()
 		);
 	}
@@ -557,7 +647,7 @@ mod tests {
 		assert_eq!(sender.rotation_cost(&channel), 0);
 
 		sender
-			.set_readership(&channel, &readership(&devices, 1))
+			.set_readership(&channel, &readership(&devices, 1), 0)
 			.unwrap();
 		assert_eq!(sender.rotation_cost(&channel), 50);
 	}
@@ -581,7 +671,7 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(sender_address);
 		let delivery = sender
-			.set_readership(&channel, &readership(&[reader], 1))
+			.set_readership(&channel, &readership(&[reader], 1), 0)
 			.unwrap()
 			.expect("establishing a channel produces a key")
 			.1;
@@ -615,7 +705,7 @@ mod tests {
 
 		let mut sender = MegolmProvider::new(sender_address);
 		let delivery = sender
-			.set_readership(&channel, &readership(&[reader], 1))
+			.set_readership(&channel, &readership(&[reader], 1), 0)
 			.unwrap()
 			.unwrap()
 			.1;
@@ -650,7 +740,7 @@ mod tests {
 
 		let mut provider = MegolmProvider::new(me);
 		provider
-			.set_readership(&channel, &readership(&[me, device()], 1))
+			.set_readership(&channel, &readership(&[me, device()], 1), 0)
 			.unwrap();
 
 		let ciphertext = provider.encrypt(&channel, b"my own message").unwrap();
@@ -669,7 +759,7 @@ mod tests {
 
 		let mut provider = MegolmProvider::new(me);
 		provider
-			.set_readership(&channel, &readership(&[me], 1))
+			.set_readership(&channel, &readership(&[me], 1), 0)
 			.unwrap();
 		let ciphertext = provider.encrypt(&channel, b"before").unwrap();
 
@@ -677,6 +767,87 @@ mod tests {
 		assert_eq!(
 			restored.decrypt(&channel, &me, &ciphertext).unwrap(),
 			b"before"
+		);
+	}
+	/// §8.3: a session that never ends means one stolen key is worth the whole
+	/// channel, for as long as the channel has existed.
+	#[test]
+	fn a_session_rotates_once_it_has_carried_enough_messages() {
+		let channel = channel();
+		let me = device();
+		let mut provider = MegolmProvider::new(me);
+
+		provider
+			.set_readership(&channel, &readership(&[me, device()], 1), 0)
+			.unwrap();
+
+		assert!(!provider.rotation_due(&channel, 0));
+
+		for _ in 0..MESSAGES_PER_SESSION {
+			provider.encrypt(&channel, b"chatter").unwrap();
+		}
+
+		assert!(
+			provider.rotation_due(&channel, 0),
+			"a session must not carry unbounded traffic"
+		);
+
+		let (cause, delivery) = provider
+			.rotate_if_due(&channel, 0)
+			.expect("a due session should rotate");
+		assert_eq!(cause, RotationCause::Aged);
+		assert_eq!(
+			delivery.recipients.len(),
+			2,
+			"everyone still reading needs the replacement"
+		);
+
+		// And the replacement starts its own budget.
+		assert!(!provider.rotation_due(&channel, 0));
+	}
+
+	/// The other half of the bound: a quiet channel would otherwise keep one
+	/// session forever.
+	#[test]
+	fn a_session_rotates_once_it_is_old_enough() {
+		let channel = channel();
+		let me = device();
+		let mut provider = MegolmProvider::new(me);
+
+		provider
+			.set_readership(&channel, &readership(&[me], 1), 1_000)
+			.unwrap();
+
+		provider.encrypt(&channel, b"one message all week").unwrap();
+		assert!(
+			!provider.rotation_due(&channel, 1_000 + SESSION_LIFETIME_MS - 1),
+			"it should not rotate early"
+		);
+		assert!(
+			provider.rotation_due(&channel, 1_000 + SESSION_LIFETIME_MS),
+			"a week-old session must be replaced however quiet the channel"
+		);
+	}
+
+	/// A client that restarted daily would otherwise never rotate, which is
+	/// exactly the case the limits exist for.
+	#[test]
+	fn the_rotation_budget_survives_a_restart() {
+		let channel = channel();
+		let me = device();
+		let mut provider = MegolmProvider::new(me);
+
+		provider
+			.set_readership(&channel, &readership(&[me], 1), 1_000)
+			.unwrap();
+		for _ in 0..MESSAGES_PER_SESSION {
+			provider.encrypt(&channel, b"chatter").unwrap();
+		}
+
+		let restored = MegolmProvider::restore(provider.save().unwrap(), me).unwrap();
+		assert!(
+			restored.rotation_due(&channel, 1_000),
+			"the message count must survive a restart, or restarting resets the budget"
 		);
 	}
 }

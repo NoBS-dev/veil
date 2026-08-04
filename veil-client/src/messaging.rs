@@ -94,8 +94,19 @@ pub async fn ensure_session(
 		return Ok(());
 	}
 
-	let (_, devices) = fetch_device_list(&target.user, directory, reported).await?;
+	let (_, listed) = fetch_device_list(&target.user, directory, reported).await?;
+	state.remember_revocations(target.user, &listed.revoked);
 
+	// Checked against what we remember, not only against this answer: a host
+	// that stopped serving the revocation would otherwise revive the device.
+	if state.is_revoked(&target) {
+		anyhow::bail!(
+			"{target} was retired by its owner. Whoever holds it, it is not them — \
+			 refusing to open a session with it."
+		);
+	}
+
+	let devices = listed.active;
 	let device = devices
 		.iter()
 		.find(|d| d.device_id == target.device)
@@ -284,7 +295,10 @@ pub async fn fetch_device_list(
 	user: &UserId,
 	url: &str,
 	reported: &mut Vec<ClientEvent>,
-) -> Result<(CrossSigningPublic, Vec<Device>)> {
+) -> Result<(
+	CrossSigningPublic,
+	veil_protocol::crosssign::VerifiedDevices,
+)> {
 	#[derive(serde::Deserialize)]
 	struct Response {
 		keys: CrossSigningPublic,
@@ -304,10 +318,11 @@ pub async fn fetch_device_list(
 	// Worth telling somebody about rather than silently dropping: a host serving
 	// devices that do not verify is either broken or trying something, and the
 	// two are not distinguishable from here.
-	if verified.len() != response.devices.len() {
+	let accounted = verified.active.len() + verified.revoked.len();
+	if accounted != response.devices.len() {
 		reported.push(ClientEvent::warn(format!(
 			"{} of {user}'s advertised devices failed verification and were discarded",
-			response.devices.len() - verified.len(),
+			response.devices.len() - accounted,
 		)));
 	}
 

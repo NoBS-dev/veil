@@ -781,6 +781,7 @@ pub fn sealed_body(plaintext: &[u8]) -> Vec<u8> {
 				devices: [reader].into_iter().collect(),
 				policy_sequence: 1,
 			},
+			now_ms(),
 		)
 		.unwrap();
 

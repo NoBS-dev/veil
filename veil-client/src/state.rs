@@ -171,6 +171,13 @@ pub struct State {
 	#[serde_as(as = "Vec<(_, _)>")]
 	#[serde(default)]
 	pub peer_devices: HashMap<UserId, DeviceList>,
+	/// Devices their owners have retired (§5.6).
+	///
+	/// Remembered because a host that stopped serving a revocation could
+	/// otherwise bring a retired device back — the signature stops it forging
+	/// one, but not omitting it. Once seen, never unseen.
+	#[serde(default)]
+	pub revoked_devices: std::collections::HashSet<DeviceAddress>,
 	/// Identities we have seen behind an alias (§11.6).
 	///
 	/// **The alias is never the identity.** Aliases are server-controlled and
@@ -276,6 +283,7 @@ impl State {
 			account: Account::new(),
 			peers: HashMap::new(),
 			peer_devices: HashMap::new(),
+			revoked_devices: std::collections::HashSet::new(),
 			pinned_aliases: HashMap::new(),
 			history_key: random_key(),
 			expected_server_identity: None,
@@ -356,6 +364,18 @@ impl State {
 	///
 	/// `None` means "not known", not "Open". A caller deciding whether it is
 	/// safe to send plaintext must treat the two differently.
+	/// Records devices an owner has retired, and reports whether one is retired.
+	pub fn remember_revocations(&mut self, user: UserId, revoked: &[DeviceId]) {
+		for device in revoked {
+			self.revoked_devices
+				.insert(DeviceAddress::new(user, *device));
+		}
+	}
+
+	pub fn is_revoked(&self, address: &DeviceAddress) -> bool {
+		self.revoked_devices.contains(address)
+	}
+
 	/// Records what an alias resolved to, or refuses if it has moved.
 	///
 	/// The same mechanic as server-identity pinning (§6.2), and for the same

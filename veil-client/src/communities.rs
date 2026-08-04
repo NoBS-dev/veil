@@ -239,8 +239,15 @@ async fn seal_for_channel(
 	let mut devices = BTreeSet::new();
 	for reader in readers {
 		let (_, list) = messaging::fetch_device_list(reader, directory, reported).await?;
-		for device in list {
-			devices.insert(DeviceAddress::new(*reader, device.device_id));
+		state.remember_revocations(*reader, &list.revoked);
+
+		for device in list.active {
+			let address = DeviceAddress::new(*reader, device.device_id);
+			// A retired device must not be given a key, which is the whole
+			// point of retiring it (§5.6).
+			if !state.is_revoked(&address) {
+				devices.insert(address);
+			}
 		}
 	}
 
@@ -251,13 +258,24 @@ async fn seal_for_channel(
 	let channel_id = ChannelId::new(*id, channel);
 	let mut provider = state.megolm()?;
 
-	let delivery = provider.set_readership(
+	let now = veil_protocol::now_ms()?;
+
+	let delivery = match provider.set_readership(
 		&channel_id,
 		&Readership {
 			devices,
 			policy_sequence: community.sequence,
 		},
-	)?;
+		now,
+	)? {
+		// A readership change already rotates; asking again would replace a
+		// session one message old and make every send cost a distribution.
+		Some(delivery) => Some(delivery),
+		// Otherwise the session may simply have run long enough (§8.3). Checked
+		// on send rather than on a timer, so a channel nobody uses costs
+		// nothing and one in use never drifts far past the limit.
+		None => provider.rotate_if_due(&channel_id, now),
+	};
 
 	if let Some((cause, delivery)) = delivery {
 		reported.push(ClientEvent::KeysDistributed {
@@ -533,6 +551,58 @@ pub async fn call(
 	)));
 
 	Ok(reported)
+}
+
+/// Retires one of this user's own devices (§5.6).
+///
+/// **The case this exists for is a device already out of your hands**, so it
+/// cannot involve asking that device to do anything. The self-signing key signs
+/// it — not the master, which stays wherever it is kept (invariant 9) — and the
+/// signature covers the retired flag, so a host can neither do this for you nor
+/// undo it.
+///
+/// What it does not do is reach the device. Anything it already holds, it keeps;
+/// retiring stops it being *given* anything further and stops peers opening new
+/// sessions with it. For a Sealed channel, take it out of the reader list too,
+/// which rotates the key.
+pub async fn revoke(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	device: veil_protocol::identity::DeviceId,
+	device_key: [u8; 32],
+) -> Result<Vec<ClientEvent>> {
+	if device == state.device_id {
+		anyhow::bail!(
+			"that is this device. Retiring the one you are using would leave you unable \
+			 to retire anything else — use another device, or remove the profile."
+		);
+	}
+
+	let signature = state.cross_signing().revoke_device(&device, &device_key);
+
+	send(
+		write,
+		state,
+		ProtocolMessage::RevokeDevice(veil_protocol::RevokeDevice {
+			device,
+			device_ed25519: device_key,
+			signature,
+		}),
+	)
+	.await?;
+
+	state
+		.revoked_devices
+		.insert(veil_protocol::identity::DeviceAddress::new(
+			state.user_id,
+			device,
+		));
+	state.save_to_keyring()?;
+
+	Ok(vec![ClientEvent::info(format!(
+		"{device} is retired. It keeps whatever it already had — for a Sealed channel, \
+		 take it out of the reader list as well, which rotates the key."
+	))])
 }
 
 /// Claims a human-usable name on this host (§11.6).

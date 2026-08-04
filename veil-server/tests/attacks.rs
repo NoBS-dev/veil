@@ -395,3 +395,58 @@ async fn a_message_is_not_delivered_to_the_wrong_device() {
 
 	server.stop().await;
 }
+
+/// Membership was the only gate on posting, so a member was the limit.
+///
+/// Not a hypothetical: nothing stopped one device filling a channel, or the
+/// blob store, as fast as it could write.
+#[tokio::test]
+async fn a_member_cannot_send_without_limit() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	tokio::time::sleep(Duration::from_millis(1500)).await;
+
+	// Past the per-device budget, draining replies as we go. Without the drain
+	// this trips the outbox's slow-consumer protection instead, and the test
+	// would be measuring that rather than the limiter.
+	let mut stored = 0usize;
+	for n in 0..800u32 {
+		let blob = n.to_le_bytes().repeat(8);
+		if alice
+			.send(&ProtocolMessage::UploadBlob(blob))
+			.await
+			.is_err()
+		{
+			break;
+		}
+
+		while let Some(reply) = alice.recv(Duration::from_millis(1)).await {
+			if matches!(reply, ProtocolMessage::BlobStored { .. }) {
+				stored += 1;
+			}
+		}
+	}
+
+	// Drain whatever is still in flight.
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	while tokio::time::Instant::now() < deadline {
+		match alice.recv(Duration::from_millis(200)).await {
+			Some(ProtocolMessage::BlobStored { .. }) => stored += 1,
+			Some(_) => continue,
+			None => break,
+		}
+	}
+
+	assert!(
+		stored > 0,
+		"the control: uploads under the budget must be accepted"
+	);
+	assert!(
+		stored < 800,
+		"a member sending without limit must be throttled, but {stored} of 800 were stored"
+	);
+
+	server.stop().await;
+}

@@ -64,6 +64,7 @@ impl Store {
 			     display_name  TEXT    NOT NULL,
 			     created_at    INTEGER NOT NULL,
 			     last_seen     INTEGER NOT NULL,
+			     revoked       INTEGER NOT NULL DEFAULT 0,
 			     PRIMARY KEY (user_id, device_id)
 			 );
 
@@ -218,6 +219,7 @@ impl Store {
 		// operator's database is not something to discard on an upgrade (§1.3).
 		for column in [
 			"ALTER TABLE channel_messages ADD COLUMN message_id BLOB",
+			"ALTER TABLE devices ADD COLUMN revoked INTEGER NOT NULL DEFAULT 0",
 			"ALTER TABLE channel_messages ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0",
 		] {
 			// Already present is the common case, and not an error.
@@ -250,14 +252,19 @@ impl Store {
 		self.db.execute(
 			"INSERT INTO devices
 			   (user_id, device_id, ed25519, curve25519, ssk_signature,
-			    display_name, created_at, last_seen)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+			    display_name, created_at, last_seen, revoked)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
 			 ON CONFLICT(user_id, device_id) DO UPDATE SET
 			   ed25519       = excluded.ed25519,
 			   curve25519    = excluded.curve25519,
 			   ssk_signature = excluded.ssk_signature,
 			   display_name  = excluded.display_name,
-			   last_seen     = excluded.last_seen",
+			   last_seen     = excluded.last_seen,
+			   -- Monotonic: a device that has been retired stays retired. The
+			   -- signature stops a host forging either direction, but a host
+			   -- replaying an older, genuinely-signed entry could otherwise
+			   -- bring one back.
+			   revoked       = MAX(devices.revoked, excluded.revoked)",
 			params![
 				user.as_bytes().as_slice(),
 				device.device_id.as_bytes().as_slice(),
@@ -267,6 +274,7 @@ impl Store {
 				device.display_name,
 				device.created_at,
 				device.last_seen,
+				device.revoked as i64,
 			],
 		)?;
 
@@ -316,7 +324,7 @@ impl Store {
 
 		let mut stmt = self.db.prepare(
 			"SELECT device_id, ed25519, curve25519, ssk_signature, display_name,
-			        created_at, last_seen
+			        created_at, last_seen, revoked
 			 FROM devices
 			 WHERE user_id = ?1 AND curve25519 != zeroblob(32)",
 		)?;
@@ -331,6 +339,7 @@ impl Store {
 					display_name: r.get(4)?,
 					created_at: r.get(5)?,
 					last_seen: r.get(6)?,
+					revoked: r.get::<_, i64>(7)? == 1,
 				})
 			})?
 			.collect::<Result<Vec<_>, _>>()?;
@@ -1092,6 +1101,7 @@ mod tests {
 			display_name: "laptop".into(),
 			created_at: 1,
 			last_seen: 1,
+			revoked: false,
 		};
 
 		(store, user, secrets.public(), device)
@@ -1110,6 +1120,7 @@ mod tests {
 			stored_keys
 				.verify_device_list(&user, &devices)
 				.unwrap()
+				.active
 				.len() == 1
 		);
 	}
