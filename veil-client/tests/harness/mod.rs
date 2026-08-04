@@ -225,10 +225,12 @@ impl Fixture {
 		// The fixture runs TLS itself here, so it needs a provider too.
 		let _ = rustls::crypto::ring::default_provider().install_default();
 
-		let port = free_port().await;
-		let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-			.await
-			.unwrap();
+		// Bound to zero and read back, never chosen and then bound. Choosing a
+		// port means releasing it before binding, and with every test binary
+		// running at once something else takes it in between — which is exactly
+		// what this test started failing on.
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
 
 		// The relay's own certificate — perfectly valid, and not the one the
 		// destination signed for.
@@ -432,12 +434,9 @@ pub fn binary(name: &str) -> std::path::PathBuf {
 	path
 }
 
-pub async fn free_port() -> u16 {
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let port = listener.local_addr().unwrap().port();
-	drop(listener);
-	port
-}
+// `free_port` used to live here and does not any more. Choosing a port and then
+// binding it means releasing it in between, and with every test binary running
+// at once something else takes it — bind to zero and read the port back instead.
 
 /// A byte stream over a server-side WebSocket, so TLS can be run inside one.
 ///

@@ -803,6 +803,27 @@ async fn handle_socket(socket: WebSocket, state: ServerState) {
 					eprintln!("Dropping a call signal for {recipient}, who is {e}");
 				}
 			}
+			ProtocolMessage::CallRoster(roster) => {
+				// Routed like a signal and just as opaque — the host learns who
+				// is in a call, which it would learn from the traffic anyway,
+				// and nothing about what is said.
+				if roster.sender != address {
+					eprintln!("Discarding a roster claiming to be from {}", roster.sender);
+					continue;
+				}
+
+				if roster.participants.len() > veil_protocol::call::MESH_LIMIT {
+					eprintln!("Discarding an oversized roster from {address}");
+					continue;
+				}
+
+				let recipient = roster.recipient;
+				if let Err(e) = route_to(&recipient, bytes.to_vec()).await {
+					// Not queued, for the same reason a signal is not: a roster
+					// for a call that has ended is noise.
+					eprintln!("Dropping a call roster for {recipient}, who is {e}");
+				}
+			}
 			ProtocolMessage::StoreBackup(blob) => {
 				if blob.len() > MAX_BLOB {
 					eprintln!("Refusing an oversized backup from {address}");

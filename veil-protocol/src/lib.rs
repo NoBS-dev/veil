@@ -370,6 +370,12 @@ pub enum ProtocolMessage {
 	/// with a cross-signed device, the media keys are authenticated with no new
 	/// PKI — so a two-person call needs no new cryptography at all.
 	CallSignal(CallSignal),
+	/// Tells a participant who else is in a group call (§9).
+	///
+	/// Sent to each participant over the same authenticated path as an offer.
+	/// Everyone then computes the same topology from the same roster without a
+	/// coordinating round trip — see `call::Mesh`.
+	CallRoster(CallRoster),
 	/// Stores this user's encrypted key backup (§12.5).
 	///
 	/// Ciphertext the host cannot read — it holds the cross-signing secrets and
@@ -524,6 +530,21 @@ pub struct Report {
 	/// report is accepted too and treated as signal for human review rather than
 	/// proof — which is what mainstream platforms do with reports regardless.
 	pub attribution: Option<String>,
+}
+
+/// Who is in a group call.
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
+#[rkyv(attr(derive(Debug)))]
+pub struct CallRoster {
+	pub call: [u8; 16],
+	pub sender: DeviceAddress,
+	pub recipient: DeviceAddress,
+	/// Every device in the call, including the sender and the recipient.
+	///
+	/// Sent in full rather than as a diff: a participant that missed one update
+	/// would compute a topology nobody else agrees with, and a call is short
+	/// enough that resending the whole list costs nothing.
+	pub participants: Vec<DeviceAddress>,
 }
 
 /// A device its owner has retired.

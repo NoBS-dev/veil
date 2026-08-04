@@ -210,3 +210,118 @@ async fn a_device_cannot_signal_as_somebody_else() {
 
 	server.stop().await;
 }
+
+/// A roster reaches the other participants, so everyone computes the same
+/// topology from the same list (§9).
+#[tokio::test]
+async fn a_roster_reaches_the_participants() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	let mut bob = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	bob.upload_keys(5).await.unwrap();
+	let mut carol = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	carol.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+
+	let participants = vec![alice.address(), bob.address(), carol.address()];
+
+	for recipient in [bob.address(), carol.address()] {
+		alice
+			.send(&ProtocolMessage::CallRoster(veil_protocol::CallRoster {
+				call: [7u8; 16],
+				sender: alice.address(),
+				recipient,
+				participants: participants.clone(),
+			}))
+			.await
+			.unwrap();
+	}
+
+	for client in [&mut bob, &mut carol] {
+		let received = next_roster(client, PATIENCE)
+			.await
+			.expect("each participant should be told the roster");
+		assert_eq!(received.participants.len(), 3);
+		assert_eq!(received.sender, alice.address());
+	}
+
+	// And they agree on the topology without asking each other.
+	use std::collections::BTreeSet;
+	use veil_protocol::call::Mesh;
+
+	let roster: BTreeSet<_> = participants.iter().copied().collect();
+	let legs: usize = roster
+		.iter()
+		.map(|m| Mesh::offers_from(m, &roster).len())
+		.sum();
+	assert_eq!(legs, 3, "three participants is three sessions");
+
+	server.stop().await;
+}
+
+/// A roster larger than a mesh can carry is refused rather than attempted.
+#[tokio::test]
+async fn an_oversized_roster_is_refused() {
+	let server = Server::start().await;
+
+	let mut alice = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	alice.upload_keys(5).await.unwrap();
+	let mut bob = TestClient::new().connect(&server.ws_url()).await.unwrap();
+	bob.upload_keys(5).await.unwrap();
+	tokio::time::sleep(BEAT).await;
+
+	let too_many: Vec<_> = (0..veil_protocol::call::MESH_LIMIT + 1)
+		.map(|_| TestClient::new().address())
+		.collect();
+
+	alice
+		.send(&ProtocolMessage::CallRoster(veil_protocol::CallRoster {
+			call: [7u8; 16],
+			sender: alice.address(),
+			recipient: bob.address(),
+			participants: too_many,
+		}))
+		.await
+		.unwrap();
+
+	// Then a roster that fits, immediately after. Asserting on order rather
+	// than silence: if the oversized one were forwarded it would arrive first.
+	alice
+		.send(&ProtocolMessage::CallRoster(veil_protocol::CallRoster {
+			call: [7u8; 16],
+			sender: alice.address(),
+			recipient: bob.address(),
+			participants: vec![alice.address(), bob.address()],
+		}))
+		.await
+		.unwrap();
+
+	let received = next_roster(&mut bob, PATIENCE)
+		.await
+		.expect("the roster that fits should arrive");
+	assert_eq!(
+		received.participants.len(),
+		2,
+		"the first roster to arrive must be the one that fits — an oversized one was \
+		 forwarded ahead of it"
+	);
+
+	server.stop().await;
+}
+
+async fn next_roster(
+	client: &mut TestClient,
+	patience: Duration,
+) -> Option<veil_protocol::CallRoster> {
+	let deadline = tokio::time::Instant::now() + patience;
+	loop {
+		match client.recv(BEAT).await {
+			Some(ProtocolMessage::CallRoster(roster)) => return Some(roster),
+			Some(_) => continue,
+			None if tokio::time::Instant::now() < deadline => continue,
+			None => return None,
+		}
+	}
+}

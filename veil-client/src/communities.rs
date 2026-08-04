@@ -492,6 +492,39 @@ pub async fn call(
 	let mut reported = Vec::new();
 	let recipient = crate::messaging::parse_target(target)?;
 
+	let mut call = [0u8; 16];
+	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut call);
+
+	place_leg(write, state, directory, calls, call, recipient).await?;
+	state.save_to_keyring()?;
+
+	reported.push(ClientEvent::info(format!(
+		"Calling {recipient}{}. Media is relayed unless both of you choose otherwise.",
+		if state.relay.is_some() {
+			""
+		} else {
+			" directly — no relay is configured, so they will see this address"
+		}
+	)));
+
+	Ok(reported)
+}
+
+/// Opens one leg of a call: a session with one device, offered over the
+/// authenticated channel.
+///
+/// Shared by the 1:1 and mesh paths, because a mesh is exactly this run once per
+/// participant — a second implementation is where the two would drift apart.
+pub async fn place_leg(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+	calls: &crate::media::Calls,
+	call: [u8; 16],
+	recipient: DeviceAddress,
+) -> Result<()> {
+	let mut reported = Vec::new();
+
 	// A session with the device first: the offer has to travel authenticated or
 	// the fingerprint inside it means nothing.
 	messaging::ensure_session(state, recipient, directory, &mut reported).await?;
@@ -499,9 +532,6 @@ pub async fn call(
 	let call_media = crate::media::Call::open(state.relay.as_deref()).await?;
 	call_media.session.offer().await?;
 	let sdp = call_media.session.local_description_when_gathered().await?;
-
-	let mut call = [0u8; 16];
-	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut call);
 
 	let (message_type, message) = {
 		let peer = state
@@ -528,27 +558,108 @@ pub async fn call(
 	// Audio starts if this machine has devices. A client on a box with no sound
 	// card should still be able to place a call — it simply cannot talk on it,
 	// and saying so is better than failing the call.
-	match crate::audio::run(&call_media) {
-		Ok(streams) => call_media.audio.lock().await.replace(streams),
-		Err(e) => {
-			reported.push(ClientEvent::warn(format!(
-				"Call connected without audio: {e:#}"
-			)));
-			None
-		}
-	};
+	// Once, not twice — calling this in both arms of a check would open two
+	// captures on one microphone, which is a mistake this code has already made.
+	if let Ok(streams) = crate::audio::run(&call_media) {
+		call_media.audio.lock().await.replace(streams);
+	}
 
-	calls.lock().await.insert(call, call_media);
-	state.save_to_keyring()?;
+	// Keyed by call *and* leg, so a mesh holds one entry per participant rather
+	// than each leg replacing the last.
+	calls
+		.lock()
+		.await
+		.insert(leg_id(call, recipient), call_media);
+	Ok(())
+}
 
-	reported.push(ClientEvent::info(format!(
-		"Calling {recipient}{}. Media is relayed unless both of you choose otherwise.",
-		if state.relay.is_some() {
-			""
-		} else {
-			" directly — no relay is configured, so they will see this address"
+/// One entry per leg, so a mesh holds a session per participant rather than
+/// each leg replacing the last.
+///
+/// Derived from the call and the far end together: a participant is in exactly
+/// one leg of a given call, so this is unique without needing a counter anyone
+/// has to agree on.
+pub fn leg_id(call: [u8; 16], other: DeviceAddress) -> [u8; 16] {
+	let mut id = call;
+	for (slot, byte) in id.iter_mut().zip(other.device.as_bytes()) {
+		*slot ^= byte;
+	}
+	id
+}
+
+/// Places a group call as a full mesh (§9).
+///
+/// **No SFU and no group key**, so this needs exactly the cryptography a 1:1
+/// call needs — which is none beyond what WebRTC already does. Every participant
+/// holds a session with every other, which is more private than an SFU because
+/// there is nothing in the middle, and does not scale for the same reason.
+///
+/// The roster goes to everyone first. Each participant then computes the same
+/// topology from it and offers to the half of the call it is responsible for, so
+/// the mesh forms without a coordinating round trip.
+pub async fn group_call(
+	write: &Arc<Mutex<WriteStream>>,
+	state: &mut State,
+	directory: &str,
+	calls: &crate::media::Calls,
+	targets: &[String],
+) -> Result<Vec<ClientEvent>> {
+	use std::collections::BTreeSet;
+	use veil_protocol::call::Mesh;
+
+	let mut roster: BTreeSet<_> = [state.address()].into_iter().collect();
+	for target in targets {
+		roster.insert(crate::messaging::parse_target(target)?);
+	}
+
+	if !Mesh::viable(roster.len()) {
+		anyhow::bail!(
+			"a mesh carries {} people at most, and this is {}. Past that every \
+			 participant uploads one stream per other participant, which the slowest \
+			 connection pays for — it needs a forwarding server, which does not exist yet.",
+			veil_protocol::call::MESH_LIMIT,
+			roster.len()
+		);
+	}
+
+	let mut reported = vec![ClientEvent::info(format!(
+		"Mesh call with {} others. You will be sending {} streams.",
+		roster.len() - 1,
+		Mesh::upload_streams(&roster)
+	))];
+
+	let mut call = [0u8; 16];
+	rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut call);
+	let participants: Vec<_> = roster.iter().copied().collect();
+
+	// Everyone learns the roster before anyone offers, so the topology is
+	// agreed before it is acted on.
+	for recipient in roster.iter().filter(|p| **p != state.address()) {
+		send(
+			write,
+			state,
+			ProtocolMessage::CallRoster(veil_protocol::CallRoster {
+				call,
+				sender: state.address(),
+				recipient: *recipient,
+				participants: participants.clone(),
+			}),
+		)
+		.await?;
+	}
+
+	// Then offer to the half of the mesh this device is responsible for. The
+	// others will offer to us.
+	for target in Mesh::offers_from(&state.address(), &roster) {
+		match place_leg(write, state, directory, calls, call, target).await {
+			Ok(()) => {}
+			// One unreachable participant should not sink the call — the rest
+			// of the mesh is unaffected.
+			Err(e) => reported.push(ClientEvent::warn(format!(
+				"Could not reach {target}: {e:#}"
+			))),
 		}
-	)));
+	}
 
 	Ok(reported)
 }

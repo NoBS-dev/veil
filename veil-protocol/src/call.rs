@@ -19,7 +19,9 @@
 //!   into a call with a stranger a security failure, in those words. So consent
 //!   does not outlive the call it was given for.
 
+use crate::identity::DeviceAddress;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// How a call's media travels.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +99,76 @@ impl Negotiation {
 		"Going direct shows your network address to the other person, and theirs to \
 		 you. It is usually faster and costs your home server nothing. It applies to \
 		 this call only."
+	}
+}
+
+/// Who connects to whom in a group call — `DESIGN.md` §9.
+///
+/// **Full mesh: every participant holds a session with every other.** No SFU, so
+/// there is nothing in the middle to keep out of the trust set, and no group key
+/// to distribute — a mesh call needs exactly the cryptography a 1:1 call needs,
+/// which is none beyond what WebRTC already does.
+///
+/// What it does not do is scale. Each participant uploads their stream once per
+/// other participant, so cost grows as `n-1` per person and `n(n-1)/2` overall.
+/// §9.1's figures make the shape clear: voice at 50–64 kbps is comfortable for a
+/// handful, and video at 1–3 Mbps is not. That is the trade, and it is why the
+/// SFU exists further up the design rather than being absent by oversight.
+pub struct Mesh;
+
+/// Beyond this, a mesh stops being kind to the participant with the worst
+/// connection.
+///
+/// Five is where voice is still comfortable — four uploads at 64 kbps is about
+/// 256 kbps, which a domestic connection carries without noticing. Video is
+/// already marginal at four. The cap is deliberately low rather than optimistic:
+/// a call that degrades for everyone because one more person joined is worse
+/// than one that says no.
+pub const MESH_LIMIT: usize = 5;
+
+impl Mesh {
+	/// Whether a call of this size should use a mesh at all.
+	pub fn viable(participants: usize) -> bool {
+		(2..=MESH_LIMIT).contains(&participants)
+	}
+
+	/// The devices `me` should send an offer to.
+	///
+	/// **Exactly one side of each pair offers**, decided by comparing addresses.
+	/// Both offering is "glare" — two half-negotiated sessions that each think
+	/// they are the caller — and the usual fix is a tie-break rather than
+	/// coordination, because coordination needs a round trip that a peer-to-peer
+	/// call does not otherwise have.
+	///
+	/// Ordering by address is arbitrary but *stable and shared*: every
+	/// participant computes the same answer from the same roster without
+	/// asking anyone.
+	pub fn offers_from(me: &DeviceAddress, roster: &BTreeSet<DeviceAddress>) -> Vec<DeviceAddress> {
+		roster
+			.iter()
+			.filter(|other| *other != me && me < other)
+			.copied()
+			.collect()
+	}
+
+	/// The devices `me` should expect an offer from.
+	pub fn answers_from(
+		me: &DeviceAddress,
+		roster: &BTreeSet<DeviceAddress>,
+	) -> Vec<DeviceAddress> {
+		roster
+			.iter()
+			.filter(|other| *other != me && *other < me)
+			.copied()
+			.collect()
+	}
+
+	/// How many streams `me` will be sending.
+	///
+	/// Exposed because it is the number that decides whether a mesh is a good
+	/// idea, and a UI that offers the choice should be able to say it.
+	pub fn upload_streams(roster: &BTreeSet<DeviceAddress>) -> usize {
+		roster.len().saturating_sub(1)
 	}
 }
 
@@ -208,5 +280,105 @@ mod tests {
 			explanation.contains("this call only"),
 			"and that it does not carry forward"
 		);
+	}
+
+	fn address(seed: u8) -> DeviceAddress {
+		use crate::{crosssign::CrossSigningSecrets, identity::DeviceId};
+		let _ = seed;
+		DeviceAddress::new(CrossSigningSecrets::new().user_id(), DeviceId::generate())
+	}
+
+	fn roster(n: usize) -> BTreeSet<DeviceAddress> {
+		(0..n).map(|i| address(i as u8)).collect()
+	}
+
+	/// Every pair connects, and exactly once. Both sides offering is glare: two
+	/// half-negotiated sessions that each think they are the caller.
+	#[test]
+	fn exactly_one_side_of_each_pair_offers() {
+		let roster = roster(5);
+
+		for a in &roster {
+			for b in &roster {
+				if a == b {
+					continue;
+				}
+
+				let a_offers = Mesh::offers_from(a, &roster).contains(b);
+				let b_offers = Mesh::offers_from(b, &roster).contains(a);
+
+				assert!(
+					a_offers ^ b_offers,
+					"exactly one of a pair must offer, or the two sides collide"
+				);
+			}
+		}
+	}
+
+	/// Offers and answers have to be the same set seen from opposite ends, or
+	/// somebody waits forever for a call that was never placed.
+	#[test]
+	fn every_offer_is_expected_by_its_recipient() {
+		let roster = roster(4);
+
+		for me in &roster {
+			for target in Mesh::offers_from(me, &roster) {
+				assert!(
+					Mesh::answers_from(&target, &roster).contains(me),
+					"an offer must be one the other side is waiting for"
+				);
+			}
+		}
+	}
+
+	/// Nobody calls themselves.
+	#[test]
+	fn a_participant_does_not_connect_to_itself() {
+		let roster = roster(3);
+
+		for me in &roster {
+			assert!(!Mesh::offers_from(me, &roster).contains(me));
+			assert!(!Mesh::answers_from(me, &roster).contains(me));
+		}
+	}
+
+	/// Every participant computes the same topology from the same roster,
+	/// without asking anyone — which is what lets a mesh form with no
+	/// coordinating round trip.
+	#[test]
+	fn the_topology_needs_no_coordination() {
+		let roster = roster(4);
+
+		let legs: usize = roster
+			.iter()
+			.map(|me| Mesh::offers_from(me, &roster).len())
+			.sum();
+
+		assert_eq!(
+			legs,
+			4 * 3 / 2,
+			"a mesh of four is six sessions, each set up by exactly one end"
+		);
+	}
+
+	/// A call that degrades for everyone because one more person joined is
+	/// worse than one that says no.
+	#[test]
+	fn a_mesh_refuses_to_grow_past_what_it_can_carry() {
+		assert!(Mesh::viable(2), "a pair is the ordinary case");
+		assert!(Mesh::viable(MESH_LIMIT));
+		assert!(
+			!Mesh::viable(MESH_LIMIT + 1),
+			"past the limit this needs an SFU, not optimism"
+		);
+		assert!(!Mesh::viable(1), "a call needs somebody else in it");
+	}
+
+	/// The number that decides whether a mesh is a good idea, so a UI offering
+	/// the choice can say it.
+	#[test]
+	fn upload_cost_is_one_stream_per_other_participant() {
+		assert_eq!(Mesh::upload_streams(&roster(2)), 1);
+		assert_eq!(Mesh::upload_streams(&roster(5)), 4);
 	}
 }

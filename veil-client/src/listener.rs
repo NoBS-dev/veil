@@ -106,6 +106,33 @@ pub async fn listener(
 									)
 									.await;
 								}
+								ProtocolMessage::CallRoster(roster) => {
+									// Every participant computes the same topology from the
+									// same list, so a mesh forms with no coordinating round
+									// trip (§9).
+									use std::collections::BTreeSet;
+									use veil_protocol::call::Mesh;
+
+									let members: BTreeSet<_> =
+										roster.participants.iter().copied().collect();
+									let me = state.lock().await.address();
+
+									if !Mesh::viable(members.len()) {
+										notice!(
+											events,
+											"Ignoring a call roster of {} — past what a mesh carries",
+											members.len()
+										);
+										continue;
+									}
+
+									say!(
+										events,
+										"Joining a call with {} others; offering to {} of them.",
+										members.len() - 1,
+										Mesh::offers_from(&me, &members).len()
+									);
+								}
 								ProtocolMessage::CallSignal(signal) => {
 									answer_call(
 										state.clone(),
@@ -160,6 +187,58 @@ pub async fn listener(
 					}
 					ProtocolMessage::Delivery(delivery) => {
 						show_delivery(state.clone(), *delivery, &events).await;
+					}
+					ProtocolMessage::CallRoster(roster) => {
+						// Every participant computes the same topology from the
+						// same list, so a mesh forms with no coordinating round
+						// trip (§9).
+						use std::collections::BTreeSet;
+						use veil_protocol::call::Mesh;
+
+						let members: BTreeSet<_> = roster.participants.iter().copied().collect();
+						let me = state.lock().await.address();
+
+						if !Mesh::viable(members.len()) {
+							notice!(
+								events,
+								"Ignoring a call roster of {} — past what a mesh carries",
+								members.len()
+							);
+							continue;
+						}
+
+						let targets = Mesh::offers_from(&me, &members);
+						say!(
+							events,
+							"Joining a call with {} others; offering to {} of them.",
+							members.len() - 1,
+							targets.len()
+						);
+
+						// The other half of the mesh offers to us. This device
+						// places the legs it is responsible for, which is what
+						// makes the roster an instruction rather than a notice.
+						let directory = {
+							let state = state.lock().await;
+							let (_, http) = state.schemes();
+							format!("{http}://{}", state.ip_and_port)
+						};
+
+						for target in targets {
+							let mut state = state.lock().await;
+							if let Err(e) = crate::communities::place_leg(
+								&write,
+								&mut state,
+								&directory,
+								&calls,
+								roster.call,
+								target,
+							)
+							.await
+							{
+								notice!(events, "Could not reach {target}: {e:#}");
+							}
+						}
 					}
 					ProtocolMessage::CallSignal(signal) => {
 						answer_call(
@@ -697,6 +776,7 @@ fn frame_name(message: &ProtocolMessage) -> &'static str {
 		ProtocolMessage::FetchCommunity(_) => "community fetch",
 		ProtocolMessage::DeleteMessage { .. } => "delete",
 		ProtocolMessage::CallSignal(_) => "call signal",
+		ProtocolMessage::CallRoster(_) => "call roster",
 		ProtocolMessage::StoreBackup(_) => "key backup",
 		ProtocolMessage::RevokeDevice(_) => "device revocation",
 		ProtocolMessage::ClaimAlias(_) => "alias claim",
@@ -793,7 +873,10 @@ async fn answer_call(
 	};
 
 	// An answer completes a call we placed; anything else is an offer.
-	if let Some(call) = calls.lock().await.get(&signal.call) {
+	// Keyed by leg, so a mesh keeps one session per participant.
+	let leg = crate::communities::leg_id(signal.call, signal.sender);
+
+	if let Some(call) = calls.lock().await.get(&leg) {
 		match call.session.accept_answer(&sdp).await {
 			Ok(()) => say!(events, "{} answered.", signal.sender),
 			Err(e) => notice!(
@@ -864,7 +947,7 @@ async fn answer_call(
 				Err(e) => notice!(events, "Answered without audio: {e:#}"),
 			}
 
-			calls.lock().await.insert(signal.call, call);
+			calls.lock().await.insert(leg, call);
 			say!(events, "Answered a call from {}.", signal.sender);
 		}
 		Err(e) => notice!(events, "Could not seal an answer: {e:#}"),

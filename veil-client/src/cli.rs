@@ -184,6 +184,20 @@ pub async fn cli(
 				},
 				_ => eprintln!("Could not read that."),
 			},
+			"groupcall" => {
+				let mut targets = Vec::new();
+				loop {
+					match ask("Participant (<user-id>/<device-id>, blank when done): ") {
+						Ok(entry) if entry.is_empty() => break,
+						Ok(entry) => targets.push(entry),
+						Err(e) => {
+							eprintln!("{e:#}");
+							break;
+						}
+					}
+				}
+				show(communities::group_call(&write, &mut state, url, &calls, &targets).await);
+			}
 			"call" => match ask("Enter target device (<user-id>/<device-id>): ") {
 				Ok(target) => {
 					show(communities::call(&write, &mut state, url, &calls, &target).await)

@@ -376,6 +376,13 @@ feeds a client input in stages, which is what lets a test change policy *while*
 another member is connected — the only way to exercise the push, since a client
 that reconnects would refresh anyway.
 
+**Never choose a port and then bind it — bind to zero and read it back.** This
+has now caused two separate flaky failures: once for spawned servers, once for
+listeners the harness owns. Choosing means releasing the port before binding it,
+and with every test binary running at once something else takes it in between.
+`free_port` has been removed from the client harness so it cannot be reached for
+again.
+
 **The harness lets the OS pick ports and reads them back from the server's
 output.** Do not go back to choosing a port and handing it over: the harness has
 to release it before the server can bind, and with every test binary running at

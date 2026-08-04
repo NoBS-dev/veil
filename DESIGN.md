@@ -108,7 +108,7 @@ to.
 | Calls: RTP audio over SRTP | **[built]** Opus track, real packets through the buffer |
 | Calls: jitter buffering and pacing | **[built]** wired into the receive path |
 | Calls: capture, playback, Opus codec | **[built]** cpal + libopus; degrades on a machine with no devices |
-| Calls: mesh for small groups | designed, §9 — same primitives |
+| Calls: mesh for small groups | **[built]** `call::Mesh` — no new cryptography |
 | Calls: SFU and SFrame for large groups | designed, §9 — the only place new crypto appears |
 | Message model, hash chain, `seen_head` | **[built]** `message.rs` |
 | Attachments and media | **[built]** `attachment.rs`, blob store; encryption follows the tier |
@@ -1002,7 +1002,16 @@ device verified through cross-signing (§5.4). The SDP carries the DTLS
 fingerprint, so sending it over that session authenticates the media keys with no
 new PKI. This is how Signal handles 1:1, and it is the load-bearing simplification.
 
-**Small groups are the same primitives, meshed.** Every participant holds a
+**Small groups are the same primitives, meshed.** Built, and the part worth
+describing is how the mesh forms. The initiator sends everyone the same roster;
+each participant then computes the same topology from it and offers to the half
+of the call it is responsible for, decided by comparing addresses. Exactly one
+side of each pair offers — both offering is *glare*, two half-negotiated sessions
+that each believe they are the caller, and the usual fix is a tie-break rather
+than coordination, because coordination costs a round trip a peer-to-peer call
+does not otherwise have. Nobody asks anybody anything.
+
+The cap is five, and it is deliberately low. Every participant holds a
 session with every other. There is no SFU, so there is nothing in the middle to
 keep out of the trust set — mesh is *more* private than an SFU, it simply does
 not scale. §9.1's own figures make the case: voice is 50–64 kbps and most
